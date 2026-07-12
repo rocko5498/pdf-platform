@@ -24,6 +24,7 @@ protocol      = { path = "../protocol" }
 diagnostics   = { path = "../diagnostics" }
 
 [dev-dependencies]
-# Integration tests link spawn + protocol types.
+# Integration tests link spawn + protocol + session types.
 sandbox       = { path = "../sandbox" }
 protocol      = { path = "../protocol" }
+coordinator   = { path = "../coordinator" }
