@@ -1,6 +1,6 @@
-//! Worker process spawn + IPC + document handle inherit. [ADR-008, SDS §3.1, §10.1]
+//! Worker process spawn + IPC + document/shmem handle inherit. [ADR-008, SDS §3.1, §4.2, §10.1]
 //!
-//! **Call order (M0):** create IPC listen end → mark doc handle inheritable →
+//! **Call order (M0):** create IPC listen end → mark handles inheritable →
 //! spawn worker → accept IPC → return parent transport.
 //!
 //! ## Env contract (child)
@@ -9,11 +9,10 @@
 //! |----------|---------|
 //! | `PDF_PLATFORM_IPC_SOCK` | Unix: path to parent `UnixListener` |
 //! | `PDF_PLATFORM_IPC_PORT` | Windows: `127.0.0.1` TCP port |
-//! | `PDF_PLATFORM_DOC_FD` | Unix: inherited document file descriptor |
-//! | `PDF_PLATFORM_DOC_HANDLE` | Windows: inherited document HANDLE (integer) |
+//! | `PDF_PLATFORM_DOC_FD` / `_HANDLE` | Inherited document file |
+//! | `PDF_PLATFORM_SHMEM_FD` / `_HANDLE` | Inherited tile shared-memory file |
 //!
-//! Document path is **not** passed (GR-1 / SDS §3.1). IPC still uses
-//! connect-after-bind (separate debt from document handle inherit).
+//! Paths are **not** passed for document/shmem (GR-1).
 
 use std::fs::File;
 use std::io;
@@ -33,8 +32,21 @@ pub const ENV_WORKER_PATH: &str = "PDF_PLATFORM_WORKER_PATH";
 pub const ENV_DOC_FD: &str = "PDF_PLATFORM_DOC_FD";
 /// Windows: inherited document HANDLE as decimal integer.
 pub const ENV_DOC_HANDLE: &str = "PDF_PLATFORM_DOC_HANDLE";
+/// Unix: inherited shared-memory FD.
+pub const ENV_SHMEM_FD: &str = "PDF_PLATFORM_SHMEM_FD";
+/// Windows: inherited shared-memory HANDLE as decimal integer.
+pub const ENV_SHMEM_HANDLE: &str = "PDF_PLATFORM_SHMEM_HANDLE";
 
 static SPAWN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Optional files to inherit into the worker.
+#[derive(Default)]
+pub struct SpawnAttachments<'a> {
+    /// Brokered document file.
+    pub doc: Option<&'a File>,
+    /// Shared tile buffer file.
+    pub shmem: Option<&'a File>,
+}
 
 /// Parent-side handle: framed IPC + child process. [SDS §10.1]
 pub struct WorkerChild {
@@ -44,7 +56,7 @@ pub struct WorkerChild {
     pub child: Child,
 }
 
-/// Spawn `worker_exe` and establish a framed control channel (no document).
+/// Spawn `worker_exe` and establish a framed control channel (no attachments).
 pub fn spawn_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
     spawn_worker_with_env(worker_exe, &[])
 }
@@ -54,18 +66,32 @@ pub fn spawn_worker_with_env(
     worker_exe: &Path,
     extra_env: &[(&str, &str)],
 ) -> io::Result<WorkerChild> {
-    spawn_impl(worker_exe, None, extra_env)
+    spawn_impl(worker_exe, &SpawnAttachments::default(), extra_env)
 }
 
 /// Spawn worker with an inheritable document file (no path string). [SDS §3.1]
-///
-/// `doc` must remain open until this function returns (parent keeps `BrokeredFile`).
 pub fn spawn_worker_with_file(
     worker_exe: &Path,
     doc: &File,
     extra_env: &[(&str, &str)],
 ) -> io::Result<WorkerChild> {
-    spawn_impl(worker_exe, Some(doc), extra_env)
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments {
+            doc: Some(doc),
+            shmem: None,
+        },
+        extra_env,
+    )
+}
+
+/// Spawn worker with document and/or shmem attachments.
+pub fn spawn_worker_with_attachments(
+    worker_exe: &Path,
+    attachments: &SpawnAttachments<'_>,
+    extra_env: &[(&str, &str)],
+) -> io::Result<WorkerChild> {
+    spawn_impl(worker_exe, attachments, extra_env)
 }
 
 /// Adopt the IPC end inside the worker process.
@@ -91,11 +117,27 @@ pub fn adopt_inherited() -> io::Result<Box<dyn protocol::transport::WorkerTransp
 pub fn adopt_document_file() -> io::Result<Option<File>> {
     #[cfg(unix)]
     {
-        return unix::adopt_document_file();
+        return unix::adopt_file_from_env(ENV_DOC_FD);
     }
     #[cfg(windows)]
     {
-        return windows::adopt_document_file();
+        return windows::adopt_file_from_env(ENV_DOC_HANDLE);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(None)
+    }
+}
+
+/// Adopt the inherited shared-memory file, if the parent attached one.
+pub fn adopt_shmem_file() -> io::Result<Option<File>> {
+    #[cfg(unix)]
+    {
+        return unix::adopt_file_from_env(ENV_SHMEM_FD);
+    }
+    #[cfg(windows)]
+    {
+        return windows::adopt_file_from_env(ENV_SHMEM_HANDLE);
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -105,20 +147,20 @@ pub fn adopt_document_file() -> io::Result<Option<File>> {
 
 fn spawn_impl(
     worker_exe: &Path,
-    doc: Option<&File>,
+    attachments: &SpawnAttachments<'_>,
     extra_env: &[(&str, &str)],
 ) -> io::Result<WorkerChild> {
     #[cfg(unix)]
     {
-        return unix::spawn_worker(worker_exe, doc, extra_env);
+        return unix::spawn_worker(worker_exe, attachments, extra_env);
     }
     #[cfg(windows)]
     {
-        return windows::spawn_worker(worker_exe, doc, extra_env);
+        return windows::spawn_worker(worker_exe, attachments, extra_env);
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (worker_exe, doc, extra_env);
+        let _ = (worker_exe, attachments, extra_env);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "spawn_worker unsupported on this OS",
@@ -174,8 +216,7 @@ mod unix {
     }
 
     fn clear_cloexec(fd: RawFd) -> io::Result<()> {
-        // SAFETY: `fd` is a live descriptor from our `File`/`UnixStream`.
-        // F_GETFD/F_SETFD only touch the close-on-exec flag.
+        // SAFETY: live FD from our File; only toggles close-on-exec.
         unsafe {
             let flags = fcntl(fd, F_GETFD, 0);
             if flags < 0 {
@@ -188,9 +229,16 @@ mod unix {
         Ok(())
     }
 
+    fn set_inherited_fd(cmd: &mut Command, env_key: &str, file: &File) -> io::Result<()> {
+        let fd = file.as_raw_fd();
+        clear_cloexec(fd)?;
+        cmd.env(env_key, fd.to_string());
+        Ok(())
+    }
+
     pub fn spawn_worker(
         worker_exe: &Path,
-        doc: Option<&File>,
+        attachments: &SpawnAttachments<'_>,
         extra_env: &[(&str, &str)],
     ) -> io::Result<WorkerChild> {
         let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -214,15 +262,19 @@ mod unix {
         cmd.env(ENV_IPC_SOCK, &sock_path)
             .env_remove(ENV_IPC_PORT)
             .env_remove(ENV_DOC_HANDLE)
+            .env_remove(ENV_SHMEM_HANDLE)
             .env_remove("PDF_PLATFORM_DOC_PATH");
         apply_extra_env(&mut cmd, extra_env);
 
-        if let Some(file) = doc {
-            let fd = file.as_raw_fd();
-            clear_cloexec(fd)?;
-            cmd.env(ENV_DOC_FD, fd.to_string());
+        if let Some(file) = attachments.doc {
+            set_inherited_fd(&mut cmd, ENV_DOC_FD, file)?;
         } else {
             cmd.env_remove(ENV_DOC_FD);
+        }
+        if let Some(file) = attachments.shmem {
+            set_inherited_fd(&mut cmd, ENV_SHMEM_FD, file)?;
+        } else {
+            cmd.env_remove(ENV_SHMEM_FD);
         }
 
         let child = cmd.spawn().map_err(|e| {
@@ -250,18 +302,17 @@ mod unix {
         Ok(Box::new(UnixWorkerTransport::from_stream(stream)))
     }
 
-    pub fn adopt_document_file() -> io::Result<Option<File>> {
-        let Ok(raw) = std::env::var(ENV_DOC_FD) else {
+    pub fn adopt_file_from_env(env_key: &str) -> io::Result<Option<File>> {
+        let Ok(raw) = std::env::var(env_key) else {
             return Ok(None);
         };
         let fd: RawFd = raw.parse().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("bad {ENV_DOC_FD}: {raw}"),
+                format!("bad {env_key}: {raw}"),
             )
         })?;
-        // SAFETY: parent set ENV_DOC_FD to an inheritable FD dedicated to this
-        // worker process; we take ownership exactly once.
+        // SAFETY: parent set env to an inheritable FD for this process only.
         let file = unsafe { File::from_raw_fd(fd) };
         Ok(Some(file))
     }
@@ -286,10 +337,13 @@ mod windows {
     }
 
     fn set_inheritable(handle: RawHandle) -> io::Result<()> {
-        // SAFETY: handle is a live Windows HANDLE from our File; SetHandleInformation
-        // only toggles the inherit flag (HANDLE_FLAG_INHERIT).
+        // SAFETY: live HANDLE from our File; only toggles inherit flag.
         let ok = unsafe {
-            SetHandleInformation(handle as *mut core::ffi::c_void, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+            SetHandleInformation(
+                handle as *mut core::ffi::c_void,
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            )
         };
         if ok == 0 {
             return Err(io::Error::last_os_error());
@@ -297,9 +351,16 @@ mod windows {
         Ok(())
     }
 
+    fn set_inherited_handle(cmd: &mut Command, env_key: &str, file: &File) -> io::Result<()> {
+        let handle = file.as_raw_handle();
+        set_inheritable(handle)?;
+        cmd.env(env_key, (handle as usize).to_string());
+        Ok(())
+    }
+
     pub fn spawn_worker(
         worker_exe: &Path,
-        doc: Option<&File>,
+        attachments: &SpawnAttachments<'_>,
         extra_env: &[(&str, &str)],
     ) -> io::Result<WorkerChild> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -309,16 +370,19 @@ mod windows {
         cmd.env(ENV_IPC_PORT, port.to_string())
             .env_remove(ENV_IPC_SOCK)
             .env_remove(ENV_DOC_FD)
+            .env_remove(ENV_SHMEM_FD)
             .env_remove("PDF_PLATFORM_DOC_PATH");
         apply_extra_env(&mut cmd, extra_env);
 
-        if let Some(file) = doc {
-            let handle = file.as_raw_handle();
-            set_inheritable(handle)?;
-            let as_int = handle as usize;
-            cmd.env(ENV_DOC_HANDLE, as_int.to_string());
+        if let Some(file) = attachments.doc {
+            set_inherited_handle(&mut cmd, ENV_DOC_HANDLE, file)?;
         } else {
             cmd.env_remove(ENV_DOC_HANDLE);
+        }
+        if let Some(file) = attachments.shmem {
+            set_inherited_handle(&mut cmd, ENV_SHMEM_HANDLE, file)?;
+        } else {
+            cmd.env_remove(ENV_SHMEM_HANDLE);
         }
 
         let child = cmd.spawn().map_err(|e| {
@@ -352,19 +416,18 @@ mod windows {
         Ok(Box::new(WindowsWorkerTransport::from_stream(stream)?))
     }
 
-    pub fn adopt_document_file() -> io::Result<Option<File>> {
-        let Ok(raw) = std::env::var(ENV_DOC_HANDLE) else {
+    pub fn adopt_file_from_env(env_key: &str) -> io::Result<Option<File>> {
+        let Ok(raw) = std::env::var(env_key) else {
             return Ok(None);
         };
         let as_int: usize = raw.parse().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("bad {ENV_DOC_HANDLE}: {raw}"),
+                format!("bad {env_key}: {raw}"),
             )
         })?;
         let handle = as_int as RawHandle;
-        // SAFETY: parent set ENV_DOC_HANDLE to an inheritable HANDLE value for
-        // this child only; we take ownership exactly once.
+        // SAFETY: parent set env to an inheritable HANDLE for this process only.
         let file = unsafe { File::from_raw_handle(handle) };
         Ok(Some(file))
     }
