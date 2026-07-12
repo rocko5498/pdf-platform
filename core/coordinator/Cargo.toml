@@ -1,0 +1,20 @@
+[package]
+name        = "coordinator"
+description = "DocumentCoordinator actor + global service wiring. [ADR-010, SDS §2.2]"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pdf-types       = { path = "../pdf-types" }
+pdf-cos         = { path = "../pdf-cos" }
+pdf-model       = { path = "../pdf-model" }
+engine-api      = { path = "../engine-api" }
+render-pipeline = { path = "../render-pipeline" }
+text-extract    = { path = "../text-extract" }
+search          = { path = "../search" }
+jobs            = { path = "../jobs" }
+sign            = { path = "../sign" }
+plugin-host     = { path = "../plugin-host" }
+sandbox         = { path = "../sandbox" }
+protocol        = { path = "../protocol" }
+diagnostics     = { path = "../diagnostics" }

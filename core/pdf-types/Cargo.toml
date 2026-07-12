@@ -1,0 +1,5 @@
+[package]
+name        = "pdf-types"
+description = "Shared primitives: geometry, object IDs, revision keys. ADR-025 foundation."
+version.workspace   = true
+edition.workspace   = true
