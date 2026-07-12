@@ -58,12 +58,25 @@ One workspace, one lockfile. It is a dev/CI utility, not a shipped product compo
 tools/
   corpus-diff/
     Cargo.toml            # workspace member, not its own [workspace]
-    src/main.rs
-    fixtures/
+    src/
+      lib.rs               # qpdf invocation + comparison logic (testable)
+      main.rs               # thin CLI: scans fixtures/, prints results, sets exit code
+    fixtures/               # the GATING corpus — valid files only, must always PASS
       valid-1page.pdf
       valid-3page.pdf
-      malformed-xref.pdf
+    tests/
+      fixtures/             # TEST-ONLY fixtures, never scanned by the gating binary
+        malformed-xref.pdf
+      integration.rs
 ```
+
+**Why malformed fixtures are not in `fixtures/`.** `fixtures/` is what the shipped
+binary scans to gate CI. A deliberately-broken file living there would make the
+harness report FAIL permanently, on every run, regardless of whether anything is
+actually wrong — a gate that's always red is not a gate. The malformed case still
+needs to exist (to prove `compare_fixture` correctly detects and reports a mismatch),
+so it lives under `tests/fixtures/`, read only by the test suite, never by the binary's
+own fixture scan.
 
 **Dependencies.** Path-deps on `coordinator` and `protocol` (siblings in the same
 workspace — reuse `coordinator::inspect`, the exact function the CLI calls, rather than
@@ -73,8 +86,14 @@ reimplementing scan logic). No new crates.io dependency.
 process, never linked (ADR-028's posture for AGPL/external-oracle tools: qpdf itself is
 Apache-2.0/Artistic and fine to link, but treating it as an external CLI oracle here
 matches how ADR-022 describes MuPDF/Acrobat oracle usage — invoked, not embedded).
-Command: `qpdf --show-npages <file>`. `qpdf` is **not installed in this environment**;
-it must be on PATH to actually run the tool (documented as a prerequisite, not vendored).
+Command: `qpdf --show-npages <file>`. `qpdf` must be on PATH (documented as a
+prerequisite, not vendored); confirmed installed and working (v12.3.2) during design.
+
+qpdf's exit code is **not** a reliable success signal on its own: on a recoverable file
+it exits `3` (warnings) but still prints a valid page count to stdout, while a truly
+unreadable file exits `2` with empty stdout (verified against both cases). The oracle
+call therefore parses stdout for an integer regardless of exit status, and only reports
+an oracle error when stdout has no parseable number.
 
 **Comparison (v1, one field).** For each fixture:
 1. Run `coordinator::inspect(path)` → `StructuralSummary.page_count`.
@@ -102,11 +121,12 @@ instead of N confusing per-file errors.
 
 ## Testing
 
-One integration test with a fixture whose page count is known-good (asserts PASS is
-reported) and one deliberately mismatched/malformed fixture (asserts FAIL is reported).
-Both are skipped with a clear message if `qpdf` is not found on PATH in the test
-environment — an external tool dependency is not something CI/dev setup should silently
-fake or a test should hard-fail on when it's simply absent.
+Integration test (`tests/integration.rs`) covering both outcomes: `tests/fixtures/`'s
+known-good file asserts PASS, `tests/fixtures/malformed-xref.pdf` asserts FAIL is
+reported with a reason mentioning the mismatch. Both are skipped with a clear message
+if `qpdf` is not found on PATH in the test environment — an external tool dependency is
+not something CI/dev setup should silently fake or a test should hard-fail on when it's
+simply absent.
 
 ## What this does NOT implement
 
@@ -121,8 +141,8 @@ fake or a test should hard-fail on when it's simply absent.
 
 1. `tools/corpus-diff` crate scaffold (Cargo.toml, added to `core/Cargo.toml`'s
    `members` via relative path — same workspace, same lockfile)
-2. Fixture PDFs (reuse/extend the byte-literal-style minimal PDFs already used in
-   `pdf-cos`'s test, plus one deliberately malformed one)
-3. `qpdf` presence check + `--show-npages` invocation and parsing
-4. Comparison loop + PASS/FAIL output + exit codes
+2. Gating fixtures (`fixtures/valid-1page.pdf`, `fixtures/valid-3page.pdf`) and the
+   test-only malformed fixture (`tests/fixtures/malformed-xref.pdf`)
+3. `qpdf` presence check + `--show-npages` invocation and stdout-based parsing
+4. Comparison loop (`compare_fixture`) + PASS/FAIL output + exit codes
 5. Integration tests (skip-if-missing-qpdf)
