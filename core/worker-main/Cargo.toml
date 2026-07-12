@@ -9,7 +9,8 @@ name = "worker"
 path = "src/main.rs"
 
 [features]
-default       = ["pdfium"]
+# Engine backends optional — ping/echo path needs none (M0 slice 2).
+default       = []
 pdfium        = ["dep:engine-pdfium"]
 hayro         = ["dep:engine-hayro"]
 
@@ -21,3 +22,8 @@ pdf-cos       = { path = "../pdf-cos" }
 sandbox       = { path = "../sandbox" }
 protocol      = { path = "../protocol" }
 diagnostics   = { path = "../diagnostics" }
+
+[dev-dependencies]
+# Integration tests link spawn + protocol types.
+sandbox       = { path = "../sandbox" }
+protocol      = { path = "../protocol" }
