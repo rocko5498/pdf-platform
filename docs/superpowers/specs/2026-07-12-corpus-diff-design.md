@@ -45,15 +45,19 @@ checked-in fixture corpus, CI-gateable exit code.
 
 ## Architecture
 
-New crate: `tools/corpus-diff` — a workspace member under `tools/`, per ADR-024's
-top-level layout (`tools/` holds "triage UI, corpus tooling, benchmark harness",
-distinct from `core/`'s product workspace). It is a dev/CI utility, not a shipped
-product component.
+New crate: `tools/corpus-diff` — directory placement follows ADR-024's top-level layout
+(`tools/` holds "triage UI, corpus tooling, benchmark harness"), but it is added as a
+**member of the existing `core/Cargo.toml` workspace** via a relative path
+(`"../tools/corpus-diff"`), not a second independent workspace. There is no root-level
+Cargo workspace in this repo (only `core/`), and `core/cli` is already nested the same
+way despite ADR-024's literal top-level `cli/` wording — a second workspace here would
+mean two `Cargo.lock`s that can drift, doubled compile/CI time, and no real benefit.
+One workspace, one lockfile. It is a dev/CI utility, not a shipped product component.
 
 ```
 tools/
   corpus-diff/
-    Cargo.toml
+    Cargo.toml            # workspace member, not its own [workspace]
     src/main.rs
     fixtures/
       valid-1page.pdf
@@ -61,9 +65,9 @@ tools/
       malformed-xref.pdf
 ```
 
-**Dependencies.** Path-deps on `coordinator` and `protocol` from `core/` (reuse
-`coordinator::inspect` — the exact function the CLI calls — rather than reimplementing
-scan logic). No new crates.io dependency.
+**Dependencies.** Path-deps on `coordinator` and `protocol` (siblings in the same
+workspace — reuse `coordinator::inspect`, the exact function the CLI calls, rather than
+reimplementing scan logic). No new crates.io dependency.
 
 **Oracle.** Shells out to the `qpdf` binary via `std::process::Command` — external
 process, never linked (ADR-028's posture for AGPL/external-oracle tools: qpdf itself is
@@ -115,7 +119,8 @@ fake or a test should hard-fail on when it's simply absent.
 
 ## Implementation order
 
-1. `tools/corpus-diff` crate scaffold (Cargo.toml, added to root workspace members)
+1. `tools/corpus-diff` crate scaffold (Cargo.toml, added to `core/Cargo.toml`'s
+   `members` via relative path — same workspace, same lockfile)
 2. Fixture PDFs (reuse/extend the byte-literal-style minimal PDFs already used in
    `pdf-cos`'s test, plus one deliberately malformed one)
 3. `qpdf` presence check + `--show-npages` invocation and parsing
