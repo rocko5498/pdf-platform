@@ -52,10 +52,24 @@ mod unix {
         }
 
         fn recv_timeout(&mut self, timeout: Duration) -> Result<Vec<u8>, TransportError> {
-            self.stream.set_read_timeout(Some(timeout))?;
+            // macOS may return EINVAL if the peer already closed the socket.
+            if let Err(e) = self.stream.set_read_timeout(Some(timeout)) {
+                return Err(map_dead_socket(e));
+            }
             let result = read_frame_into(&mut self.stream, &mut self.decoder);
             let _ = self.stream.set_read_timeout(None);
             result
+        }
+    }
+
+    fn map_dead_socket(e: io::Error) -> TransportError {
+        match e.kind() {
+            io::ErrorKind::InvalidInput
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted => TransportError::Disconnected,
+            _ => e.into(),
         }
     }
 
@@ -110,10 +124,23 @@ mod windows {
         }
 
         fn recv_timeout(&mut self, timeout: Duration) -> Result<Vec<u8>, TransportError> {
-            self.stream.set_read_timeout(Some(timeout))?;
+            if let Err(e) = self.stream.set_read_timeout(Some(timeout)) {
+                return Err(map_dead_socket(e));
+            }
             let result = read_frame_into(&mut self.stream, &mut self.decoder);
             let _ = self.stream.set_read_timeout(None);
             result
+        }
+    }
+
+    fn map_dead_socket(e: io::Error) -> TransportError {
+        match e.kind() {
+            io::ErrorKind::InvalidInput
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted => TransportError::Disconnected,
+            _ => e.into(),
         }
     }
 
@@ -161,17 +188,16 @@ mod tests {
     fn pair_disconnect_on_drop() {
         let (mut a, b) = pair().expect("pair");
         drop(b);
-        // Peer closed; next recv should surface Disconnected (or Io on some stacks).
+        // Peer closed → Disconnected. Some stacks need a send to notice.
         match a.recv_timeout(Duration::from_millis(500)) {
             Err(TransportError::Disconnected) => {}
-            Err(TransportError::Timeout) => {
-                // TCP may not signal EOF until a write/read path settles; try send.
+            Err(TransportError::Timeout) | Err(TransportError::Io(_)) => {
                 match a.send(b"x") {
                     Err(TransportError::Disconnected) | Err(TransportError::Io(_)) => {}
                     other => panic!("expected disconnect after drop, got {other:?}"),
                 }
             }
-            other => panic!("expected Disconnected/Timeout, got {other:?}"),
+            other => panic!("expected Disconnected/Timeout/Io, got {other:?}"),
         }
     }
 }

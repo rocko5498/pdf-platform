@@ -12,7 +12,7 @@ length-prefix framing + loopback + OS impls) without spawn, sandbox lockdown, or
 
 ---
 
-### Task 1: Framing + trait finalize in `protocol`
+### Task 1: Framing + trait finalize in `protocol` ✅ (PR #3 / `810dbdb`)
 
 **Files:**
 - Modify: `core/protocol/src/transport.rs`
@@ -33,7 +33,7 @@ length-prefix framing + loopback + OS impls) without spawn, sandbox lockdown, or
 
 ---
 
-### Task 2: Loopback transport
+### Task 2: Loopback transport ✅ (PR #3 / `810dbdb`)
 
 **Files:**
 - Modify: `core/protocol/src/transport.rs` (or `loopback.rs` + mod)
@@ -52,7 +52,7 @@ length-prefix framing + loopback + OS impls) without spawn, sandbox lockdown, or
 
 ---
 
-### Task 3: Unix domain socket transport (`sandbox`)
+### Task 3: Unix domain socket transport (`sandbox`) ✅ (PR #3; Windows TCP test pair stand-in)
 
 **Files:**
 - Modify: `core/sandbox/src/transport.rs`
@@ -70,7 +70,7 @@ length-prefix framing + loopback + OS impls) without spawn, sandbox lockdown, or
 
 ---
 
-### Task 4: Windows named pipe transport (`sandbox`)
+### Task 4: Windows named pipe transport (`sandbox`) ⚠️ deferred product path — TCP loopback test pair only (ponytail → spawn slice)
 
 **Files:**
 - Modify: `core/sandbox/src/transport.rs` (cfg windows modules)
