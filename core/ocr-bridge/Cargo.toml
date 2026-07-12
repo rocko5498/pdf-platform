@@ -1,0 +1,8 @@
+[package]
+name        = "ocr-bridge"
+description = "OcrEngine trait + Tesseract backend. STUB — M9. [ADR-018]"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pdf-types = { path = "../pdf-types" }

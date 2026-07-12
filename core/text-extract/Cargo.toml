@@ -1,0 +1,9 @@
+[package]
+name        = "text-extract"
+description = "Canonical per-page text model + extraction. STUB — M2. [ADR-019]"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pdf-types = { path = "../pdf-types" }
+pdf-cos   = { path = "../pdf-cos" }

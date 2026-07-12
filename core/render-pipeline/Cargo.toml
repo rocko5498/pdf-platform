@@ -1,0 +1,11 @@
+[package]
+name        = "render-pipeline"
+description = "Tile scheduler, generation counters, priority queues, shmem buffer pool. [ADR-007]"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pdf-types   = { path = "../pdf-types" }
+engine-api  = { path = "../engine-api" }
+protocol    = { path = "../protocol" }
+diagnostics = { path = "../diagnostics" }
