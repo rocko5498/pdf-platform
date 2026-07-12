@@ -1,0 +1,3 @@
+[toolchain]
+# Pinned stable toolchain per ADR-027. Update deliberately; record in CHANGELOG.
+channel = "stable"

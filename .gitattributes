@@ -1,0 +1,4 @@
+# PDF fixtures are offset-sensitive (xref tables). Never convert line endings.
+# Without this, Windows checkout with autocrlf corrupts page-count scans.
+# Cites: SDS §14 M0 corpus-diff gate, ADR-022
+*.pdf binary

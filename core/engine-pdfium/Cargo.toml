@@ -1,0 +1,11 @@
+[package]
+name        = "engine-pdfium"
+description = "PDFium rasterizer backend. Feature-gated; sandboxed in Z1. [ADR-005, SDS §13.4]"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+engine-api  = { path = "../engine-api" }
+pdf-types   = { path = "../pdf-types" }
+diagnostics = { path = "../diagnostics" }

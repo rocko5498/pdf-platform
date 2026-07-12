@@ -1,0 +1,8 @@
+[package]
+name        = "jobs"
+description = "Declarative job DAG scheduler, priority classes, cancel tokens. STUB — M6. [ADR-009]"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+protocol = { path = "../protocol" }

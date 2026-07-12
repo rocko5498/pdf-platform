@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    # Foundation
+    "pdf-types",
+    "pdf-cos",
+    "diagnostics",
+    # Model (stub — M3)
+    "pdf-model",
+    "pdf-write",
+    # Engine seam
+    "engine-api",
+    "engine-pdfium",
+    "engine-hayro",
+    # Services
+    "render-pipeline",
+    "text-extract",
+    "search",
+    "jobs",
+    "ocr-bridge",
+    "sign",
+    "plugin-host",
+    "sandbox",
+    # Composition
+    "protocol",
+    "coordinator",
+    "worker-main",
+    "ffi-bridge",
+    "cli",
+    # Dev/CI tooling
+    "../tools/corpus-diff",
+]
+
+[workspace.package]
+version   = "0.1.0"
+edition   = "2021"
+# MSRV: trailing ~2 stable versions per ADR-027
+rust-version = "1.80"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = "warn"

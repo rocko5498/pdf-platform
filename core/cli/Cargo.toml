@@ -1,0 +1,14 @@
+[package]
+name        = "cli"
+description = "Headless CLI client of the coordinator. Proves shell has no privileged capability. [ADR-025, SDS §2.10]"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pdf-platform"
+path = "src/main.rs"
+
+[dependencies]
+coordinator = { path = "../coordinator" }
+protocol    = { path = "../protocol" }
+diagnostics = { path = "../diagnostics" }

@@ -1,0 +1,80 @@
+# M0 PR gate — subset of ADR-029 (full path-aware/corpus/image-diff comes later).
+# Gates: workspace build + tests + corpus-diff (qpdf oracle).
+# Cites: ADR-029, ADR-022, SDS §14 M0 exit criteria.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # SDS §14 M0 wants multi-OS proof; this is the first automated slice.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    defaults:
+      run:
+        working-directory: core
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core -> target
+
+      - name: Install qpdf (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qpdf
+          qpdf --version
+
+      - name: Install qpdf (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install qpdf
+          qpdf --version
+
+      - name: Install qpdf (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Direct official release zip — more reliable than choco on GHA windows runners.
+          $version = "12.2.0"
+          $zip = Join-Path $env:RUNNER_TEMP "qpdf.zip"
+          $dest = Join-Path $env:RUNNER_TEMP "qpdf"
+          $url = "https://github.com/qpdf/qpdf/releases/download/v$version/qpdf-$version-msvc64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $qpdfExe = Get-ChildItem -Path $dest -Recurse -Filter qpdf.exe | Select-Object -First 1
+          if (-not $qpdfExe) { throw "qpdf.exe not found after extract from $url" }
+          $bin = $qpdfExe.Directory.FullName
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & $qpdfExe.FullName --version
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Run corpus-diff gate
+        run: cargo run -q -p corpus-diff

@@ -1,0 +1,16 @@
+[package]
+name        = "sandbox"
+description = "Per-OS worker confinement + WorkerTransport impls. [ADR-008, ADR-016, ADR-031]"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+protocol    = { path = "../protocol" }
+diagnostics = { path = "../diagnostics" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# seccomp-bpf + namespace setup; deps added at M0 implementation
+[target.'cfg(target_os = "windows")'.dependencies]
+# AppContainer + job-object setup; deps added at M0 implementation
+[target.'cfg(target_os = "macos")'.dependencies]
+# Sandbox profile setup; deps added at M0 implementation

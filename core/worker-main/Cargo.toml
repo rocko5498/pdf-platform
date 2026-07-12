@@ -1,0 +1,23 @@
+[package]
+name        = "worker-main"
+description = "Z1 worker process binary. Sandboxed; hosts the engine backend. [ADR-008, SDS §2.3]"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[features]
+default       = ["pdfium"]
+pdfium        = ["dep:engine-pdfium"]
+hayro         = ["dep:engine-hayro"]
+
+[dependencies]
+engine-api    = { path = "../engine-api" }
+engine-pdfium = { path = "../engine-pdfium", optional = true }
+engine-hayro  = { path = "../engine-hayro", optional = true }
+pdf-cos       = { path = "../pdf-cos" }
+sandbox       = { path = "../sandbox" }
+protocol      = { path = "../protocol" }
+diagnostics   = { path = "../diagnostics" }

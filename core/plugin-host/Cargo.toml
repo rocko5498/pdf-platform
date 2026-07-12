@@ -1,0 +1,8 @@
+[package]
+name        = "plugin-host"
+description = "Wasmtime WASM plugin execution + Z0 control plane. STUB — M11. [ADR-014, ADR-015]"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+protocol = { path = "../protocol" }

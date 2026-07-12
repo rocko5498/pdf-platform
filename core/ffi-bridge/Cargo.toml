@@ -1,0 +1,14 @@
+[package]
+name        = "ffi-bridge"
+description = "Sole Rust↔Qt FFI boundary. cxx-generated bridge. [ADR-004, ADR-025]"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+coordinator = { path = "../coordinator" }
+protocol    = { path = "../protocol" }
+cxx         = "1"
+
+[build-dependencies]
+cxx-build = "1"

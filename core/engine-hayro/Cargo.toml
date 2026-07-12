@@ -1,0 +1,9 @@
+[package]
+name        = "engine-hayro"
+description = "hayro experimental backend — compile-checked stub. [ADR-005]"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine-api = { path = "../engine-api" }
+pdf-types  = { path = "../pdf-types" }
