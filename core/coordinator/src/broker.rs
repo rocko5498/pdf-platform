@@ -8,20 +8,20 @@ use std::path::{Path, PathBuf};
 
 /// A document file opened by the broker for a session.
 ///
-/// Holds both the OS `File` (for future FD/HANDLE inherit) and the path
-/// (M0 worker still receives path — temporary zone debt; see design slice 4).
+/// Holds the OS `File` (inherited into the worker as FD/HANDLE) and the path
+/// for Z0 identity / logging only — path is not sent to Z1. [GR-1, handle-inherit]
 pub struct BrokeredFile {
     path: PathBuf,
     file: File,
 }
 
 impl BrokeredFile {
-    /// Path that was opened (for M0 env handoff only).
+    /// Path that was opened (Z0 only; not passed to the worker).
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Borrow the opened file (read-only intent).
+    /// Borrow the opened file (read-only intent; re-inherited on respawn).
     pub fn file(&self) -> &File {
         &self.file
     }
