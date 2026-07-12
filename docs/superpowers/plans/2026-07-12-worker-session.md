@@ -14,10 +14,10 @@
 
 ### Task 0: Preconditions (do not skip)
 
-- [ ] Confirm `main` contains transport + spawn (PR #3, #4).
-- [ ] Read design doc fully.
-- [ ] Branch from `main`.
-- [ ] Log intent in `.agent-state/log.md` + claim in `claims.md`.
+- [x] Confirm `main` contains transport + spawn (PR #3, #4).
+- [x] Read design doc fully.
+- [x] Branch from `main`.
+- [x] Log intent in `.agent-state/log.md` + claim in `claims.md`.
 
 ---
 
