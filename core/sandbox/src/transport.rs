@@ -1,13 +1,13 @@
-//! Platform `WorkerTransport` impls. [ADR-031, SDS §4.2, design 2026-07-12]
+//! Platform `WorkerTransport` impls. [ADR-031 / transport design, SDS §4.2]
 //!
-//! | OS      | Mechanism in this slice                                      |
-//! |---------|--------------------------------------------------------------|
-//! | Unix    | `UnixStream::pair` (`AF_UNIX` + `SOCK_STREAM`)               |
-//! | Windows | Connected `TcpStream` on `127.0.0.1` for in-process tests   |
+//! | OS      | In-process `pair()`              | Spawn path (`spawn` module)        |
+//! |---------|----------------------------------|------------------------------------|
+//! | Unix    | `UnixStream::pair`               | `UnixListener` + path in env       |
+//! | Windows | TCP loopback                     | TCP loopback port in env           |
 //!
-//! // ponytail: Windows production path is named-pipe inherit at `sandbox::spawn`
-//! // (next slice). Defer `windows-sys` until that slice needs it (ADR-028).
-//! // TCP loopback is only a test duplex stand-in — not the product IPC path.
+//! // ponytail: named-pipe inherit (Windows) and FD inherit (Unix) remain the
+//! // product-hardening path once confinement lands; connect-after-bind keeps
+//! // this slice std-only and free of new deps (ADR-028).
 
 use std::io;
 use std::time::Duration;
@@ -32,7 +32,8 @@ mod unix {
     }
 
     impl UnixWorkerTransport {
-        fn new(stream: UnixStream) -> Self {
+        /// Wrap an already-connected stream.
+        pub fn from_stream(stream: UnixStream) -> Self {
             Self {
                 stream,
                 decoder: FrameDecoder::new(),
@@ -42,7 +43,7 @@ mod unix {
         /// Connected pair for tests (no spawn required).
         pub fn pair() -> io::Result<(Self, Self)> {
             let (a, b) = UnixStream::pair()?;
-            Ok((Self::new(a), Self::new(b)))
+            Ok((Self::from_stream(a), Self::from_stream(b)))
         }
     }
 
@@ -83,7 +84,7 @@ mod unix {
 pub use unix::{pair, UnixWorkerTransport};
 
 // ---------------------------------------------------------------------------
-// Windows — test duplex via TCP loopback (named pipes next slice)
+// Windows — TCP loopback (std-only; named pipes deferred)
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
@@ -91,16 +92,17 @@ mod windows {
     use super::*;
     use std::net::{TcpListener, TcpStream};
 
-    /// Windows control-channel transport (test path: TCP loopback). [ADR-031]
+    /// Windows control-channel transport (TCP loopback for M0). [ADR-031]
     ///
-    /// Production will use named pipes once `sandbox::spawn` lands.
+    /// // ponytail: named-pipe inherit for confinement-ready spawn later.
     pub struct WindowsWorkerTransport {
         stream: TcpStream,
         decoder: FrameDecoder,
     }
 
     impl WindowsWorkerTransport {
-        fn from_stream(stream: TcpStream) -> io::Result<Self> {
+        /// Wrap an already-connected stream.
+        pub fn from_stream(stream: TcpStream) -> io::Result<Self> {
             stream.set_nodelay(true)?;
             Ok(Self {
                 stream,
@@ -188,7 +190,6 @@ mod tests {
     fn pair_disconnect_on_drop() {
         let (mut a, b) = pair().expect("pair");
         drop(b);
-        // Peer closed → Disconnected. Some stacks need a send to notice.
         match a.recv_timeout(Duration::from_millis(500)) {
             Err(TransportError::Disconnected) => {}
             Err(TransportError::Timeout) | Err(TransportError::Io(_)) => {
