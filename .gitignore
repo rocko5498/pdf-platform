@@ -28,6 +28,9 @@ Thumbs.db
 .idea/
 *.swp
 
+# Agent session state (ephemeral, not committed)
+.agent-state/
+
 # Secrets - never commit
 *.pem
 *.key
