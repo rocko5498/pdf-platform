@@ -9,7 +9,10 @@ pub struct LeniencyEvent {
 
 impl LeniencyEvent {
     pub fn new(kind: &'static str, detail: impl Into<String>) -> Self {
-        Self { kind, detail: detail.into() }
+        Self {
+            kind,
+            detail: detail.into(),
+        }
     }
 }
 

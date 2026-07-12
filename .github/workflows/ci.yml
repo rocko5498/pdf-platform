@@ -1,0 +1,76 @@
+# M0 PR gate — subset of ADR-029 (full path-aware/corpus/image-diff comes later).
+# Gates: workspace build + tests + corpus-diff (qpdf oracle).
+# Cites: ADR-029, ADR-022, SDS §14 M0 exit criteria.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # SDS §14 M0 wants multi-OS proof; this is the first automated slice.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    defaults:
+      run:
+        working-directory: core
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core -> target
+
+      - name: Install qpdf (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qpdf
+          qpdf --version
+
+      - name: Install qpdf (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install qpdf
+          qpdf --version
+
+      - name: Install qpdf (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install qpdf -y --no-progress
+          $qpdfDir = Get-ChildItem "C:\Program Files\qpdf*" -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+          if (-not $qpdfDir) { throw "qpdf install directory not found under C:\Program Files" }
+          $bin = Join-Path $qpdfDir.FullName "bin"
+          echo "$bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $bin "qpdf.exe") --version
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Run corpus-diff gate
+        run: cargo run -q -p corpus-diff

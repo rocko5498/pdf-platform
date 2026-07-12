@@ -1,4 +1,4 @@
-﻿//! `pdf-platform` CLI entry point. [ADR-025, FR-CLI, US-DEV-6, SDS §14 M0]
+//! `pdf-platform` CLI entry point. [ADR-025, FR-CLI, US-DEV-6, SDS §14 M0]
 //!
 //! M0 scope: structural summary only. Full CLI surface at M6.
 
@@ -29,7 +29,10 @@ fn main() {
             if s.leniency_count == 0 {
                 println!("Leniency:   0 repairs");
             } else {
-                println!("Leniency:   {} repair(s) — details on stderr", s.leniency_count);
+                println!(
+                    "Leniency:   {} repair(s) — details on stderr",
+                    s.leniency_count
+                );
                 for event in &s.leniency_events {
                     eprintln!("  leniency: {event}");
                 }
@@ -43,4 +46,10 @@ fn main() {
     }
 }
 
-fn yn(b: bool) -> &'static str { if b { "yes" } else { "no" } }
+fn yn(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}

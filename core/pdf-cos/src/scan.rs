@@ -1,10 +1,10 @@
-﻿//! Minimal structural scanner. [ADR-006, SDS §14 M0, FR-DIAG-2]
+//! Minimal structural scanner. [ADR-006, SDS §14 M0, FR-DIAG-2]
 //!
 //! Reads classic xref tables only. Compressed xref (PDF 1.5+), encryption,
 //! and linearized hint streams are deferred to M1.
 
-use std::path::Path;
 use crate::leniency::LeniencyEvent;
+use std::path::Path;
 
 /// Structural summary of a PDF document produced by the minimal M0 scanner.
 #[derive(Debug)]
@@ -30,10 +30,10 @@ pub enum ScanError {
 impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScanError::Io(e)        => write!(f, "I/O error: {e}"),
-            ScanError::NoStartxref  => write!(f, "no startxref marker found"),
-            ScanError::NoTrailer    => write!(f, "no trailer dictionary found"),
-            ScanError::NoRoot       => write!(f, "no /Root in trailer"),
+            ScanError::Io(e) => write!(f, "I/O error: {e}"),
+            ScanError::NoStartxref => write!(f, "no startxref marker found"),
+            ScanError::NoTrailer => write!(f, "no trailer dictionary found"),
+            ScanError::NoRoot => write!(f, "no /Root in trailer"),
             ScanError::MalformedXref => write!(f, "malformed xref table"),
         }
     }
@@ -42,7 +42,9 @@ impl std::fmt::Display for ScanError {
 impl std::error::Error for ScanError {}
 
 impl From<std::io::Error> for ScanError {
-    fn from(e: std::io::Error) -> Self { ScanError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        ScanError::Io(e)
+    }
 }
 
 /// Scan a PDF file and return its structural summary.
@@ -58,7 +60,10 @@ pub(crate) fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
     let mut leniency = Vec::new();
 
     if !data.starts_with(b"%PDF-") {
-        leniency.push(LeniencyEvent::new("missing-pdf-header", "no %PDF- marker at byte 0"));
+        leniency.push(LeniencyEvent::new(
+            "missing-pdf-header",
+            "no %PDF- marker at byte 0",
+        ));
     }
 
     let xref_offset = find_startxref(data).ok_or(ScanError::NoStartxref)?;
@@ -70,11 +75,12 @@ pub(crate) fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
 
     let has_acroform = find_key(catalog, b"/AcroForm").is_some();
     let has_xfa = find_key(catalog, b"/XFA").is_some()
-        || (has_acroform && fetch_key_dict(data, &xref, catalog, b"/AcroForm")
+        || (has_acroform
+            && fetch_key_dict(data, &xref, catalog, b"/AcroForm")
                 .map(|d| find_key(d, b"/XFA").is_some())
                 .unwrap_or(false));
-    let has_js = find_key(catalog, b"/JS").is_some()
-        || names_tree_has_javascript(data, &xref, catalog);
+    let has_js =
+        find_key(catalog, b"/JS").is_some() || names_tree_has_javascript(data, &xref, catalog);
 
     let page_count = find_indirect_ref(catalog, b"/Pages")
         .and_then(|(n, _)| fetch_object(data, &xref, n))
@@ -82,20 +88,28 @@ pub(crate) fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
         .unwrap_or(0) as u32;
 
     let sig_count = if has_acroform {
-        count_sig_field_pattern(
-            fetch_key_dict(data, &xref, catalog, b"/AcroForm").unwrap_or(b""),
-        )
+        count_sig_field_pattern(fetch_key_dict(data, &xref, catalog, b"/AcroForm").unwrap_or(b""))
     } else {
         0
     };
 
-    Ok(DocumentStructure { page_count, has_acroform, has_xfa, has_js, sig_count, leniency })
+    Ok(DocumentStructure {
+        page_count,
+        has_acroform,
+        has_xfa,
+        has_js,
+        sig_count,
+        leniency,
+    })
 }
 
 // --- private helpers ---
 
 #[derive(Clone, Default)]
-struct XrefEntry { offset: u64, in_use: bool }
+struct XrefEntry {
+    offset: u64,
+    in_use: bool,
+}
 
 /// Scan last 1024 bytes for `startxref\n<N>`, return N as a file offset.
 fn find_startxref(data: &[u8]) -> Option<usize> {
@@ -105,13 +119,19 @@ fn find_startxref(data: &[u8]) -> Option<usize> {
     // Find last occurrence of NEEDLE
     let mut last = None;
     for i in 0..=tail.len().saturating_sub(NEEDLE.len()) {
-        if &tail[i..i + NEEDLE.len()] == NEEDLE { last = Some(i); }
+        if &tail[i..i + NEEDLE.len()] == NEEDLE {
+            last = Some(i);
+        }
     }
     let pos = last?;
     let mut i = pos + NEEDLE.len();
-    while i < tail.len() && matches!(tail[i], b' ' | b'\r' | b'\n') { i += 1; }
+    while i < tail.len() && matches!(tail[i], b' ' | b'\r' | b'\n') {
+        i += 1;
+    }
     let start = i;
-    while i < tail.len() && tail[i].is_ascii_digit() { i += 1; }
+    while i < tail.len() && tail[i].is_ascii_digit() {
+        i += 1;
+    }
     std::str::from_utf8(&tail[start..i]).ok()?.parse().ok()
 }
 
@@ -133,19 +153,32 @@ fn parse_xref_table(
 
     loop {
         // Check for trailer keyword — marks end of xref sections.
-        if d.get(pos..).map_or(false, |s| s.starts_with(b"trailer")) { break; }
+        if d.get(pos..).map_or(false, |s| s.starts_with(b"trailer")) {
+            break;
+        }
 
-        let first = match parse_uint(d, &mut pos) { Some(n) => n, None => break };
+        let first = match parse_uint(d, &mut pos) {
+            Some(n) => n,
+            None => break,
+        };
         skip_ws(d, &mut pos);
-        let count = match parse_uint(d, &mut pos) { Some(n) => n, None => break };
+        let count = match parse_uint(d, &mut pos) {
+            Some(n) => n,
+            None => break,
+        };
         skip_eol(d, &mut pos);
 
         let needed = first + count;
-        if entries.len() < needed { entries.resize(needed, XrefEntry::default()); }
+        if entries.len() < needed {
+            entries.resize(needed, XrefEntry::default());
+        }
 
         for obj in first..first + count {
             if pos + 20 > d.len() {
-                leniency.push(LeniencyEvent::new("xref-truncated", "xref table ends early"));
+                leniency.push(LeniencyEvent::new(
+                    "xref-truncated",
+                    "xref table ends early",
+                ));
                 break;
             }
             let entry_bytes = &d[pos..pos + 20];
@@ -156,7 +189,10 @@ fn parse_xref_table(
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(0);
-            entries[obj] = XrefEntry { offset: byte_offset, in_use };
+            entries[obj] = XrefEntry {
+                offset: byte_offset,
+                in_use,
+            };
             pos += 20;
         }
     }
@@ -175,15 +211,24 @@ fn find_trailer<'a>(data: &'a [u8], xref_offset: usize) -> Option<&'a [u8]> {
 /// Fetch the body of an indirect object by number (between obj/endobj).
 fn fetch_object<'a>(data: &'a [u8], xref: &[XrefEntry], num: u32) -> Option<&'a [u8]> {
     let entry = xref.get(num as usize)?;
-    if !entry.in_use { return None; }
+    if !entry.in_use {
+        return None;
+    }
     let d = data.get(entry.offset as usize..)?;
     // Skip "N G obj" header + whitespace
     let body_start = d.windows(4).position(|w| w == b" obj").map(|p| {
         let after = p + 4;
-        after + d[after..].iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n')).unwrap_or(0)
+        after
+            + d[after..]
+                .iter()
+                .position(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                .unwrap_or(0)
     })?;
     let body = &d[body_start..];
-    let end = body.windows(6).position(|w| w == b"endobj").unwrap_or(body.len());
+    let end = body
+        .windows(6)
+        .position(|w| w == b"endobj")
+        .unwrap_or(body.len());
     Some(&body[..end])
 }
 
@@ -202,7 +247,11 @@ fn find_indirect_ref(data: &[u8], key: &[u8]) -> Option<(u32, u16)> {
     skip_ws(after, &mut i);
     let gen_num = parse_uint(after, &mut i)? as u16;
     skip_ws(after, &mut i);
-    if after.get(i) == Some(&b'R') { Some((obj_num, gen_num)) } else { None }
+    if after.get(i) == Some(&b'R') {
+        Some((obj_num, gen_num))
+    } else {
+        None
+    }
 }
 
 /// Follow an indirect ref from a named key and return the target object body.
@@ -223,10 +272,16 @@ fn parse_int_after_key(data: &[u8], key: &[u8]) -> Option<i64> {
     let mut i = 0;
     skip_ws(after, &mut i);
     let neg = after.get(i) == Some(&b'-');
-    if neg { i += 1; }
+    if neg {
+        i += 1;
+    }
     let start = i;
-    while i < after.len() && after[i].is_ascii_digit() { i += 1; }
-    if i == start { return None; }
+    while i < after.len() && after[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
     let n: i64 = std::str::from_utf8(&after[start..i]).ok()?.parse().ok()?;
     Some(if neg { -n } else { n })
 }
@@ -245,25 +300,40 @@ fn count_sig_field_pattern(acroform_body: &[u8]) -> u32 {
     let mut count = 0u32;
     let mut i = 0;
     while i + SIG.len() <= acroform_body.len() {
-        if &acroform_body[i..i + SIG.len()] == SIG { count += 1; i += SIG.len(); } else { i += 1; }
+        if &acroform_body[i..i + SIG.len()] == SIG {
+            count += 1;
+            i += SIG.len();
+        } else {
+            i += 1;
+        }
     }
     count
 }
 
 fn parse_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
     let start = *pos;
-    while *pos < data.len() && data[*pos].is_ascii_digit() { *pos += 1; }
-    if *pos == start { return None; }
+    while *pos < data.len() && data[*pos].is_ascii_digit() {
+        *pos += 1;
+    }
+    if *pos == start {
+        return None;
+    }
     std::str::from_utf8(&data[start..*pos]).ok()?.parse().ok()
 }
 
 fn skip_ws(data: &[u8], pos: &mut usize) {
-    while *pos < data.len() && matches!(data[*pos], b' ' | b'\t' | b'\r' | b'\n') { *pos += 1; }
+    while *pos < data.len() && matches!(data[*pos], b' ' | b'\t' | b'\r' | b'\n') {
+        *pos += 1;
+    }
 }
 
 fn skip_eol(data: &[u8], pos: &mut usize) {
-    if data.get(*pos) == Some(&b'\r') { *pos += 1; }
-    if data.get(*pos) == Some(&b'\n') { *pos += 1; }
+    if data.get(*pos) == Some(&b'\r') {
+        *pos += 1;
+    }
+    if data.get(*pos) == Some(&b'\n') {
+        *pos += 1;
+    }
 }
 
 #[cfg(test)]

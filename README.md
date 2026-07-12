@@ -23,9 +23,29 @@ Precedence on conflict: ADR -> SDS -> PRD -> UI/UX Design System -> Implementati
 
 ## Status
 
-Pre-development. Current focus: milestone M0 (walking skeleton) per SDS section 14.
+**Milestone M0** (walking skeleton) per SDS §14 — in progress.
+
+| Piece | Status |
+|-------|--------|
+| CLI structural summary (`pdf-platform <file>`) | Working on `main` / PR stack |
+| Corpus-diff harness (our scanner vs `qpdf`) | On PR — must stay green in CI |
+| Tile via bridge + IPC + shmem + sandbox | Not yet (hard plumbing next) |
+| CI gate | GitHub Actions: build/test + corpus-diff on 3 OSes |
+
+## Build (Rust tools only, for now)
+
+Requires: Rust stable, and [`qpdf`](https://qpdf.sourceforge.io/) on `PATH` for corpus-diff.
+
+```bash
+cd core
+cargo build -p cli
+cargo run -p cli --bin pdf-platform -- path/to/file.pdf
+cargo test --workspace
+cargo run -p corpus-diff   # needs qpdf; exit 0 = gate pass
+```
+
+The Qt shell and sandboxed worker render path are not wired yet — that is the rest of M0.
 
 ## License
 
-_To be finalized before first substantive commit._ See ADR direction:
-GPLv3 application + permissive core/plugin seams.
+GPLv3 — see [LICENSE](LICENSE).

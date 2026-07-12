@@ -4,5 +4,5 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod init;     // initialise tracing subscriber; ring-buffer backend
-pub mod redact;   // Redacted<T> wrapper — redacts Display/Debug in release
+pub mod init; // initialise tracing subscriber; ring-buffer backend
+pub mod redact; // Redacted<T> wrapper — redacts Display/Debug in release

@@ -20,7 +20,10 @@ pub fn qpdf_page_count(path: &Path) -> Result<u32, String> {
         .output()
         .map_err(|e| format!("failed to run qpdf: {e}"))?;
 
-    match String::from_utf8_lossy(&output.stdout).trim().parse::<u32>() {
+    match String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+    {
         Ok(n) => Ok(n),
         Err(_) => Err(format!(
             "qpdf reported no page count: {}",
@@ -47,7 +50,10 @@ pub fn compare_fixture(path: &Path) -> FixtureResult {
     let theirs = qpdf_page_count(path);
 
     match (ours, theirs) {
-        (Ok(o), Ok(q)) if o == q => FixtureResult::Pass { file, page_count: o },
+        (Ok(o), Ok(q)) if o == q => FixtureResult::Pass {
+            file,
+            page_count: o,
+        },
         (Ok(o), Ok(q)) => FixtureResult::Fail {
             file,
             reason: format!("page count mismatch: ours={o}, qpdf={q}"),
@@ -73,7 +79,9 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(name)
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(name)
     }
 
     #[test]
