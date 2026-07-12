@@ -1,4 +1,6 @@
 # Project: Open-source professional PDF platform
+# See AGENTS.md for the universal AI agent coordination document (tool-agnostic, all agents read it)
+
 
 ## Canonical documents (authoritative - read before acting)
 Precedence on conflict: ADR -> SDS -> PRD -> UI/UX Design System -> IMPLEMENTATION_GUIDE.
@@ -24,3 +26,10 @@ Precedence on conflict: ADR -> SDS -> PRD -> UI/UX Design System -> IMPLEMENTATI
 - Respect the stability contract: don't change shortcuts, menu taxonomy,
   focus order, or default workspaces.
 - Small, reviewable diffs. Surface uncertainty honestly.
+
+## pddf — Work Mode Activation
+When user types `pddf` (alone or as the whole message), run this sequence every time:
+1. Invoke `Skill("claude-mem:mem-search")` with query "current milestone tasks status"
+2. Report a ≤5-line status handoff: current milestone, what's done, any blockers, next task candidate
+3. Ask "What are we building?" unless the user already stated it in the same message
+This is the session-start ritual for this project — always run it fully, no shortcuts.
