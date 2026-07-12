@@ -650,6 +650,7 @@ dependencies = [
 name = "worker-main"
 version = "0.1.0"
 dependencies = [
+ "coordinator",
  "diagnostics",
  "engine-api",
  "engine-hayro",
