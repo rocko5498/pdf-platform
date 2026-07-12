@@ -5,13 +5,15 @@
 //!
 //! ## Env contract (child)
 //!
-//! | OS      | Variable                 | Meaning                          |
-//! |---------|--------------------------|----------------------------------|
-//! | Unix    | `PDF_PLATFORM_IPC_SOCK`  | Path to `UnixListener` socket    |
-//! | Windows | `PDF_PLATFORM_IPC_PORT`  | `127.0.0.1` TCP port to connect  |
+//! | OS / role | Variable                  | Meaning |
+//! |-----------|---------------------------|---------|
+//! | Unix IPC  | `PDF_PLATFORM_IPC_SOCK`   | Path to `UnixListener` socket |
+//! | Windows IPC | `PDF_PLATFORM_IPC_PORT` | `127.0.0.1` TCP port to connect |
+//! | Document (M0) | `PDF_PLATFORM_DOC_PATH` | Absolute path for worker scan |
 //!
-//! // ponytail: connect-after-bind avoids FD CLOEXEC / named-pipe deps for this
-//! // slice. Product hardening = inherit FD/HANDLE before confinement (design).
+//! // ponytail: DOC_PATH in Z1 is temporary zone debt — replace with inherited
+//! // FD/HANDLE before confinement (design 2026-07-12-worker-open-inspect).
+//! // ponytail: connect-after-bind IPC (not FD inherit) until confinement slice.
 
 use std::io;
 use std::path::Path;
@@ -20,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use protocol::transport::WorkerTransport;
+use protocol::transport::WorkerTransport as _;
 
 /// Env var: Unix domain socket path the worker must connect to.
 pub const ENV_IPC_SOCK: &str = "PDF_PLATFORM_IPC_SOCK";
@@ -28,32 +30,40 @@ pub const ENV_IPC_SOCK: &str = "PDF_PLATFORM_IPC_SOCK";
 pub const ENV_IPC_PORT: &str = "PDF_PLATFORM_IPC_PORT";
 /// Optional override for worker binary path (tests / packaging).
 pub const ENV_WORKER_PATH: &str = "PDF_PLATFORM_WORKER_PATH";
+/// Document path for worker structural scan (M0 temporary; not final zone model).
+pub const ENV_DOC_PATH: &str = "PDF_PLATFORM_DOC_PATH";
 
 static SPAWN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Parent-side handle: framed IPC + child process. [SDS §10.1]
 pub struct WorkerChild {
     /// Control channel to the worker.
-    pub transport: Box<dyn WorkerTransport>,
+    pub transport: Box<dyn protocol::transport::WorkerTransport>,
     /// OS process; drop does not kill — call `kill` or `wait` explicitly.
     pub child: Child,
 }
 
 /// Spawn `worker_exe` and establish a framed control channel.
-///
-/// No sandbox lockdown is applied (slice 2). See module docs for env contract.
 pub fn spawn_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
+    spawn_worker_with_env(worker_exe, &[])
+}
+
+/// Like [`spawn_worker`], with extra environment variables for the child.
+pub fn spawn_worker_with_env(
+    worker_exe: &Path,
+    extra_env: &[(&str, &str)],
+) -> io::Result<WorkerChild> {
     #[cfg(unix)]
     {
-        return unix::spawn_worker(worker_exe);
+        return unix::spawn_worker(worker_exe, extra_env);
     }
     #[cfg(windows)]
     {
-        return windows::spawn_worker(worker_exe);
+        return windows::spawn_worker(worker_exe, extra_env);
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = worker_exe;
+        let _ = (worker_exe, extra_env);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "spawn_worker unsupported on this OS",
@@ -62,7 +72,7 @@ pub fn spawn_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
 }
 
 /// Adopt the inherited/connect IPC end inside the worker process.
-pub fn adopt_inherited() -> io::Result<Box<dyn WorkerTransport>> {
+pub fn adopt_inherited() -> io::Result<Box<dyn protocol::transport::WorkerTransport>> {
     #[cfg(unix)]
     {
         return unix::adopt_inherited();
@@ -80,8 +90,14 @@ pub fn adopt_inherited() -> io::Result<Box<dyn WorkerTransport>> {
     }
 }
 
+fn apply_extra_env(cmd: &mut Command, extra_env: &[(&str, &str)]) {
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Unix — UnixListener path
+// Unix
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -91,7 +107,10 @@ mod unix {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
 
-    pub fn spawn_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
+    pub fn spawn_worker(
+        worker_exe: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> io::Result<WorkerChild> {
         let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
         let sock_path: PathBuf = std::env::temp_dir().join(format!(
             "pdf-platform-ipc-{}-{}.sock",
@@ -101,7 +120,6 @@ mod unix {
         let _ = std::fs::remove_file(&sock_path);
 
         let listener = UnixListener::bind(&sock_path)?;
-        // Bound path must be cleaned up if spawn/accept fails.
         struct Unlink(PathBuf);
         impl Drop for Unlink {
             fn drop(&mut self) {
@@ -110,29 +128,24 @@ mod unix {
         }
         let unlink = Unlink(sock_path.clone());
 
-        let child = Command::new(worker_exe)
-            .env(ENV_IPC_SOCK, &sock_path)
-            .env_remove(ENV_IPC_PORT)
-            .spawn()
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("spawn {}: {e}", worker_exe.display()),
-                )
-            })?;
-
-        // Child retries connect; parent blocks on accept.
-        listener.set_nonblocking(false)?;
-        let (stream, _) = listener.accept().map_err(|e| {
-            io::Error::new(e.kind(), format!("accept worker IPC: {e}"))
+        let mut cmd = Command::new(worker_exe);
+        cmd.env(ENV_IPC_SOCK, &sock_path).env_remove(ENV_IPC_PORT);
+        apply_extra_env(&mut cmd, extra_env);
+        let child = cmd.spawn().map_err(|e| {
+            io::Error::new(e.kind(), format!("spawn {}: {e}", worker_exe.display()))
         })?;
-        drop(unlink); // socket file no longer needed once connected
+
+        listener.set_nonblocking(false)?;
+        let (stream, _) = listener
+            .accept()
+            .map_err(|e| io::Error::new(e.kind(), format!("accept worker IPC: {e}")))?;
+        drop(unlink);
 
         let transport = Box::new(UnixWorkerTransport::from_stream(stream));
         Ok(WorkerChild { transport, child })
     }
 
-    pub fn adopt_inherited() -> io::Result<Box<dyn WorkerTransport>> {
+    pub fn adopt_inherited() -> io::Result<Box<dyn protocol::transport::WorkerTransport>> {
         let path = std::env::var(ENV_IPC_SOCK).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -145,7 +158,7 @@ mod unix {
 }
 
 // ---------------------------------------------------------------------------
-// Windows — TCP loopback port
+// Windows
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
@@ -154,29 +167,29 @@ mod windows {
     use crate::transport::WindowsWorkerTransport;
     use std::net::{TcpListener, TcpStream};
 
-    pub fn spawn_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
+    pub fn spawn_worker(
+        worker_exe: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> io::Result<WorkerChild> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
 
-        let child = Command::new(worker_exe)
-            .env(ENV_IPC_PORT, port.to_string())
-            .env_remove(ENV_IPC_SOCK)
-            .spawn()
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("spawn {}: {e}", worker_exe.display()),
-                )
-            })?;
-
-        let (stream, _) = listener.accept().map_err(|e| {
-            io::Error::new(e.kind(), format!("accept worker IPC: {e}"))
+        let mut cmd = Command::new(worker_exe);
+        cmd.env(ENV_IPC_PORT, port.to_string())
+            .env_remove(ENV_IPC_SOCK);
+        apply_extra_env(&mut cmd, extra_env);
+        let child = cmd.spawn().map_err(|e| {
+            io::Error::new(e.kind(), format!("spawn {}: {e}", worker_exe.display()))
         })?;
+
+        let (stream, _) = listener
+            .accept()
+            .map_err(|e| io::Error::new(e.kind(), format!("accept worker IPC: {e}")))?;
         let transport = Box::new(WindowsWorkerTransport::from_stream(stream)?);
         Ok(WorkerChild { transport, child })
     }
 
-    pub fn adopt_inherited() -> io::Result<Box<dyn WorkerTransport>> {
+    pub fn adopt_inherited() -> io::Result<Box<dyn protocol::transport::WorkerTransport>> {
         let port: u16 = std::env::var(ENV_IPC_PORT)
             .map_err(|_| {
                 io::Error::new(
@@ -197,7 +210,6 @@ mod windows {
     }
 }
 
-/// Retry connect until parent is listening (spawn race).
 fn connect_with_retry<T, F>(mut connect: F, attempts: u32, delay_ms: u64) -> io::Result<T>
 where
     F: FnMut() -> io::Result<T>,

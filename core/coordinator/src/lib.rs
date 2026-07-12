@@ -8,5 +8,5 @@ pub mod document; // DocumentCoordinator actor; per-document owned state + chann
 pub mod inspect; // Synchronous inspect for CLI diagnostic path [ADR-010, FR-DIAG-2]
 pub mod memory; // CacheGovernor + MemoryGovernor [SDS §2.2.4, ADR-011]
 pub mod render; // RenderScheduler: viewport → tile requests [SDS §2.2.2]
-pub mod session; // WorkerSession: spawn/poll/death detect [SDS §10.1 M0 slice 3]
+pub mod session; // WorkerSession: spawn/poll/death/inspect [SDS §10.1, §3.1]
 pub mod settings; // Settings: UI prefs + enterprise policy overlay [SDS §2.2.11]

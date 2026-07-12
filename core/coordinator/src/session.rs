@@ -1,16 +1,17 @@
-//! Worker session lifecycle: spawn, poll, death detection. [SDS §10.1, ADR-008, ADR-021]
+//! Worker session lifecycle: spawn, poll, death detection, inspect. [SDS §10.1, §3.1, ADR-008]
 //!
-//! M0 slice 3: detect worker death and emit `WorkerDied`. Full recovery
-//! (re-broker file, re-parse, re-render) is **out of scope**.
+//! M0: death detect + multi-process structural inspect. Full recovery / handle-inherit later.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::broker::BrokeredFile;
 use protocol::events::{CoordinatorEvent, WorkerDeathReason};
+use protocol::inspect::{decode_summary, StructuralSummary};
 use protocol::transport::{TransportError, WorkerTransport as _};
-use sandbox::spawn::{spawn_worker, WorkerChild};
+use sandbox::spawn::{spawn_worker, spawn_worker_with_env, WorkerChild, ENV_DOC_PATH};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -24,6 +25,8 @@ pub enum SessionError {
         /// Short static description of the invalid transition.
         &'static str,
     ),
+    /// Protocol / codec failure (inspect reply).
+    Protocol(String),
 }
 
 impl std::fmt::Display for SessionError {
@@ -31,6 +34,7 @@ impl std::fmt::Display for SessionError {
         match self {
             SessionError::Io(e) => write!(f, "session io: {e}"),
             SessionError::InvalidState(s) => write!(f, "session invalid state: {s}"),
+            SessionError::Protocol(s) => write!(f, "session protocol: {s}"),
         }
     }
 }
@@ -39,7 +43,7 @@ impl std::error::Error for SessionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             SessionError::Io(e) => Some(e),
-            SessionError::InvalidState(_) => None,
+            SessionError::InvalidState(_) | SessionError::Protocol(_) => None,
         }
     }
 }
@@ -61,7 +65,7 @@ enum LiveState {
     },
 }
 
-/// One worker-backed session (M0: no document file yet).
+/// One worker-backed session.
 pub struct WorkerSession {
     id: u64,
     worker_exe: PathBuf,
@@ -69,7 +73,7 @@ pub struct WorkerSession {
 }
 
 impl WorkerSession {
-    /// Spawn a worker and attach it to a new session.
+    /// Spawn a worker and attach it to a new session (no document).
     pub fn spawn(worker_exe: &Path) -> Result<Self, SessionError> {
         let child = spawn_worker(worker_exe)?;
         Ok(Self {
@@ -77,6 +81,29 @@ impl WorkerSession {
             worker_exe: worker_exe.to_path_buf(),
             state: LiveState::Alive { child },
         })
+    }
+
+    /// Spawn a worker with a brokered document path for structural inspect. [SDS §3.1]
+    ///
+    /// // ponytail: passes DOC_PATH into Z1 — temporary until FD/HANDLE inherit.
+    pub fn spawn_with_document(
+        worker_exe: &Path,
+        doc: &BrokeredFile,
+    ) -> Result<Self, SessionError> {
+        let path = doc.path().to_string_lossy().into_owned();
+        let child = spawn_worker_with_env(worker_exe, &[(ENV_DOC_PATH, path.as_str())])?;
+        Ok(Self {
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            worker_exe: worker_exe.to_path_buf(),
+            state: LiveState::Alive { child },
+        })
+    }
+
+    /// Request a structural summary from the worker (`inspect` frame).
+    pub fn inspect(&mut self) -> Result<StructuralSummary, SessionError> {
+        self.send(b"inspect")?;
+        let body = self.recv_frame(Duration::from_secs(30))?;
+        decode_summary(&body).map_err(|e| SessionError::Protocol(e.to_string()))
     }
 
     /// Local session id.
@@ -105,6 +132,17 @@ impl WorkerSession {
         }
     }
 
+    /// Receive one frame with timeout (tests / inspect).
+    pub fn recv_frame(&mut self, timeout: Duration) -> Result<Vec<u8>, SessionError> {
+        match &mut self.state {
+            LiveState::Alive { child } => child
+                .transport
+                .recv_timeout(timeout)
+                .map_err(transport_to_session_err),
+            LiveState::Dead { .. } => Err(SessionError::InvalidState("worker dead")),
+        }
+    }
+
     /// Fault-injection: kill the worker process. [ADR-022]
     pub fn kill_worker(&mut self) -> Result<(), SessionError> {
         match &mut self.state {
@@ -118,9 +156,6 @@ impl WorkerSession {
     }
 
     /// Poll for liveness / inbound frames / death. [SDS §10.1]
-    ///
-    /// Does not block longer than roughly `timeout` for IPC receive.
-    /// Emits at most one `WorkerDied` per death until `respawn_ping_only`.
     pub fn poll(&mut self, timeout: Duration) -> Result<Vec<CoordinatorEvent>, SessionError> {
         match &mut self.state {
             LiveState::Dead { reason, emitted } => {
@@ -135,7 +170,6 @@ impl WorkerSession {
                 }])
             }
             LiveState::Alive { child } => {
-                // 1) Process exit first.
                 if let Some(status) = child.child.try_wait()? {
                     let reason = WorkerDeathReason::ProcessExited {
                         code: status.code(),
@@ -150,12 +184,8 @@ impl WorkerSession {
                     }]);
                 }
 
-                // 2) IPC receive with timeout.
                 match child.transport.recv_timeout(timeout) {
-                    Ok(_frame) => {
-                        // M0: unsolicited frames ignored (echo tests use send/recv helpers).
-                        Ok(vec![])
-                    }
+                    Ok(_frame) => Ok(vec![]),
                     Err(TransportError::Timeout) => Ok(vec![]),
                     Err(TransportError::Disconnected) => {
                         let reason = WorkerDeathReason::IpcDisconnected;
@@ -199,7 +229,7 @@ impl WorkerSession {
         }
     }
 
-    /// After death: spawn a new worker (ping path only — no file broker). [design slice 3]
+    /// After death: spawn a new worker (ping path only — no document). [design slice 3]
     pub fn respawn_ping_only(&mut self) -> Result<(), SessionError> {
         match &self.state {
             LiveState::Alive { .. } => {

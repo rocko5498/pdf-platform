@@ -50,8 +50,13 @@ impl From<std::io::Error> for ScanError {
 /// Scan a PDF file and return its structural summary.
 pub fn scan_structure(path: &Path) -> Result<DocumentStructure, ScanError> {
     let file = std::fs::File::open(path)?;
+    scan_file(&file)
+}
+
+/// Scan an already-opened file (read-only mmap). [ADR-011, SDS §3.1 step 4]
+pub fn scan_file(file: &std::fs::File) -> Result<DocumentStructure, ScanError> {
     // SAFETY: read-only shared mapping; the file is not mutated while the Mmap is live.
-    let map = unsafe { memmap2::Mmap::map(&file) }?;
+    let map = unsafe { memmap2::Mmap::map(file) }?;
     scan_bytes(&map)
 }
 
