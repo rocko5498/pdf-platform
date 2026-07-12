@@ -1,6 +1,6 @@
-//! Worker session lifecycle: spawn, poll, death detection, inspect. [SDS §10.1, §3.1, ADR-008]
+//! Worker session lifecycle: spawn, poll, death, inspect, respawn. [SDS §10.1, §3.1, ADR-008]
 //!
-//! M0: death detect + multi-process structural inspect. Full recovery / handle-inherit later.
+//! M0: multi-process inspect + kill → respawn with document re-inherit.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -65,11 +65,13 @@ enum LiveState {
     },
 }
 
-/// One worker-backed session.
+/// One worker-backed session (optionally owns a brokered document).
 pub struct WorkerSession {
     id: u64,
     worker_exe: PathBuf,
     state: LiveState,
+    /// Z0-owned document; re-inherited on each spawn/respawn. [SDS §10.1 step 2]
+    doc: Option<BrokeredFile>,
 }
 
 impl WorkerSession {
@@ -80,21 +82,23 @@ impl WorkerSession {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             worker_exe: worker_exe.to_path_buf(),
             state: LiveState::Alive { child },
+            doc: None,
         })
     }
 
     /// Spawn a worker with a brokered document via inherited FD/HANDLE. [SDS §3.1, GR-1]
     ///
-    /// Path string is **not** passed to the worker.
+    /// Takes ownership of `doc` so the session can re-inherit on respawn.
     pub fn spawn_with_document(
         worker_exe: &Path,
-        doc: &BrokeredFile,
+        doc: BrokeredFile,
     ) -> Result<Self, SessionError> {
         let child = spawn_worker_with_file(worker_exe, doc.file(), &[])?;
         Ok(Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             worker_exe: worker_exe.to_path_buf(),
             state: LiveState::Alive { child },
+            doc: Some(doc),
         })
     }
 
@@ -105,7 +109,7 @@ impl WorkerSession {
         decode_summary(&body).map_err(|e| SessionError::Protocol(e.to_string()))
     }
 
-    /// Local session id.
+    /// Local session id (stable across respawn).
     pub fn session_id(&self) -> u64 {
         self.id
     }
@@ -115,7 +119,12 @@ impl WorkerSession {
         matches!(self.state, LiveState::Alive { .. })
     }
 
-    /// Path used for (re)spawn.
+    /// Whether this session owns a brokered document.
+    pub fn has_document(&self) -> bool {
+        self.doc.is_some()
+    }
+
+    /// Path used for (re)spawn of the worker binary.
     pub fn worker_exe(&self) -> &Path {
         &self.worker_exe
     }
@@ -228,17 +237,33 @@ impl WorkerSession {
         }
     }
 
-    /// After death: spawn a new worker (ping path only — no document). [design slice 3]
-    pub fn respawn_ping_only(&mut self) -> Result<(), SessionError> {
+    /// After death: spawn a fresh worker; re-inherit document if present. [SDS §10.1]
+    ///
+    /// Session id is unchanged. Does not replay overlays (none in M0).
+    pub fn respawn(&mut self) -> Result<(), SessionError> {
         match &self.state {
             LiveState::Alive { .. } => {
                 return Err(SessionError::InvalidState("respawn while alive"));
             }
             LiveState::Dead { .. } => {}
         }
-        let child = spawn_worker(&self.worker_exe)?;
+        let child = if let Some(doc) = self.doc.as_ref() {
+            spawn_worker_with_file(&self.worker_exe, doc.file(), &[])?
+        } else {
+            spawn_worker(&self.worker_exe)?
+        };
         self.state = LiveState::Alive { child };
         Ok(())
+    }
+
+    /// Alias for [`Self::respawn`] when no document is attached (ping-only).
+    pub fn respawn_ping_only(&mut self) -> Result<(), SessionError> {
+        if self.doc.is_some() {
+            return Err(SessionError::InvalidState(
+                "use respawn() when a document is attached",
+            ));
+        }
+        self.respawn()
     }
 }
 
