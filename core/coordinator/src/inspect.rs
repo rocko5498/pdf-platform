@@ -28,6 +28,8 @@ impl std::error::Error for InspectError {}
 /// Synchronous — no worker spawn, no shmem, no sandbox for this path.
 pub fn inspect(path: &Path) -> Result<StructuralSummary, InspectError> {
     let ds = scan_structure(path).map_err(InspectError::Scan)?;
+    // ponytail: exhaustive field map — when DocumentStructure gains fields,
+    // update StructuralSummary in protocol::inspect and this mapping together.
     Ok(StructuralSummary {
         page_count:      ds.page_count,
         has_acroform:    ds.has_acroform,
