@@ -7,6 +7,8 @@ edition.workspace = true
 [dependencies]
 protocol    = { path = "../protocol" }
 diagnostics = { path = "../diagnostics" }
+# Shared tile buffers; same pin as pdf-cos (MIT). Exit: sandbox::shmem module. [ADR-028]
+memmap2     = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # seccomp-bpf + namespace setup; deps added at M0 implementation
