@@ -1,5 +1,5 @@
-//! Multi-process structural inspect via broker + worker. [SDS §3.1, FR-DIAG-2]
-//! Design: docs/superpowers/specs/2026-07-12-worker-open-inspect-design.md
+//! Multi-process structural inspect via broker + inherited handle. [SDS §3.1, GR-1]
+//! Designs: worker-open-inspect + handle-inherit
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

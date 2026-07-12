@@ -11,7 +11,7 @@ use crate::broker::BrokeredFile;
 use protocol::events::{CoordinatorEvent, WorkerDeathReason};
 use protocol::inspect::{decode_summary, StructuralSummary};
 use protocol::transport::{TransportError, WorkerTransport as _};
-use sandbox::spawn::{spawn_worker, spawn_worker_with_env, WorkerChild, ENV_DOC_PATH};
+use sandbox::spawn::{spawn_worker, spawn_worker_with_file, WorkerChild};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -83,15 +83,14 @@ impl WorkerSession {
         })
     }
 
-    /// Spawn a worker with a brokered document path for structural inspect. [SDS §3.1]
+    /// Spawn a worker with a brokered document via inherited FD/HANDLE. [SDS §3.1, GR-1]
     ///
-    /// // ponytail: passes DOC_PATH into Z1 — temporary until FD/HANDLE inherit.
+    /// Path string is **not** passed to the worker.
     pub fn spawn_with_document(
         worker_exe: &Path,
         doc: &BrokeredFile,
     ) -> Result<Self, SessionError> {
-        let path = doc.path().to_string_lossy().into_owned();
-        let child = spawn_worker_with_env(worker_exe, &[(ENV_DOC_PATH, path.as_str())])?;
+        let child = spawn_worker_with_file(worker_exe, doc.file(), &[])?;
         Ok(Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             worker_exe: worker_exe.to_path_buf(),
