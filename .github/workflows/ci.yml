@@ -57,14 +57,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install qpdf -y --no-progress
-          $qpdfDir = Get-ChildItem "C:\Program Files\qpdf*" -Directory -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending |
-            Select-Object -First 1
-          if (-not $qpdfDir) { throw "qpdf install directory not found under C:\Program Files" }
-          $bin = Join-Path $qpdfDir.FullName "bin"
-          echo "$bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & (Join-Path $bin "qpdf.exe") --version
+          # Direct official release zip — more reliable than choco on GHA windows runners.
+          $version = "12.2.0"
+          $zip = Join-Path $env:RUNNER_TEMP "qpdf.zip"
+          $dest = Join-Path $env:RUNNER_TEMP "qpdf"
+          $url = "https://github.com/qpdf/qpdf/releases/download/v$version/qpdf-$version-msvc64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $qpdfExe = Get-ChildItem -Path $dest -Recurse -Filter qpdf.exe | Select-Object -First 1
+          if (-not $qpdfExe) { throw "qpdf.exe not found after extract from $url" }
+          $bin = $qpdfExe.Directory.FullName
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & $qpdfExe.FullName --version
 
       - name: Build workspace
         run: cargo build --workspace
