@@ -61,10 +61,19 @@ name        = "corpus-diff"
 description = "Structural differential-testing harness: our scanner vs the qpdf oracle. [ADR-022, SDS §14 M0 exit criteria]"
 version.workspace = true
 edition.workspace = true
+workspace   = "../../core"
 
 [dependencies]
 coordinator = { path = "../../core/coordinator" }
 ```
+
+`workspace = "../../core"` is required, not optional: `tools/corpus-diff` is a
+sibling of `core/`, not a descendant, so Cargo's ancestor-directory walk (used when
+`cargo` is invoked from inside `tools/corpus-diff/` itself, not from `core/`) would
+never find `core/Cargo.toml`. Without this explicit pointer, running `cargo build`
+from inside the crate's own directory would make Cargo treat it as a standalone
+package with its own `Cargo.lock` — the exact lockfile-drift risk the single-workspace
+Global Constraint exists to prevent.
 
 - [ ] **Step 2: Create empty lib and main stubs**
 

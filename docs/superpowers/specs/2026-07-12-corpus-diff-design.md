@@ -53,6 +53,10 @@ Cargo workspace in this repo (only `core/`), and `core/cli` is already nested th
 way despite ADR-024's literal top-level `cli/` wording — a second workspace here would
 mean two `Cargo.lock`s that can drift, doubled compile/CI time, and no real benefit.
 One workspace, one lockfile. It is a dev/CI utility, not a shipped product component.
+Since `tools/corpus-diff` is a sibling of `core/`, not a descendant, its manifest also
+sets `package.workspace = "../../core"` — otherwise running `cargo` from inside the
+crate's own directory (rather than from `core/`) would let Cargo's ancestor-walk fail
+to find the workspace root and treat it as a standalone package with its own lockfile.
 
 ```
 tools/
