@@ -1,0 +1,21 @@
+[package]
+name        = "benchmarks"
+description = "Criterion micro-benchmarks for the render pipeline. [ADR-023]"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "benchmarks_lib"
+path = "src/lib.rs"
+
+[[bench]]
+name = "render_pipeline"
+harness = false
+path = "src/bench_render_pipeline.rs"
+
+[dependencies]
+engine-api      = { path = "../engine-api" }
+engine-stub     = { path = "../engine-stub" }
+protocol        = { path = "../protocol" }
+render-pipeline = { path = "../render-pipeline" }
+criterion       = { workspace = true }

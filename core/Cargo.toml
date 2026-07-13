@@ -30,6 +30,7 @@ members = [
     "cli",
     # Dev/CI tooling
     "../tools/corpus-diff",
+    "benchmarks",
 ]
 
 [workspace.package]
@@ -43,3 +44,6 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 pedantic = "warn"
+
+[workspace.dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
