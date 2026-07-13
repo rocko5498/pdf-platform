@@ -1,0 +1,18 @@
+# Shortcut and menu registry. [ADR-032]
+# CI will reject any PR that bumps schema_version without a corresponding migration.
+schema_version = 1
+profile_version = "0.1.0"
+
+# ---------------------------------------------------------------------------
+# Shortcuts
+# ---------------------------------------------------------------------------
+[shortcuts]
+# ponytail: stub — populate per DS-* action IDs at M0 implementation
+# Example format (do not remove — used by CI schema validator):
+# open_document   = { key = "Ctrl+O", action = "document.open" }
+
+# ---------------------------------------------------------------------------
+# Menus
+# ---------------------------------------------------------------------------
+[[menus]]
+# ponytail: stub — File/Edit/View/... menus at M0 implementation

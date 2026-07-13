@@ -38,8 +38,6 @@ dependencies = [
  "engine-stub",
  "protocol",
  "render-pipeline",
- "sandbox",
- "worker-main",
 ]
 
 [[package]]
@@ -356,7 +354,9 @@ dependencies = [
  "coordinator",
  "cxx",
  "cxx-build",
+ "engine-stub",
  "protocol",
+ "sandbox",
 ]
 
 [[package]]

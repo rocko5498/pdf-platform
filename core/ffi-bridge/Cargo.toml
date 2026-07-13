@@ -5,9 +5,14 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
+[lib]
+crate-type = ["staticlib", "rlib"]
+
 [dependencies]
 coordinator = { path = "../coordinator" }
 protocol    = { path = "../protocol" }
+sandbox     = { path = "../sandbox" }
+engine-stub = { path = "../engine-stub" }
 cxx         = "1"
 
 [build-dependencies]
