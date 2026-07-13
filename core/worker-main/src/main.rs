@@ -18,6 +18,14 @@ use sandbox::shmem::map_shmem_file;
 use sandbox::spawn::{adopt_document_file, adopt_inherited, adopt_shmem_file};
 
 fn main() -> ExitCode {
+    // Apply sandbox confinement BEFORE any handle adoption or untrusted input.
+    // SECURITY: human-gated — do not weaken filters. [ADR-016, IG AI-6, SDS §3.1]
+    // M0: advisory lockdown (logs what would be applied, does not kill on failure).
+    if let Err(e) = sandbox::confinement::lockdown_worker() {
+        eprintln!("worker: confinement failed: {e}");
+        return ExitCode::from(1);
+    }
+
     let mut transport = match adopt_inherited() {
         Ok(t) => t,
         Err(e) => {
