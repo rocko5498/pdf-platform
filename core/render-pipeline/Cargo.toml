@@ -9,3 +9,5 @@ pdf-types   = { path = "../pdf-types" }
 engine-api  = { path = "../engine-api" }
 protocol    = { path = "../protocol" }
 diagnostics = { path = "../diagnostics" }
+sandbox     = { path = "../sandbox" }
+memmap2     = "0.9"

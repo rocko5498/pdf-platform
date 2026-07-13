@@ -12,6 +12,7 @@ members = [
     "engine-api",
     "engine-pdfium",
     "engine-hayro",
+    "engine-stub",
     # Services
     "render-pipeline",
     "text-extract",
