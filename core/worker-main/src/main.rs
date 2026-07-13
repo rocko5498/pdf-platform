@@ -155,6 +155,9 @@ fn fill_tile_smoke(file: &File) -> Result<Vec<u8>, String> {
         len: TILE_RGBA8_BYTES as u32,
         format: PixelFormat::Rgba8,
         generation: 1,
+        page: 0,
+        col: 0,
+        row: 0,
     };
     Ok(encode_tile_ready(&desc))
 }
@@ -191,6 +194,9 @@ fn handle_render_tile(shmem_file: &File, raw: &[u8]) -> Result<Vec<u8>, String> 
         len: output.rgba_pixels.len() as u32,
         format: PixelFormat::Rgba8,
         generation: req.generation,
+        page: req.page,
+        col: 0, // M0: single-tile, grid position not yet tracked in request
+        row: 0,
     };
     Ok(encode_tile_ready(&desc))
 }

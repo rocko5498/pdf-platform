@@ -54,6 +54,9 @@ fn render_tile_stub_engine_produces_colored_pixels() {
     assert_eq!(desc.len as usize, TILE_RGBA8_BYTES);
     assert_eq!(desc.format, PixelFormat::Rgba8);
     assert_eq!(desc.generation, 1);
+    assert_eq!(desc.page, 0, "tile identity: page should be 0");
+    assert_eq!(desc.col, 0, "tile identity: col should be 0");
+    assert_eq!(desc.row, 0, "tile identity: row should be 0");
 
     // 6. Read pixels from shmem and verify they are real (non-zero, colored).
     let _ = region.flush();

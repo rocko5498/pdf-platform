@@ -52,6 +52,12 @@ pub struct TileSlotDesc {
     pub format: PixelFormat,
     /// Render generation (stale if mismatched). [SDS §5.3]
     pub generation: u64,
+    /// 0-based page index this tile belongs to.
+    pub page: u32,
+    /// Column in the tile grid.
+    pub col: u32,
+    /// Row in the tile grid.
+    pub row: u32,
 }
 
 /// Magic prefix the worker writes for the M0 shmem smoke test.
@@ -80,32 +86,47 @@ impl std::fmt::Display for TileReadyDecodeError {
 
 impl std::error::Error for TileReadyDecodeError {}
 
-/// Encode a `TILE_READY` control-frame body (text v1).
+/// Encode a `TILE_READY` control-frame body (text v2).
+///
+/// v2 adds `page`, `col`, `row` fields so the coordinator can correlate
+/// responses without a pending-request map. v1 decoders ignore unknown fields
+/// so this is backward-compatible.
 pub fn encode_tile_ready(d: &TileSlotDesc) -> Vec<u8> {
     format!(
-        "TILE_READY\nv1\noffset={}\nlen={}\nformat={}\ngeneration={}\n",
+        "TILE_READY\nv2\noffset={}\nlen={}\nformat={}\ngeneration={}\npage={}\ncol={}\nrow={}\n",
         d.offset,
         d.len,
         d.format.as_str(),
-        d.generation
+        d.generation,
+        d.page,
+        d.col,
+        d.row,
     )
     .into_bytes()
 }
 
-/// Decode a `TILE_READY` frame body.
+/// Decode a `TILE_READY` frame body (v1 or v2).
+///
+/// v2 includes tile identity fields (`page`, `col`, `row`). v1 frames
+/// default these to 0 for backward compatibility.
 pub fn decode_tile_ready(body: &[u8]) -> Result<TileSlotDesc, TileReadyDecodeError> {
     let text = std::str::from_utf8(body).map_err(|_| TileReadyDecodeError::InvalidUtf8)?;
     let mut lines = text.lines();
     if lines.next() != Some("TILE_READY") {
         return Err(TileReadyDecodeError::BadHeader);
     }
-    if lines.next() != Some("v1") {
+    let version = lines.next().ok_or(TileReadyDecodeError::BadHeader)?;
+    // Accept both v1 and v2.
+    if version != "v1" && version != "v2" {
         return Err(TileReadyDecodeError::BadHeader);
     }
     let mut offset = None;
     let mut len = None;
     let mut format = None;
     let mut generation = None;
+    let mut page = 0u32;
+    let mut col = 0u32;
+    let mut row = 0u32;
     for line in lines {
         let Some((k, v)) = line.split_once('=') else {
             continue;
@@ -135,6 +156,15 @@ pub fn decode_tile_ready(body: &[u8]) -> Result<TileSlotDesc, TileReadyDecodeErr
                         .map_err(|_| TileReadyDecodeError::BadField("generation"))?,
                 );
             }
+            "page" => {
+                page = v.parse().map_err(|_| TileReadyDecodeError::BadField("page"))?;
+            }
+            "col" => {
+                col = v.parse().map_err(|_| TileReadyDecodeError::BadField("col"))?;
+            }
+            "row" => {
+                row = v.parse().map_err(|_| TileReadyDecodeError::BadField("row"))?;
+            }
             _ => {}
         }
     }
@@ -143,6 +173,9 @@ pub fn decode_tile_ready(body: &[u8]) -> Result<TileSlotDesc, TileReadyDecodeErr
         len: len.ok_or(TileReadyDecodeError::BadField("len"))?,
         format: format.ok_or(TileReadyDecodeError::BadField("format"))?,
         generation: generation.ok_or(TileReadyDecodeError::BadField("generation"))?,
+        page,
+        col,
+        row,
     })
 }
 
@@ -162,8 +195,23 @@ mod tests {
             len: TILE_RGBA8_BYTES as u32,
             format: PixelFormat::Rgba8,
             generation: 3,
+            page: 1,
+            col: 2,
+            row: 3,
         };
         let bytes = encode_tile_ready(&d);
         assert_eq!(decode_tile_ready(&bytes).unwrap(), d);
+    }
+
+    #[test]
+    fn tile_ready_v1_backward_compat() {
+        // v1 frames should decode with page/col/row defaulting to 0.
+        let v1_body = b"TILE_READY\nv1\noffset=0\nlen=262144\nformat=rgba8\ngeneration=1\n";
+        let desc = decode_tile_ready(v1_body).unwrap();
+        assert_eq!(desc.offset, 0);
+        assert_eq!(desc.generation, 1);
+        assert_eq!(desc.page, 0);
+        assert_eq!(desc.col, 0);
+        assert_eq!(desc.row, 0);
     }
 }

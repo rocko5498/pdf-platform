@@ -1,9 +1,10 @@
 //! Micro-benchmarks for the render pipeline. [ADR-023, SDS §14, MET-PERF]
 //!
 //! Measures in-process throughput:
-//! - Stub engine rasterization throughput
+//! - Stub engine rasterization throughput (tiles/sec, MB/sec)
 //! - TilePool allocation latency
 //! - RenderTileRequest codec roundtrip
+//! - TILE_READY codec roundtrip
 //!
 //! Cross-process IPC benchmark is in worker-main/tests/ipc_bench.rs.
 //!
@@ -13,6 +14,9 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use engine_api::rasterize::{Rasterize, RasterizeRequest, TileRect};
 use engine_stub::StubEngine;
 use protocol::commands::{decode_render_tile, encode_render_tile, RenderTileRequest};
+use protocol::handles::{
+    decode_tile_ready, encode_tile_ready, PixelFormat, TileSlotDesc, TILE_RGBA8_BYTES,
+};
 
 fn bench_rasterize(c: &mut Criterion) {
     let mut group = c.benchmark_group("rasterize");
@@ -88,10 +92,42 @@ fn bench_render_tile_codec(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_tile_ready_codec(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tile_ready_codec");
+    let desc = TileSlotDesc {
+        offset: 0,
+        len: TILE_RGBA8_BYTES as u32,
+        format: PixelFormat::Rgba8,
+        generation: 42,
+        page: 3,
+        col: 1,
+        row: 2,
+    };
+
+    group.bench_function("encode", |b| {
+        b.iter(|| encode_tile_ready(&desc));
+    });
+
+    let encoded = encode_tile_ready(&desc);
+    group.bench_function("decode", |b| {
+        b.iter(|| decode_tile_ready(&encoded).unwrap());
+    });
+
+    group.bench_function("roundtrip", |b| {
+        b.iter(|| {
+            let enc = encode_tile_ready(&desc);
+            decode_tile_ready(&enc).unwrap()
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_rasterize,
     bench_tile_pool_alloc,
     bench_render_tile_codec,
+    bench_tile_ready_codec,
 );
 criterion_main!(benches);
