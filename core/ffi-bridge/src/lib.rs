@@ -7,12 +7,13 @@
 //!   FFI-6: two-reviewer rule; changes require one FFI-surface owner. [ADR-027]
 // SAFETY: cxx guarantees type-checked cross-language calls; no exceptions cross
 //         this boundary; ownership does not straddle languages. [ADR-004, ADR-027]
+#![allow(static_mut_refs)] // M0: single-threaded Qt main thread; replaced at multi-doc
 
 use std::os::windows::io::AsRawHandle;
 
-use protocol::commands::{encode_render_tile, RenderTileRequest};
-use protocol::handles::{decode_tile_ready, TILE_RGBA8_BYTES};
-use protocol::transport::WorkerTransport;
+use protocol::commands::{encode_command, Command};
+use protocol::events::{decode_worker_event, WorkerEvent};
+use protocol::handles::TILE_RGBA8_BYTES;
 use sandbox::shmem::SharedRegion;
 use sandbox::spawn::{spawn_worker_with_attachments, SpawnAttachments};
 
@@ -21,9 +22,16 @@ struct DocSession {
     child: sandbox::spawn::WorkerChild,
     #[allow(dead_code)]
     region: SharedRegion,
+    /// Monotonic counter for correlation IDs.
+    next_cid: u64,
 }
 
 /// Global session storage (M0: one document at a time).
+// SAFETY: accessed only from the Qt main thread (single-threaded FFI).
+// The C++ shell guarantees no concurrent access. Will be replaced with
+// a proper pattern (OnceLock + Mutex or similar) when multi-document
+// support lands. [ADR-004, ADR-027]
+#[allow(static_mut_refs)]
 static mut SESSION: Option<Box<DocSession>> = None;
 
 /// Open a document: spawn worker, create shmem, store session.
@@ -38,7 +46,7 @@ fn open_document_impl(_path: &str) -> Result<ffi::OpenResultFFI, String> {
 
     let child = spawn_worker_with_attachments(
         &exe,
-        &SpawnAttachments { doc: None, shmem: Some(region.file()) },
+        &SpawnAttachments { doc: None, shmem: Some(region.file()), password: None },
         &[],
     )
     .map_err(|e| e.to_string())?;
@@ -49,7 +57,7 @@ fn open_document_impl(_path: &str) -> Result<ffi::OpenResultFFI, String> {
 
     // SAFETY: single-threaded Qt main thread; M0 single-document.
     unsafe {
-        SESSION = Some(Box::new(DocSession { child, region }));
+        SESSION = Some(Box::new(DocSession { child, region, next_cid: 1 }));
     }
 
     Ok(ffi::OpenResultFFI { page_count, shmem_handle: handle })
@@ -68,22 +76,45 @@ fn render_tile_impl(
     // SAFETY: single-threaded Qt main thread.
     let session = unsafe { SESSION.as_mut().ok_or("no open document")? };
 
-    let req = RenderTileRequest { page, x, y, w, h, scale, generation, slot_offset: 0 };
-    let body = encode_render_tile(&req);
+    let correlation_id = session.next_cid;
+    session.next_cid += 1;
+
+    let cmd = Command::RenderTile {
+        correlation_id,
+        page, x, y, w, h,
+        scale, generation,
+        slot_offset: 0,
+        col: 0,
+        row: 0,
+    };
+    let body = encode_command(&cmd);
     session.child.transport.send(&body).map_err(|e| e.to_string())?;
     let reply = session.child
         .transport
         .recv_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
-    let desc = decode_tile_ready(&reply).map_err(|e| e.to_string())?;
-    Ok(ffi::TileResultFFI { offset: desc.offset, len: desc.len, generation: desc.generation })
+
+    // Try typed event decode first, fall back to legacy.
+    match decode_worker_event(&reply) {
+        Ok(WorkerEvent::TileReady { desc, .. }) => {
+            Ok(ffi::TileResultFFI { offset: desc.offset, len: desc.len, generation: desc.generation })
+        }
+        Ok(WorkerEvent::RenderError { message, .. }) => Err(message),
+        Ok(_) => Err("unexpected event type".to_string()),
+        Err(_) => {
+            // Legacy TILE_READY fallback.
+            protocol::handles::decode_tile_ready(&reply)
+                .map(|desc| ffi::TileResultFFI { offset: desc.offset, len: desc.len, generation: desc.generation })
+                .map_err(|e| e.to_string())
+        }
+    }
 }
 
 /// Close the current document session.
 fn close_document_impl() {
     // SAFETY: single-threaded Qt main thread.
     if let Some(mut session) = unsafe { SESSION.take() } {
-        let _ = session.child.transport.send(b"quit");
+        let _ = session.child.transport.send(b"CMD:QUIT\n");
         let _ = session.child.child.wait();
     }
 }

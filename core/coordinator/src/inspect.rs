@@ -10,6 +10,7 @@ use std::path::Path;
 /// Error returned by [`inspect`].
 #[derive(Debug)]
 pub enum InspectError {
+    /// Document scan failed.
     Scan(ScanError),
 }
 

@@ -8,7 +8,7 @@
 //! | Variable | Meaning |
 //! |----------|---------|
 //! | `PDF_PLATFORM_IPC_SOCK` | Unix: path to parent `UnixListener` |
-//! | `PDF_PLATFORM_IPC_PORT` | Windows: `127.0.0.1` TCP port |
+//! | `PDF_PLATFORM_IPC_PIPE` | Windows: named pipe path |
 //! | `PDF_PLATFORM_DOC_FD` / `_HANDLE` | Inherited document file |
 //! | `PDF_PLATFORM_SHMEM_FD` / `_HANDLE` | Inherited tile shared-memory file |
 //!
@@ -24,8 +24,8 @@ use std::time::Duration;
 
 /// Env var: Unix domain socket path the worker must connect to.
 pub const ENV_IPC_SOCK: &str = "PDF_PLATFORM_IPC_SOCK";
-/// Env var: TCP port on 127.0.0.1 the worker must connect to (Windows M0).
-pub const ENV_IPC_PORT: &str = "PDF_PLATFORM_IPC_PORT";
+/// Env var: named-pipe path the worker must connect to (Windows). [ADR-031]
+pub const ENV_IPC_PIPE: &str = "PDF_PLATFORM_IPC_PIPE";
 /// Optional override for worker binary path (tests / packaging).
 pub const ENV_WORKER_PATH: &str = "PDF_PLATFORM_WORKER_PATH";
 /// Unix: inherited document FD number.
@@ -36,16 +36,25 @@ pub const ENV_DOC_HANDLE: &str = "PDF_PLATFORM_DOC_HANDLE";
 pub const ENV_SHMEM_FD: &str = "PDF_PLATFORM_SHMEM_FD";
 /// Windows: inherited shared-memory HANDLE as decimal integer.
 pub const ENV_SHMEM_HANDLE: &str = "PDF_PLATFORM_SHMEM_HANDLE";
+/// Password for encrypted documents (UTF-8, passed as env var).
+pub const ENV_DOC_PASSWORD: &str = "PDF_PLATFORM_DOC_PASSWORD";
 
 static SPAWN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Optional files to inherit into the worker.
-#[derive(Default)]
 pub struct SpawnAttachments<'a> {
     /// Brokered document file.
     pub doc: Option<&'a File>,
     /// Shared tile buffer file.
     pub shmem: Option<&'a File>,
+    /// Password for encrypted documents (passed as env var, not FD).
+    pub password: Option<&'a str>,
+}
+
+impl<'a> Default for SpawnAttachments<'a> {
+    fn default() -> Self {
+        Self { doc: None, shmem: None, password: None }
+    }
 }
 
 /// Parent-side handle: framed IPC + child process. [SDS §10.1]
@@ -80,6 +89,7 @@ pub fn spawn_worker_with_file(
         &SpawnAttachments {
             doc: Some(doc),
             shmem: None,
+            password: None,
         },
         extra_env,
     )
@@ -143,6 +153,11 @@ pub fn adopt_shmem_file() -> io::Result<Option<File>> {
     {
         Ok(None)
     }
+}
+
+/// Adopt the document password from the environment, if the parent provided one.
+pub fn adopt_password() -> Option<String> {
+    std::env::var(ENV_DOC_PASSWORD).ok()
 }
 
 fn spawn_impl(
@@ -260,7 +275,7 @@ mod unix {
 
         let mut cmd = Command::new(worker_exe);
         cmd.env(ENV_IPC_SOCK, &sock_path)
-            .env_remove(ENV_IPC_PORT)
+            .env_remove(ENV_IPC_PIPE)
             .env_remove(ENV_DOC_HANDLE)
             .env_remove(ENV_SHMEM_HANDLE)
             .env_remove("PDF_PLATFORM_DOC_PATH");
@@ -275,6 +290,11 @@ mod unix {
             set_inherited_fd(&mut cmd, ENV_SHMEM_FD, file)?;
         } else {
             cmd.env_remove(ENV_SHMEM_FD);
+        }
+        if let Some(pw) = attachments.password {
+            cmd.env(ENV_DOC_PASSWORD, pw);
+        } else {
+            cmd.env_remove(ENV_DOC_PASSWORD);
         }
 
         let child = cmd.spawn().map_err(|e| {
@@ -319,14 +339,13 @@ mod unix {
 }
 
 // ---------------------------------------------------------------------------
-// Windows
+// Windows — Named pipes [ADR-031]
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use crate::transport::WindowsWorkerTransport;
-    use std::net::{TcpListener, TcpStream};
+    use crate::transport::{NamedPipeClient, NamedPipeServer};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 
     const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
@@ -363,11 +382,15 @@ mod windows {
         attachments: &SpawnAttachments<'_>,
         extra_env: &[(&str, &str)],
     ) -> io::Result<WorkerChild> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
+        let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pipe_name = format!(
+            "\\\\.\\pipe\\pdf-platform-ipc-{}-{}",
+            std::process::id(),
+            seq
+        );
 
         let mut cmd = Command::new(worker_exe);
-        cmd.env(ENV_IPC_PORT, port.to_string())
+        cmd.env(ENV_IPC_PIPE, &pipe_name)
             .env_remove(ENV_IPC_SOCK)
             .env_remove(ENV_DOC_FD)
             .env_remove(ENV_SHMEM_FD)
@@ -384,36 +407,36 @@ mod windows {
         } else {
             cmd.env_remove(ENV_SHMEM_HANDLE);
         }
+        if let Some(pw) = attachments.password {
+            cmd.env(ENV_DOC_PASSWORD, pw);
+        } else {
+            cmd.env_remove(ENV_DOC_PASSWORD);
+        }
 
         let child = cmd.spawn().map_err(|e| {
             io::Error::new(e.kind(), format!("spawn {}: {e}", worker_exe.display()))
         })?;
 
-        let (stream, _) = listener
-            .accept()
-            .map_err(|e| io::Error::new(e.kind(), format!("accept worker IPC: {e}")))?;
-        let transport = Box::new(WindowsWorkerTransport::from_stream(stream)?);
+        // Create named pipe server and wait for worker to connect.
+        let server = NamedPipeServer::new(&pipe_name)?;
+
+        let transport = Box::new(server);
         Ok(WorkerChild { transport, child })
     }
 
     pub fn adopt_inherited() -> io::Result<Box<dyn protocol::transport::WorkerTransport>> {
-        let port: u16 = std::env::var(ENV_IPC_PORT)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("missing env {ENV_IPC_PORT}"),
-                )
-            })?
-            .parse()
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("bad {ENV_IPC_PORT}: {e}"),
-                )
-            })?;
-        let addr = format!("127.0.0.1:{port}");
-        let stream = connect_with_retry(|| TcpStream::connect(&addr), 50, 100)?;
-        Ok(Box::new(WindowsWorkerTransport::from_stream(stream)?))
+        let pipe_name = std::env::var(ENV_IPC_PIPE).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing env {ENV_IPC_PIPE}"),
+            )
+        })?;
+        let client = connect_with_retry(
+            || NamedPipeClient::connect(&pipe_name),
+            50,
+            100,
+        )?;
+        Ok(Box::new(client))
     }
 
     pub fn adopt_file_from_env(env_key: &str) -> io::Result<Option<File>> {

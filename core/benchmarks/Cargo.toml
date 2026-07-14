@@ -13,9 +13,15 @@ name = "render_pipeline"
 harness = false
 path = "src/bench_render_pipeline.rs"
 
+[[bench]]
+name = "viewport"
+harness = false
+path = "src/bench_viewport.rs"
+
 [dependencies]
 engine-api      = { path = "../engine-api" }
 engine-stub     = { path = "../engine-stub" }
+engine-pdfium   = { path = "../engine-pdfium" }
 protocol        = { path = "../protocol" }
 render-pipeline = { path = "../render-pipeline" }
 criterion       = { workspace = true }

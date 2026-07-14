@@ -11,8 +11,13 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::MmapMut;
+
+/// Monotonic counter to guarantee unique temp-file names even when two
+/// `create` calls land in the same nanosecond on the same PID. [GR-7]
+static SHMEM_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Parent-side shared region: open file + mutable mapping.
 pub struct SharedRegion {
@@ -31,9 +36,11 @@ impl SharedRegion {
                 "shared region len must be > 0",
             ));
         }
+        let seq = SHMEM_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "pdf-platform-shmem-{}-{}.bin",
+            "pdf-platform-shmem-{}-{}-{}.bin",
             std::process::id(),
+            seq,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())

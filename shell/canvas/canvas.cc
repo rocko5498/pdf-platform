@@ -1,115 +1,108 @@
-// Canvas widget implementation. [ADR-007, SDS §6.4]
-// M0: software paint from shmem RGBA8 buffer.
+﻿// Canvas widget: software paint from shmem RGBA8 tile. [ADR-007, SDS §6.4]
+// M0: MapViewOfFile + QPainter blit. GPU texture compositor deferred to M1.
 
 #include "canvas.h"
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
 #include <QPainter>
-#include <rust/cxx.h>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 #include "bridge.h"
 
 namespace pdf_platform {
 
-// ── CanvasWidget ────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// CanvasWidget
+// ---------------------------------------------------------------------------
 
-CanvasWidget::CanvasWidget(QWidget* parent)
-    : QWidget(parent) {
+CanvasWidget::CanvasWidget(QWidget* parent) : QWidget(parent) {
     setMinimumSize(256, 256);
-    setWindowTitle("PDF Platform — M0 Canvas");
+    setAttribute(Qt::WA_OpaquePaintEvent);
 }
 
 void CanvasWidget::setTile(const uint8_t* buffer, uint32_t width, uint32_t height) {
-    tile_image_ = QImage(buffer, width, height, width * 4,
-                         QImage::Format_RGBA8888).copy();
+    // Format_RGBA8888 matches our RGBA8 pixel layout.
+    // .copy() so we own the data independently of the shmem mapping.
+    tile_image_ = QImage(buffer, static_cast<int>(width), static_cast<int>(height),
+                         QImage::Format_RGBA8888)
+                      .copy();
     has_tile_ = true;
     update();
 }
 
 void CanvasWidget::clear() {
-    tile_image_ = QImage();
+    tile_image_ = QImage{};
     has_tile_ = false;
     update();
 }
 
-void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
-    QPainter painter(this);
-    painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
-
-    if (has_tile_ && !tile_image_.isNull()) {
-        QRect target = tile_image_.rect();
-        target.moveCenter(rect().center());
-        painter.drawImage(target, tile_image_);
+void CanvasWidget::paintEvent(QPaintEvent*) {
+    QPainter p(this);
+    if (has_tile_) {
+        p.drawImage(0, 0, tile_image_);
     } else {
-        painter.fillRect(rect(), QColor(240, 240, 240));
-        painter.setPen(QColor(128, 128, 128));
-        painter.drawText(rect(), Qt::AlignCenter, "No document loaded");
+        p.fillRect(rect(), Qt::darkGray);
     }
 }
 
-// ── MainWindow ──────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// MainWindow
+// ---------------------------------------------------------------------------
 
-MainWindow::MainWindow(QWidget* parent)
-    : QMainWindow(parent) {
+MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     canvas_ = new CanvasWidget(this);
     setCentralWidget(canvas_);
-    resize(800, 600);
+    resize(256, 256);
+    setWindowTitle("PDF Platform — M0");
 }
 
 MainWindow::~MainWindow() {
-#ifdef _WIN32
     if (shmem_mapping_) {
         UnmapViewOfFile(shmem_mapping_);
         shmem_mapping_ = nullptr;
     }
-#endif
     close_document();
 }
 
 bool MainWindow::openDocument(const QString& path) {
-    close_document();
+    if (shmem_mapping_) {
+        UnmapViewOfFile(shmem_mapping_);
+        shmem_mapping_ = nullptr;
+    }
 
-    // Open via Rust coordinator. cxx converts Result<T,String> to exceptions.
-    pdf_platform::OpenResultFFI info;
+    OpenResultFFI result;
     try {
-        info = pdf_platform::open_document_impl(path.toStdString());
-    } catch (const rust::error& e) {
-        qWarning("open_document failed: %s", e.what());
+        result = open_document(path.toStdString());
+    } catch (const std::exception& e) {
+        setWindowTitle(QString("PDF Platform — open failed: %1").arg(e.what()));
         return false;
     }
 
-    // Map the shared memory region.
-#ifdef _WIN32
-    HANDLE handle = reinterpret_cast<HANDLE>(info.shmem_handle);
-    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+    // Map the shmem region for reading tile pixels.
+    HANDLE h = reinterpret_cast<HANDLE>(static_cast<intptr_t>(result.shmem_handle));
+    shmem_mapping_ = MapViewOfFile(h, FILE_MAP_READ, 0, 0, 0);
+    shmem_size_ = 256u * 256u * 4u;  // TILE_RGBA8_BYTES
 
-    shmem_size_ = 256 * 256 * 4;
-    shmem_mapping_ = MapViewOfFile(handle, FILE_MAP_READ, 0, 0, shmem_size_);
     if (!shmem_mapping_) {
+        setWindowTitle("PDF Platform — shmem map failed");
         return false;
     }
-#else
-    return false;
-#endif
 
-    // Render the first tile.
-    pdf_platform::TileResultFFI desc;
+    // Render page 0, 256x256 tile at 1.0x scale.
     try {
-        desc = pdf_platform::render_tile_impl(0, 0, 0, 256, 256, 1.0, 1);
-    } catch (const rust::error& e) {
-        qWarning("render_tile failed: %s", e.what());
+        auto tile = render_tile(0, 0, 0, 256, 256, 1.0f, 1);
+        const auto* pixels = static_cast<const uint8_t*>(shmem_mapping_) + tile.offset;
+        canvas_->setTile(pixels, 256, 256);
+    } catch (const std::exception& e) {
+        canvas_->clear();
+        setWindowTitle(QString("PDF Platform — render failed: %1").arg(e.what()));
         return false;
     }
 
-    const auto* pixels = static_cast<const uint8_t*>(shmem_mapping_) + desc.offset;
-    canvas_->setTile(pixels, 256, 256);
-
-    setWindowTitle(QString("PDF Platform — %1").arg(path));
+    setWindowTitle(QString("PDF Platform — M0 — %1 pages").arg(result.page_count));
     return true;
 }
 

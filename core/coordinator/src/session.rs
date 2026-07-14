@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::broker::BrokeredFile;
-use protocol::events::{CoordinatorEvent, WorkerDeathReason};
-use protocol::inspect::{decode_summary, StructuralSummary};
-use protocol::transport::{TransportError, WorkerTransport as _};
+use protocol::commands::{encode_command, Command};
+use protocol::events::{decode_worker_event, CoordinatorEvent, WorkerDeathReason, WorkerEvent};
+use protocol::inspect::StructuralSummary;
+use protocol::transport::TransportError;
 use sandbox::spawn::{spawn_worker, spawn_worker_with_file, WorkerChild};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -72,6 +73,8 @@ pub struct WorkerSession {
     state: LiveState,
     /// Z0-owned document; re-inherited on each spawn/respawn. [SDS §10.1 step 2]
     doc: Option<BrokeredFile>,
+    /// Monotonic counter for correlation IDs.
+    next_cid: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerSession {
@@ -83,6 +86,7 @@ impl WorkerSession {
             worker_exe: worker_exe.to_path_buf(),
             state: LiveState::Alive { child },
             doc: None,
+            next_cid: AtomicU64::new(1),
         })
     }
 
@@ -99,14 +103,30 @@ impl WorkerSession {
             worker_exe: worker_exe.to_path_buf(),
             state: LiveState::Alive { child },
             doc: Some(doc),
+            next_cid: AtomicU64::new(1),
         })
     }
 
-    /// Request a structural summary from the worker (`inspect` frame).
+    /// Request a structural summary from the worker (`inspect` command).
     pub fn inspect(&mut self) -> Result<StructuralSummary, SessionError> {
-        self.send(b"inspect")?;
-        let body = self.recv_frame(Duration::from_secs(30))?;
-        decode_summary(&body).map_err(|e| SessionError::Protocol(e.to_string()))
+        let correlation_id = self.next_correlation_id();
+        let cmd = Command::Inspect { correlation_id };
+        let body = encode_command(&cmd);
+        self.send(&body)?;
+        let reply = self.recv_frame(Duration::from_secs(30))?;
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::Summary { correlation_id: cid, summary }) if cid == correlation_id => {
+                Ok(summary)
+            }
+            Ok(other) => Err(SessionError::Protocol(
+                format!("unexpected event: {other:?}"),
+            )),
+            Err(e) => {
+                // Fall back to legacy SUMMARY codec for backward compatibility.
+                protocol::inspect::decode_summary(&reply)
+                    .map_err(|_| SessionError::Protocol(format!("decode failed: {e}")))
+            }
+        }
     }
 
     /// Local session id (stable across respawn).
@@ -122,6 +142,11 @@ impl WorkerSession {
     /// Whether this session owns a brokered document.
     pub fn has_document(&self) -> bool {
         self.doc.is_some()
+    }
+
+    /// Generate the next unique correlation ID for command-response matching.
+    pub fn next_correlation_id(&self) -> u64 {
+        self.next_cid.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Path used for (re)spawn of the worker binary.

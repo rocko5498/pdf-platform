@@ -11,9 +11,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use protocol::commands::encode_render_tile;
-use protocol::handles::{decode_tile_ready, TILE_RGBA8_BYTES};
-use protocol::transport::WorkerTransport as _;
+use protocol::commands::{encode_command, Command};
+use protocol::events::{decode_worker_event, WorkerEvent};
+use protocol::handles::TILE_RGBA8_BYTES;
 use sandbox::shmem::SharedRegion;
 use sandbox::spawn::{spawn_worker_with_attachments, SpawnAttachments};
 
@@ -30,35 +30,35 @@ fn ipc_render_tile_roundtrip_baseline() {
         let region = SharedRegion::create(TILE_RGBA8_BYTES).expect("create shmem");
         let mut child = spawn_worker_with_attachments(
             worker_path(),
-            &SpawnAttachments { doc: None, shmem: Some(region.file()) },
+            &SpawnAttachments { doc: None, shmem: Some(region.file()), password: None },
             &[],
         )
         .expect("spawn");
 
-        let req = encode_render_tile(&protocol::commands::RenderTileRequest {
-            page: 0,
-            x: 0,
-            y: 0,
-            w: 256,
-            h: 256,
-            scale: 1.0,
-            generation: 1,
-            slot_offset: 0,
-        });
+        let cmd = Command::RenderTile {
+            correlation_id: i as u64 + 1,
+            page: 0, x: 0, y: 0, w: 256, h: 256,
+            scale: 1.0, generation: 1, slot_offset: 0,
+            col: 0, row: 0,
+        };
 
         let start = Instant::now();
-        child.transport.send(&req).expect("send");
+        child.transport.send(&encode_command(&cmd)).expect("send");
         let reply = child
             .transport
             .recv_timeout(Duration::from_secs(5))
             .expect("recv");
         let elapsed = start.elapsed();
 
-        let desc = decode_tile_ready(&reply).expect("decode");
-        assert_eq!(desc.generation, 1);
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::TileReady { desc, .. }) => {
+                assert_eq!(desc.generation, 1);
+            }
+            other => panic!("expected TileReady, got {other:?}"),
+        }
         times.push(elapsed);
 
-        child.transport.send(b"quit").expect("quit");
+        child.transport.send(b"CMD:QUIT\n").expect("quit");
         let _ = child.child.wait();
     }
 

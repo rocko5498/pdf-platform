@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use protocol::transport::{TransportError, WorkerTransport};
+use protocol::transport::TransportError;
 use sandbox::spawn::spawn_worker;
 
 fn worker_path() -> &'static Path {

@@ -13,6 +13,7 @@ memmap2     = "0.9"
 [target.'cfg(target_os = "linux")'.dependencies]
 # seccomp-bpf + namespace setup; deps added at M0 implementation
 [target.'cfg(target_os = "windows")'.dependencies]
-# AppContainer + job-object setup; deps added at M0 implementation
+# Named pipe FFI is declared inline via #[link(name = "kernel32")] — no
+# windows-sys dependency needed. Consistent with spawn.rs SetHandleInformation.
 [target.'cfg(target_os = "macos")'.dependencies]
 # Sandbox profile setup; deps added at M0 implementation

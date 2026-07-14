@@ -7,7 +7,6 @@ use std::time::Duration;
 use protocol::handles::{
     decode_tile_ready, PixelFormat, SHMEM_SMOKE_MAGIC, TILE_RGBA8_BYTES,
 };
-use protocol::transport::WorkerTransport as _;
 use sandbox::shmem::SharedRegion;
 use sandbox::spawn::{spawn_worker_with_attachments, SpawnAttachments};
 
@@ -25,6 +24,7 @@ fn worker_fills_shmem_tile_smoke() {
         &SpawnAttachments {
             doc: None,
             shmem: Some(region.file()),
+            password: None,
         },
         &[],
     )
@@ -53,6 +53,6 @@ fn worker_fills_shmem_tile_smoke() {
         "expected 0xA5 fill"
     );
 
-    child.transport.send(b"quit").expect("quit");
+    child.transport.send(b"CMD:QUIT\n").expect("quit");
     let _ = child.child.wait();
 }

@@ -39,6 +39,14 @@ impl PixelFormat {
             _ => None,
         }
     }
+
+    /// Parse from a numeric wire value (used by event codec).
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(PixelFormat::Rgba8),
+            _ => None,
+        }
+    }
 }
 
 /// Descriptor for one tile slot inside a shared region. [SDS §6.3]

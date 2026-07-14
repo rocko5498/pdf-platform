@@ -65,8 +65,11 @@ pub struct ViewportRegion {
     pub page: u32,
     /// Visible rectangle in page device-space coordinates.
     pub x: u32,
+    /// Top edge of visible region.
     pub y: u32,
+    /// Width of visible region.
     pub w: u32,
+    /// Height of visible region.
     pub h: u32,
 }
 
@@ -224,8 +227,12 @@ impl RenderScheduler {
     }
 
     /// Process a viewport and return new tile requests (deduplicating in-flight).
-    pub fn schedule_viewport(&mut self, viewport: &Viewport) -> Vec<TileRequest> {
-        let requests = viewport.decompose_with_prefetch(self.generation, 2);
+    ///
+    /// `prefetch_margin` controls how many extra tiles beyond the visible area
+    /// to prefetch. Use velocity-aware margins for fast scrolling (wider margin)
+    /// and tight margins for slow/zoom interaction.
+    pub fn schedule_viewport(&mut self, viewport: &Viewport, prefetch_margin: u32) -> Vec<TileRequest> {
+        let requests = viewport.decompose_with_prefetch(self.generation, prefetch_margin);
         let mut new_requests = Vec::new();
 
         for req in requests {
@@ -305,12 +312,12 @@ mod tests {
             page_height: 792,
         };
 
-        let r1 = sched.schedule_viewport(&vp);
+        let r1 = sched.schedule_viewport(&vp, 2);
         let count = r1.len();
         assert!(count > 0, "should produce tile requests");
 
         // Same viewport — should produce no new requests (all in-flight).
-        let r2 = sched.schedule_viewport(&vp);
+        let r2 = sched.schedule_viewport(&vp, 2);
         assert_eq!(r2.len(), 0);
     }
 
@@ -325,7 +332,7 @@ mod tests {
             page_height: 792,
         };
 
-        sched.schedule_viewport(&vp);
+        sched.schedule_viewport(&vp, 2);
         let count = sched.in_flight_count();
         assert!(count > 0, "should have in-flight tiles");
 

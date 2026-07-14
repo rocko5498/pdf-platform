@@ -5,4 +5,4 @@
 
 pub mod extract; // ExtractCapability: text-with-geometry per page
 pub mod rasterize; // RasterizeCapability: render page region → shmem tile
-pub mod structure; // StructureCapability: enumerate structure tree / forms
+pub mod structure; // StructureCapability: outline, layers, attachments, page metadata
