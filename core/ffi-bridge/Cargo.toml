@@ -14,6 +14,7 @@ protocol    = { path = "../protocol" }
 sandbox     = { path = "../sandbox" }
 engine-stub = { path = "../engine-stub" }
 pdf-model   = { path = "../pdf-model" }
+pdf-write   = { path = "../pdf-write" }
 engine-api  = { path = "../engine-api" }
 search      = { path = "../search" }
 cxx         = "1"

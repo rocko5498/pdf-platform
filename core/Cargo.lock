@@ -538,6 +538,7 @@ dependencies = [
  "engine-api",
  "engine-stub",
  "pdf-model",
+ "pdf-write",
  "protocol",
  "sandbox",
  "search",

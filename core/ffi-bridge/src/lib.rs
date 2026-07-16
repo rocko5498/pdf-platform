@@ -14,7 +14,10 @@ use std::os::windows::io::AsRawHandle;
 use pdf_model::annotation::{
     Annotation, AnnotationStore, AnnotationType, Color, Rect, TextMarkupKind,
 };
-use pdf_model::appearance::generate_appearance;
+use pdf_model::appearance::{build_annotation_pdf_objects, generate_appearance};
+use pdf_model::overlay::CowOverlay;
+use pdf_model::page_patch::inject_annot_refs;
+use pdf_write::IncrementalWriter;
 use pdf_model::fdf::{export_xfdf, import_xfdf_to_store};
 use protocol::commands::{encode_command, Command};
 use protocol::events::{decode_worker_event, WorkerEvent};
@@ -529,6 +532,139 @@ fn annotation_count_impl() -> Result<u32, String> {
     with_session_mut(|session| Ok(session.annotations.all_annotations().len() as u32))
 }
 
+
+fn get_object_bytes(session: &mut DocSession, obj_num: u32) -> Result<Vec<u8>, String> {
+    let correlation_id = next_cid(session);
+    let event = send_recv(session, Command::GetObject { correlation_id, obj_num })?;
+    match event {
+        WorkerEvent::ObjectData { data, obj_num: on, .. } if on == obj_num => Ok(data),
+        WorkerEvent::RenderError { message, .. } => Err(message),
+        other => Err(format!("unexpected get_object: {other:?}")),
+    }
+}
+
+/// Persist annotations into an incremental PDF update. [FR-ANNOT-4, ADR-012]
+fn save_document_impl(out_path: &str) -> Result<String, String> {
+    with_session_mut(|session| {
+        let original = std::fs::read(&session.path).map_err(|e| format!("read source: {e}"))?;
+        let xfdf = export_xfdf(&session.annotations, None);
+
+        let xfdf_path = std::path::Path::new(out_path).with_extension("xfdf");
+        std::fs::write(&xfdf_path, xfdf.as_bytes()).map_err(|e| format!("xfdf write: {e}"))?;
+
+        if session.annotations.all_annotations().is_empty() {
+            if out_path != session.path {
+                std::fs::write(out_path, &original).map_err(|e| format!("copy: {e}"))?;
+            }
+            return Ok(format!(
+                "saved without annots; xfdf={}",
+                xfdf_path.display()
+            ));
+        }
+
+        let mut overlay = CowOverlay::new();
+        let mut next_obj = session
+            .summary
+            .original_offsets
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(10)
+            + 1;
+
+        use std::collections::HashMap;
+        let mut by_page: HashMap<u32, Vec<pdf_model::annotation::Annotation>> = HashMap::new();
+        for a in session.annotations.all_annotations() {
+            by_page.entry(a.page_index).or_default().push(a.clone());
+        }
+
+        let page_objs: Vec<u32> = {
+            let mut objs = Vec::new();
+            if let Ok(pages) = get_object_bytes(session, 2) {
+                let text = String::from_utf8_lossy(&pages);
+                if let Some(k) = text.find("/Kids") {
+                    let slice = &text[k..];
+                    if let Some(lb) = slice.find('[') {
+                        if let Some(rb) = slice[lb..].find(']') {
+                            let arr = &slice[lb + 1..lb + rb];
+                            for tok in arr.split_whitespace() {
+                                if let Ok(n) = tok.parse::<u32>() {
+                                    if n > 0 && !objs.contains(&n) {
+                                        objs.push(n);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if objs.is_empty() {
+                objs = (0..session.page_count).map(|i| i + 3).collect();
+            }
+            objs
+        };
+
+        for (page_index, anns) in &by_page {
+            let page_obj_num = *page_objs.get(*page_index as usize).ok_or_else(|| {
+                format!("no page object for page {page_index}")
+            })?;
+            let original_page = get_object_bytes(session, page_obj_num).unwrap_or_else(|_| {
+                format!(
+                    "{page_obj_num} 0 obj\n<< /Type /Page /MediaBox [0 0 {} {}] >>\nendobj\n",
+                    session.page_width, session.page_height
+                )
+                .into_bytes()
+            });
+
+            let mut annot_nums = Vec::new();
+            for ann in anns {
+                let mut a = ann.clone();
+                let objs = build_annotation_pdf_objects(&mut a, next_obj, next_obj + 1);
+                overlay.set_object(objs.annot_obj_num, objs.annot_bytes);
+                overlay.set_object(objs.ap_obj_num, objs.ap_bytes);
+                annot_nums.push(objs.annot_obj_num);
+                next_obj += 2;
+            }
+            let patched = inject_annot_refs(&original_page, &annot_nums)
+                .map_err(|e| format!("page patch: {e}"))?;
+            overlay.set_object(page_obj_num, patched);
+        }
+
+        let prev_xref = {
+            let text = String::from_utf8_lossy(&original);
+            text.rfind("startxref")
+                .and_then(|i| {
+                    text[i + 9..]
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .and_then(|l| l.trim().parse::<u32>().ok())
+                })
+                .unwrap_or(0)
+        };
+
+        let mut out = original.clone();
+        let original_len = out.len() as u32;
+        let result = IncrementalWriter::write_incremental(
+            &mut out,
+            &overlay,
+            prev_xref,
+            next_obj,
+            &session.summary.original_offsets,
+            original_len,
+        )
+        .map_err(|e| format!("incremental write: {e}"))?;
+
+        std::fs::write(out_path, &out).map_err(|e| format!("write out: {e}"))?;
+        Ok(format!(
+            "saved {} annots, {} objects, xfdf={}",
+            session.annotations.all_annotations().len(),
+            result.objects_written,
+            xfdf_path.display()
+        ))
+    })
+}
+
+
 fn page_count_impl() -> Result<u32, String> {
     with_session_mut(|session| Ok(session.page_count))
 }
@@ -588,5 +724,6 @@ mod ffi {
         fn export_xfdf_impl() -> Result<String>;
         fn import_xfdf_impl(xml: &str) -> Result<u32>;
         fn annotation_count_impl() -> Result<u32>;
+        fn save_document_impl(out_path: &str) -> Result<String>;
     }
 }

@@ -56,4 +56,8 @@ inline uint32_t import_xfdf(const std::string& xml) { return import_xfdf_impl(xm
 
 inline uint32_t annotation_count() { return annotation_count_impl(); }
 
+inline std::string save_document(const std::string& out_path) {
+    return std::string(save_document_impl(out_path));
+}
+
 }  // namespace pdf_platform

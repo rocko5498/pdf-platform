@@ -26,11 +26,13 @@ Precedence on conflict: ADR → SDS → PRD → UI/UX Design System → Implemen
 | Milestone | Status | Notes |
 |-----------|--------|--------|
 | **M0** Walking skeleton | **Done** | Tile via bridge+IPC+shmem; kill-respawn; CI + corpus-diff; budgets recorded. Sandbox confinement still advisory. |
-| **M1** Robust viewer | **Mostly complete** | Multi-page nav, zoom, GPU/software canvas, a11y surface, outline/diagnostics docks, live structure queries, encrypted open with password prompt, large-doc benches exist. Full multi-tile continuous scroll compositor and formal a11y audit still deepen. |
-| **M2** Text / search | **Mostly complete** | Canonical text cache, geometry IPC, find/copy, ligature/CJK-safe search, reliability flag surface. Instant-first-hit streaming and full extraction corpus still expand. |
+| **M1** Robust viewer | **Mostly complete** | Multi-tile continuous scroll, zoom, GPU/software canvas, a11y, live outline/diagnostics, encrypted open, large-doc benches. Formal a11y audit + hard p95 packaging still open. |
+| **M2** Text / search | **Mostly complete** | Text cache, geometry IPC, find/copy, UTF-8-safe ligature/CJK find, reliability flag. Full extraction corpus still expands. |
 | **M3** Mutation core | **Gate passed** | CoW, journal, incremental save, autosave recovery, fault-injection suite. |
-| **M4** Annotations | **Mostly complete** | Types + appearance streams, QuadPoints, session authoring via tools, XFDF export/import + interop unit tests, ink latency smoke. Real Acrobat/Foxit matrix and document-persisted annot save path still deepen. |
-| **M5–M12** | In progress / ahead on models | Forms, assembly, redaction models exist; full milestone exits not claimed. |
+| **M4** Annotations | **Mostly complete** | Appearance streams, QuadPoints, tools, XFDF + interop unit matrix, incremental save with `/Annots` patch + XFDF sidecar. External Acrobat/Foxit matrix still open. |
+| **M5–M12** | Models ahead | Forms/assembly/redaction crates exist; product exits not claimed. |
+
+Criterion-level status: [docs/milestone-exit-tracker.md](docs/milestone-exit-tracker.md).
 
 ### M0 baseline measurements (PRD §14)
 
@@ -65,6 +67,7 @@ The Qt shell requires Qt 6 (Widgets + OpenGLWidgets) and CMake. The Rust core bu
 | Ctrl+F | Find in document |
 | Ctrl+C | Copy current page text |
 | Ctrl+E | Export session annotations as XFDF |
+| Ctrl+S | Save PDF (incremental annots + XFDF sidecar) |
 | PageUp/Down, wheel | Previous/next page |
 | Ctrl+wheel / Ctrl± | Zoom |
 | Enter (with tool) | Place annotation |

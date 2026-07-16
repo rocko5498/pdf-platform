@@ -45,6 +45,7 @@ public:
 signals:
     void pageStepRequested(int delta);
     void zoomStepRequested(int delta);
+    void scrollDeltaRequested(int dy);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -98,7 +99,10 @@ private:
     void setupChrome();
     bool openDocumentWithPassword(const QString& path, const QString& password);
     bool renderCurrentPage();
+    bool renderVisibleTiles();
     void refreshPanels();
+    float docHeightPx() const;
+    void clampScroll();
     void mapShmem(qintptr handle);
     void onAnnotationTool(int tool);
 
@@ -113,7 +117,9 @@ private:
     float scale_ = 1.0f;
     float page_width_ = 595.f;
     float page_height_ = 842.f;
+    float scroll_y_ = 0.f;
     uint64_t generation_ = 1;
+    static constexpr int kTile = 256;
     QString path_;
     QString last_find_query_;
     int annot_tool_ = 0;  // AnnotationTool as int
