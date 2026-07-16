@@ -25,14 +25,17 @@ Precedence on conflict: ADR → SDS → PRD → UI/UX Design System → Implemen
 
 | Milestone | Status | Notes |
 |-----------|--------|--------|
-| **M0** Walking skeleton | **Done** | Tile via bridge+IPC+shmem; kill-respawn; CI + corpus-diff; budgets recorded. Sandbox confinement still advisory. |
-| **M1** Robust viewer | **Mostly complete** | Multi-tile continuous scroll, zoom, GPU/software canvas, a11y, live outline/diagnostics, encrypted open, large-doc benches. Formal a11y audit + hard p95 packaging still open. |
-| **M2** Text / search | **Mostly complete** | Text cache, geometry IPC, find/copy, UTF-8-safe ligature/CJK find, reliability flag. Full extraction corpus still expands. |
+| **M0** Walking skeleton | **Done** | Tile via bridge+IPC+shmem; kill-respawn; CI + corpus-diff; budgets recorded. Sandbox confinement still **advisory**. |
+| **M1** Robust viewer | **Mostly complete** | Multi-tile continuous scroll, zoom, GPU/software canvas, a11y static audit, live outline/diagnostics, encrypted open, large-doc benches. Hard p95 on ref hardware still open. |
+| **M2** Text / search | **Mostly complete** | Text cache, geometry IPC, find/copy, UTF-8-safe ligature/CJK find, `extraction_correctness` suite. Multi-engine corpus still expands. |
 | **M3** Mutation core | **Gate passed** | CoW, journal, incremental save, autosave recovery, fault-injection suite. |
-| **M4** Annotations | **Mostly complete** | Appearance streams, QuadPoints, tools, XFDF + interop unit matrix, incremental save with `/Annots` patch + XFDF sidecar. External Acrobat/Foxit matrix still open. |
-| **M5–M12** | Models ahead | Forms/assembly/redaction crates exist; product exits not claimed. |
+| **M4** Annotations | **Mostly complete** | Appearance streams, QuadPoints, tools, XFDF + interop unit matrix, incremental save with `/Annots` patch + XFDF sidecar. External Acrobat/Foxit lab still open. |
+| **M5** Forms JS | **Subset + Z1 wire** | `forms_js` AFSimple_Calculate subset, kill switch, honesty log, `CMD:FORMS_CALC` over worker. Full AcroForm product exit not claimed. |
+| **M6** Assembly | **CLI (qpdf)** | merge / split / extract-pages / optimize + preflight honesty. Pure-Rust assembly deferred. |
+| **M7–M12** | Models ahead | Redaction/sign/OCR crates exist; product exits not claimed. |
 
-Criterion-level status: [docs/milestone-exit-tracker.md](docs/milestone-exit-tracker.md).
+Criterion-level status: [docs/milestone-exit-tracker.md](docs/milestone-exit-tracker.md).  
+Release checklist: [docs/release-gates.md](docs/release-gates.md).
 
 ### M0 baseline measurements (PRD §14)
 
@@ -44,7 +47,7 @@ Criterion-level status: [docs/milestone-exit-tracker.md](docs/milestone-exit-tra
 
 ## Build
 
-Requires: Rust stable, and [`qpdf`](https://qpdf.sourceforge.io/) on `PATH` for corpus-diff.
+Requires: Rust stable, and [`qpdf`](https://qpdf.sourceforge.io/) on `PATH` for corpus-diff and assembly CLI.
 
 ```bash
 cd core
@@ -53,11 +56,16 @@ cargo run -p cli --bin pdf-platform -- path/to/file.pdf
 cargo run -p cli --bin pdf-platform -- find path/to/file.pdf "query"
 cargo run -p cli --bin pdf-platform -- export-text path/to/file.pdf 0
 cargo run -p cli --bin pdf-platform -- optimize-preflight path/to/file.pdf screen
+cargo run -p cli --bin pdf-platform -- merge a.pdf b.pdf -o out.pdf
+cargo run -p cli --bin pdf-platform -- split in.pdf -o split-out/
 cargo run -p cli --bin pdf-platform -- forms-calc-demo
 cargo run -p cli --bin pdf-platform -- confinement
 cargo test --workspace
 cargo run -p corpus-diff   # needs qpdf; exit 0 = gate pass
 cargo bench -p benchmarks --bench startup
+# from repo root:
+python tools/a11y_audit.py
+python tools/bench/check_p95_gates.py
 ```
 
 
