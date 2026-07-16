@@ -78,3 +78,17 @@ jobs:
 
       - name: Run corpus-diff gate
         run: cargo run -q -p corpus-diff
+
+      - name: Interop matrix (unit)
+        run: cargo test -p pdf-model --test interop_matrix
+
+      - name: Forms JS subset + confinement unit tests
+        run: |
+          cargo test -p pdf-model forms_js
+          cargo test -p sandbox confinement
+
+      - name: A11y static audit + p95 gate table
+        working-directory: .
+        run: |
+          python tools/a11y_audit.py
+          python tools/bench/check_p95_gates.py

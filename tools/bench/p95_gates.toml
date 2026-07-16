@@ -1,0 +1,13 @@
+# Performance gate budgets (initial targets — recalibrate with evidence). [ADR-023, PRD §14]
+# Enforced on dedicated hardware for releases; CI runs a *smoke* check only.
+
+[meta]
+version = 1
+notes = "Percentiles not means. CI smoke uses criterion-less unit checks in benchmarks crate where present."
+
+[gates]
+# id = { metric, budget_ms or budget_us, percentile }
+cold_start_ms = { budget = 1000, percentile = 95, cite = "MET-PERF-1" }
+first_page_ms = { budget = 300, percentile = 95, cite = "MET-PERF-2" }
+# Viewport decompose for 2000p scroll scheduling (CPU micro, not full raster)
+viewport_scroll_2000p_us = { budget = 5000, percentile = 95, cite = "MET-PERF-3" }

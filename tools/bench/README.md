@@ -1,8 +1,24 @@
-# bench
+# Benchmark harness notes
 
-M0 exit-criterion benchmark harness. Measures tile-rasterize throughput and
-IPC round-trip latency against the NFR targets in the PRD.
+**Cites:** ADR-023, PRD §14 MET-PERF-*, SDS §14 M1
 
-Cite: SDS §14 M0 exit criteria, PRD NFR-PERF-*.
+## Gates
 
-ponytail: stub — wire up at M0 implementation; must gate the CI pipeline before M0 ships.
+Budgets live in [`p95_gates.toml`](p95_gates.toml). Validate definition:
+
+```bash
+python tools/bench/check_p95_gates.py
+```
+
+## Run (developer)
+
+```bash
+cd core
+cargo bench -p benchmarks --bench startup
+cargo bench -p benchmarks --bench large_doc   # when registered
+```
+
+## CI policy
+
+- PR CI: **definition smoke** only (`check_p95_gates.py`) — no noisy cloud gating.  
+- Release: hard p95 compare on **fixed reference hardware** per ADR-023.

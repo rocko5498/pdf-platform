@@ -400,31 +400,13 @@ impl AcroForm {
         changed
     }
 
-    /// Run the calculation order: evaluate each field's JS expression
-    /// and update dependent fields. [FR-JS-1]
+    /// Run the calculation order via the forms JS **subset** evaluator. [FR-JS-1, ADR-017]
     ///
-    /// Returns the list of fields that were recalculated.
+    /// Unsupported constructs are not silently emulated — see `forms_js` log
+    /// when using [`crate::forms_js::run_form_calculations`]. Returns field
+    /// names that were recalculated successfully.
     pub fn run_calculations(&mut self) -> Vec<String> {
-        if !self.has_javascript || !self.javascript_enabled {
-            return Vec::new();
-        }
-
-        let mut recalculated = Vec::new();
-
-        for field_name in &self.calculation_order.clone() {
-            if let Some(field) = self.fields.get(field_name) {
-                if let Some(ref calc) = field.calculation {
-                    if calc.enabled {
-                        // In a real implementation, this would evaluate the JS expression.
-                        // For M5, we record that a calculation would run here.
-                        // The actual JS execution is in the worker (Z1) per ADR-017.
-                        recalculated.push(field_name.clone());
-                    }
-                }
-            }
-        }
-
-        recalculated
+        crate::forms_js::run_form_calculations(self).updated_fields
     }
 
     /// Check if any field has JavaScript calculations.
@@ -564,21 +546,36 @@ mod tests {
     fn calculation_order() {
         let mut form = AcroForm::new();
         form.has_javascript = true;
+        form.javascript_enabled = true;
 
-        // Add fields with calculations.
-        let mut total_field = FormField::new("total", FieldType::Text, 0,
-            FieldRect::new(0.0, 0.0, 100.0, 20.0));
+        let mut a = FormField::new("a", FieldType::Text, 0, FieldRect::new(0.0, 0.0, 100.0, 20.0));
+        a.set_value(FieldValue::Text("10".into()));
+        form.add_field(a);
+        let mut b = FormField::new("b", FieldType::Text, 0, FieldRect::new(0.0, 0.0, 100.0, 20.0));
+        b.set_value(FieldValue::Text("5".into()));
+        form.add_field(b);
+
+        let mut total_field = FormField::new(
+            "total",
+            FieldType::Text,
+            0,
+            FieldRect::new(0.0, 0.0, 100.0, 20.0),
+        );
         total_field.calculation = Some(FieldCalculation {
-            expression: "a + b".into(),
+            expression: r#"AFSimple_Calculate("SUM", ["a","b"])"#.into(),
             dependencies: vec!["a".into(), "b".into()],
             enabled: true,
         });
         form.add_field(total_field);
 
-        let mut tax_field = FormField::new("tax", FieldType::Text, 0,
-            FieldRect::new(0.0, 30.0, 100.0, 20.0));
+        let mut tax_field = FormField::new(
+            "tax",
+            FieldType::Text,
+            0,
+            FieldRect::new(0.0, 30.0, 100.0, 20.0),
+        );
         tax_field.calculation = Some(FieldCalculation {
-            expression: "total * 0.1".into(),
+            expression: r#"getField("total") * 0.1"#.into(),
             dependencies: vec!["total".into()],
             enabled: true,
         });
@@ -586,11 +583,13 @@ mod tests {
 
         form.calculation_order = vec!["total".into(), "tax".into()];
 
+        // Forms JS subset evaluates in-process for tests; production path is Z1. [ADR-017]
         let recalc = form.run_calculations();
-        // In M5, calculations are recorded but not executed in-process.
-        // The actual JS runs in the worker (Z1).
-        assert_eq!(recalc.len(), 2);
-        assert_eq!(recalc[0], "total");
-        assert_eq!(recalc[1], "tax");
+        assert!(recalc.contains(&"total".into()));
+        assert!(recalc.contains(&"tax".into()));
+        assert_eq!(
+            form.fields().get("total").unwrap().value,
+            FieldValue::Text("15".into())
+        );
     }
 }

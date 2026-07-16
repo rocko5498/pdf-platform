@@ -18,6 +18,7 @@ pub mod assembly;
 pub mod command;
 pub mod fdf;
 pub mod form;
+pub mod forms_js;
 pub mod journal;
 pub mod overlay;
 pub mod organize;

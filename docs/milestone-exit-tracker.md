@@ -9,14 +9,14 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M0** | Kill-worker respawn | **Met** | `session_death.rs` |
 | **M0** | Corpus-diff + CI | **Met** | GitHub Actions |
 | **M0** | Cold-start / first-page budgets | **Met** | ~11ms / ~13ms recorded |
-| **M0** | Sandbox confinement | **Partial** | Advisory only (human-gated) |
+| **M0** | Sandbox confinement | **Advisory + review package** | `docs/security/confinement-review-package.md`; `confinement_report()`; no silent enforce |
 | **M1** | Multi-page + zoom + scroll | **Mostly** | Continuous multi-tile composite + wheel scroll |
 | **M1** | Outline / layers / attachments | **Mostly** | Live worker queries + dock panels |
 | **M1** | Diagnostics / leniency | **Mostly** | Panel + CLI + FFI |
 | **M1** | Accessible chrome | **Mostly** | QAccessible + focus/keyboard |
 | **M1** | Encrypted open | **Mostly** | Password prompt + env password to worker |
-| **M1** | Large-doc p95 budgets | **Harness** | `bench_large_doc` exists; hard gate packaging TBD |
-| **M1** | Formal a11y audit | **Open** | Checklist in DS §13; not CI-audited |
+| **M1** | Formal a11y audit | **Partial** | `tools/a11y_audit.py` CI + `docs/a11y-audit-checklist.md` manual |
+| **M1** | Large-doc p95 budgets | **Harness + gate table** | `tools/bench/p95_gates.toml` + check script; hard gate on ref hardware |
 | **M2** | Canonical text model + cache | **Met** | text-extract + coordinator + FFI cache |
 | **M2** | Find + geometry | **Mostly** | UTF-8-safe find, CLI/GUI find, selection overlay |
 | **M2** | Copy text | **Mostly** | Ctrl+C page text |
@@ -26,8 +26,9 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M4** | Appearance streams always written | **Met** | `build_annotation_pdf_objects` + tests |
 | **M4** | XFDF import/export | **Mostly** | Unit interop + shell export/save XFDF |
 | **M4** | Annot persist to PDF | **Mostly** | Incremental save + page `/Annots` patch via FFI |
-| **M4** | Acrobat/Foxit matrix | **Open** | Needs external apps; unit matrix only |
-| **M5+** | Forms JS / assembly / redaction product exits | **Model ahead** | Crates exist; product exit not claimed |
+| **M4** | Acrobat/Foxit matrix | **Unit matrix CI** | `interop_matrix` + CI; external apps still release-train |
+| **M5** | Forms JS subset | **Subset landed** | `forms_js` AFSimple_Calculate + kill switch + honesty log [ADR-017] |
+| **M5+** | Full forms/assembly/redaction product exits | **Partial models** | Broader product exit criteria still open |
 
 ## Roadmap invariants (SDS §14)
 
