@@ -13,6 +13,8 @@
 #![allow(missing_docs)] // M0: exhaustive field docs deferred to component-level review
 
 use crate::layout::ViewportState;
+use crate::scroll::ScrollPhysics;
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Tool modes
@@ -375,6 +377,10 @@ pub struct ViewController {
     pub drag: DragState,
     /// Whether tool stickiness is enabled (user-configurable).
     pub sticky_tools: bool,
+    /// Scroll physics for velocity tracking and momentum.
+    pub scroll_physics: ScrollPhysics,
+    /// Timestamp of the last scroll input event (for velocity estimation).
+    last_scroll_time: Option<Instant>,
 }
 
 impl ViewController {
@@ -385,6 +391,8 @@ impl ViewController {
             shortcuts: ShortcutRegistry::defaults(),
             drag: DragState::default(),
             sticky_tools: true,
+            scroll_physics: ScrollPhysics::new(),
+            last_scroll_time: None,
         }
     }
 
@@ -456,6 +464,7 @@ impl ViewController {
                     let dy = (self.drag.last_y - y) / state.scale;
                     self.drag.last_x = *x;
                     self.drag.last_y = *y;
+                    self.track_scroll_velocity(dx, dy);
                     vec![InputAction::ScrollBy { dx, dy }]
                 } else {
                     vec![]
@@ -486,11 +495,14 @@ impl ViewController {
                 } else if modifiers.shift {
                     // Shift + wheel = horizontal scroll. [DS-POINT-1]
                     let dx = delta_x - delta_y; // Normalize wheel delta to horizontal.
-                    vec![InputAction::ScrollBy { dx: dx * 30.0, dy: 0.0 }]
+                    let doc_dx = dx * 30.0;
+                    self.track_scroll_velocity(doc_dx, 0.0);
+                    vec![InputAction::ScrollBy { dx: doc_dx, dy: 0.0 }]
                 } else {
                     // Plain wheel = vertical scroll. [DS-POINT-1]
                     let dy = delta_y * 30.0;
                     let dx = delta_x * 30.0;
+                    self.track_scroll_velocity(dx, dy);
                     vec![InputAction::ScrollBy { dx, dy }]
                 }
             }
@@ -505,6 +517,39 @@ impl ViewController {
 
             _ => vec![],
         }
+    }
+
+    /// Track scroll velocity from a scroll input event.
+    ///
+    /// `dx`, `dy` are the scroll deltas in document-space points. The method
+    /// computes the time since the last scroll event and feeds it to the
+    /// scroll physics for velocity estimation.
+    fn track_scroll_velocity(&mut self, dx: f32, dy: f32) {
+        let now = Instant::now();
+        let dt = self.last_scroll_time
+            .map(|t| now.duration_since(t).as_secs_f32())
+            .unwrap_or(0.016); // Default to ~60fps if no previous event.
+        self.last_scroll_time = Some(now);
+        self.scroll_physics.on_scroll(dx, dy, dt);
+    }
+
+    /// Tick the scroll physics (momentum decay, edge resistance).
+    ///
+    /// Call this once per frame from the shell. `doc_height` is the total
+    /// document height in document-space points. Returns `true` if the
+    /// scroll position changed (repaint needed).
+    pub fn tick_physics(&mut self, dt: f32, state: &mut ViewportState, doc_height: f32) -> bool {
+        self.scroll_physics.tick(dt, state, doc_height)
+    }
+
+    /// Stop all scroll momentum (e.g., on explicit navigation like Page Up).
+    pub fn stop_momentum(&mut self) {
+        self.scroll_physics.stop();
+    }
+
+    /// Get a reference to the scroll physics.
+    pub fn scroll_physics(&self) -> &ScrollPhysics {
+        &self.scroll_physics
     }
 
     /// Finalize a marquee zoom after drag release.
@@ -752,5 +797,87 @@ mod tests {
         let reg = ShortcutRegistry::defaults();
         let action = reg.lookup(Key::Char('z'), &Modifiers::default());
         assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn wheel_scroll_tracks_velocity() {
+        let mut vc = ViewController::new();
+        let state = default_state();
+
+        // Send a wheel event — should track velocity.
+        vc.process_event(
+            &InputEvent::Wheel {
+                delta_x: 0.0,
+                delta_y: -120.0,
+                x: 400.0,
+                y: 300.0,
+                modifiers: Modifiers::default(),
+            },
+            &state,
+        );
+
+        assert!(vc.scroll_physics.velocity_y().abs() > 0.0,
+            "velocity should be tracked after wheel scroll");
+    }
+
+    #[test]
+    fn hand_drag_tracks_velocity() {
+        let mut vc = ViewController::new();
+        vc.tool = ToolMode::Hand;
+        let state = default_state();
+
+        // Start drag.
+        vc.process_event(
+            &InputEvent::MousePress {
+                x: 400.0, y: 300.0,
+                button: MouseButton::Left,
+                modifiers: Modifiers::default(),
+            },
+            &state,
+        );
+
+        // Move — should track velocity.
+        vc.process_event(
+            &InputEvent::MouseMove {
+                x: 350.0, y: 250.0,
+                buttons: MouseButtons { left: true, ..Default::default() },
+            },
+            &state,
+        );
+
+        assert!(vc.scroll_physics.velocity_y().abs() > 0.0 || vc.scroll_physics.velocity_x().abs() > 0.0,
+            "velocity should be tracked after hand drag");
+    }
+
+    #[test]
+    fn tick_physics_returns_false_when_idle() {
+        let mut vc = ViewController::new();
+        let mut state = default_state();
+        let changed = vc.tick_physics(0.016, &mut state, 5000.0);
+        assert!(!changed, "no change when no velocity");
+    }
+
+    #[test]
+    fn tick_physics_applies_momentum() {
+        let mut vc = ViewController::new();
+        let mut state = default_state();
+
+        // Simulate a fast scroll.
+        vc.scroll_physics.on_scroll(0.0, 500.0, 0.01);
+
+        // First tick should move the viewport.
+        let changed = vc.tick_physics(0.016, &mut state, 5000.0);
+        assert!(changed, "momentum should move viewport");
+        assert!(state.scroll_y > 0.0, "scroll_y should increase: {}", state.scroll_y);
+    }
+
+    #[test]
+    fn stop_momentum_cancels() {
+        let mut vc = ViewController::new();
+        vc.scroll_physics.on_scroll(0.0, 500.0, 0.01);
+        assert!(vc.scroll_physics.is_momentum_active());
+
+        vc.stop_momentum();
+        assert!(!vc.scroll_physics.is_momentum_active());
     }
 }

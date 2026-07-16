@@ -60,12 +60,16 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "benchmarks"
 version = "0.1.0"
 dependencies = [
+ "coordinator",
  "criterion",
  "engine-api",
  "engine-pdfium",
  "engine-stub",
+ "pdf-model",
+ "pdf-write",
  "protocol",
  "render-pipeline",
+ "sandbox",
 ]
 
 [[package]]
@@ -259,6 +263,7 @@ dependencies = [
  "pdf-cos",
  "pdf-model",
  "pdf-types",
+ "pdf-write",
  "plugin-host",
  "protocol",
  "render-pipeline",
@@ -530,9 +535,12 @@ dependencies = [
  "coordinator",
  "cxx",
  "cxx-build",
+ "engine-api",
  "engine-stub",
+ "pdf-model",
  "protocol",
  "sandbox",
+ "search",
 ]
 
 [[package]]
@@ -1147,6 +1155,7 @@ name = "pdf-cos"
 version = "0.1.0"
 dependencies = [
  "diagnostics",
+ "flate2",
  "memmap2",
  "pdf-types",
 ]
@@ -1613,6 +1622,7 @@ checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
 name = "search"
 version = "0.1.0"
 dependencies = [
+ "engine-api",
  "pdf-types",
  "text-extract",
 ]
@@ -1797,6 +1807,7 @@ dependencies = [
 name = "text-extract"
 version = "0.1.0"
 dependencies = [
+ "engine-api",
  "pdf-cos",
  "pdf-types",
 ]
@@ -2416,6 +2427,7 @@ dependencies = [
  "engine-hayro",
  "engine-pdfium",
  "engine-stub",
+ "memmap2",
  "pdf-cos",
  "protocol",
  "sandbox",

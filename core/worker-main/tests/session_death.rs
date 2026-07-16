@@ -41,6 +41,7 @@ fn session_kill_emits_worker_died_once() {
                 | WorkerDeathReason::Io { .. } => {}
             }
         }
+        other => panic!("expected WorkerDied, got {other:?}"),
     }
     assert!(!s.is_alive());
 

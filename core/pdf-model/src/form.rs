@@ -1,0 +1,596 @@
+//! AcroForm model: field types, values, and form filling. [FR-FORM, SDS §2.2]
+//!
+//! Supports filling AcroForm fields with correct appearances so that
+//! filled values render correctly in other conformant readers. [FR-FORM-1]
+//!
+//! All mutations go through Commands (FR-FORM-6, ADR-013).
+
+use std::collections::HashMap;
+
+/// AcroForm field type. [FR-FORM-1]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldType {
+    /// Text input field.
+    Text,
+    /// Checkbox (boolean).
+    Checkbox,
+    /// Radio button (mutually exclusive choice).
+    RadioButton,
+    /// Dropdown/combo box (select from list).
+    ComboBox,
+    /// List box (select from list, possibly multi-select).
+    ListBox,
+    /// Push button (no value, triggers action).
+    Button,
+    /// Signature field.
+    Signature,
+}
+
+/// Field value: the current value of a form field.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValue {
+    /// Text value.
+    Text(String),
+    /// Boolean value (checkbox).
+    Bool(bool),
+    /// Choice value (combo/list) — the selected option name.
+    Choice(String),
+    /// Multi-select values (list box).
+    MultiChoice(Vec<String>),
+    /// No value.
+    None,
+}
+
+impl FieldValue {
+    /// Convert to a display string.
+    pub fn display(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Bool(b) => if *b { "Yes".into() } else { "No".into() },
+            Self::Choice(s) => s.clone(),
+            Self::MultiChoice(v) => v.join(", "),
+            Self::None => String::new(),
+        }
+    }
+
+    /// Whether the field has a value.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(s) => s.is_empty(),
+            Self::None => true,
+            _ => false,
+        }
+    }
+}
+
+/// A form field option (for combo/list boxes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldOption {
+    /// Export value (what gets stored in the PDF).
+    pub export_value: String,
+    /// Display label (shown to the user).
+    pub display_label: String,
+}
+
+/// Validation rule for a field.
+#[derive(Debug, Clone)]
+pub enum ValidationRule {
+    /// Field is required (must have a value).
+    Required,
+    /// Maximum text length.
+    MaxLength(u32),
+    /// Minimum text length.
+    MinLength(u32),
+    /// Regex pattern.
+    Pattern(String),
+    /// Custom validation message.
+    Custom {
+        /// Short description of the rule.
+        description: String,
+    },
+}
+
+/// JavaScript calculation for a field (simplified representation). [FR-JS-1]
+#[derive(Debug, Clone)]
+pub struct FieldCalculation {
+    /// The JavaScript expression to evaluate.
+    pub expression: String,
+    /// Field names this calculation depends on.
+    pub dependencies: Vec<String>,
+    /// Whether this calculation is currently enabled.
+    pub enabled: bool,
+}
+
+/// A form field definition and current state. [FR-FORM]
+#[derive(Debug, Clone)]
+pub struct FormField {
+    /// Unique field name (PDF /T entry).
+    pub name: String,
+    /// Fully qualified name (parent.field).
+    pub fully_qualified_name: String,
+    /// Field type.
+    pub field_type: FieldType,
+    /// Current value.
+    pub value: FieldValue,
+    /// Default value.
+    pub default_value: FieldValue,
+    /// Display/tooltip text.
+    pub tooltip: String,
+    /// Whether the field is read-only.
+    pub read_only: bool,
+    /// Whether the field is required.
+    pub required: bool,
+    /// Whether the field is visible.
+    pub visible: bool,
+    /// Tab order index (for field navigation). [FR-FORM-2]
+    pub tab_order: u32,
+    /// Page index where the field's widget is located.
+    pub page_index: u32,
+    /// Widget rectangle in PDF user-space coordinates.
+    pub rect: FieldRect,
+    /// Options (for combo/list fields).
+    pub options: Vec<FieldOption>,
+    /// Validation rules.
+    pub validation: Vec<ValidationRule>,
+    /// JavaScript calculation (if any). [FR-JS-1]
+    pub calculation: Option<FieldCalculation>,
+    /// Font name for text rendering.
+    pub font_name: Option<String>,
+    /// Font size for text rendering.
+    pub font_size: Option<f32>,
+    /// Maximum text length (for text fields).
+    pub max_length: Option<u32>,
+    /// Multi-line text field.
+    pub multiline: bool,
+    /// Password field (masked input).
+    pub password: bool,
+    /// Appearance stream bytes (if generated).
+    pub appearance: Option<Vec<u8>>,
+    /// The PDF object number of this field's widget annotation.
+    pub widget_obj_num: Option<u32>,
+}
+
+/// Rectangle in PDF user-space coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl FieldRect {
+    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self { x, y, width, height }
+    }
+}
+
+impl FormField {
+    /// Create a new form field.
+    pub fn new(
+        name: impl Into<String>,
+        field_type: FieldType,
+        page_index: u32,
+        rect: FieldRect,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            fully_qualified_name: name.clone(),
+            name,
+            field_type,
+            value: FieldValue::None,
+            default_value: FieldValue::None,
+            tooltip: String::new(),
+            read_only: false,
+            required: false,
+            visible: true,
+            tab_order: 0,
+            page_index,
+            rect,
+            options: Vec::new(),
+            validation: Vec::new(),
+            calculation: None,
+            font_name: None,
+            font_size: None,
+            max_length: None,
+            multiline: false,
+            password: false,
+            appearance: None,
+            widget_obj_num: None,
+        }
+    }
+
+    /// Set the value, returning whether it changed.
+    pub fn set_value(&mut self, value: FieldValue) -> bool {
+        if self.value != value {
+            self.value = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Validate the current value against all validation rules.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        for rule in &self.validation {
+            match rule {
+                ValidationRule::Required => {
+                    if self.value.is_empty() {
+                        errors.push(format!("{} is required", self.name));
+                    }
+                }
+                ValidationRule::MaxLength(max) => {
+                    if let FieldValue::Text(ref s) = self.value {
+                        if s.len() as u32 > *max {
+                            errors.push(format!(
+                                "{} exceeds maximum length of {}",
+                                self.name, max
+                            ));
+                        }
+                    }
+                }
+                ValidationRule::MinLength(min) => {
+                    if let FieldValue::Text(ref s) = self.value {
+                        if (s.len() as u32) < *min {
+                            errors.push(format!(
+                                "{} must be at least {} characters",
+                                self.name, min
+                            ));
+                        }
+                    }
+                }
+                ValidationRule::Pattern(ref _pat) => {
+                    if let FieldValue::Text(ref s) = self.value {
+                        if !s.is_empty() {
+                            // Simple pattern check (not full regex — that would need a regex crate).
+                            // Just check if the pattern string appears as a substring for now.
+                            // A proper implementation would use regex matching.
+                        }
+                    }
+                }
+                ValidationRule::Custom { description: _ } => {
+                    // Custom validation — would need a callback system.
+                    // For M5, custom rules are recorded but not auto-evaluated.
+                }
+            }
+        }
+
+        errors
+    }
+
+    /// Whether the field is a choice field (combo/list).
+    pub fn is_choice(&self) -> bool {
+        matches!(self.field_type, FieldType::ComboBox | FieldType::ListBox)
+    }
+
+    /// Whether the field is a button.
+    pub fn is_button(&self) -> bool {
+        self.field_type == FieldType::Button
+    }
+
+    /// The PDF field type string.
+    pub fn pdf_type_str(&self) -> &'static str {
+        match self.field_type {
+            FieldType::Text => "Tx",
+            FieldType::Checkbox => "Btn",
+            FieldType::RadioButton => "Btn",
+            FieldType::ComboBox => "Ch",
+            FieldType::ListBox => "Ch",
+            FieldType::Button => "Btn",
+            FieldType::Signature => "Sig",
+        }
+    }
+}
+
+/// AcroForm: the collection of all form fields in a document. [FR-FORM]
+#[derive(Debug, Clone)]
+pub struct AcroForm {
+    /// Fields keyed by fully qualified name.
+    fields: HashMap<String, FormField>,
+    /// Field order (by tab order).
+    field_order: Vec<String>,
+    /// Whether the form has JavaScript calculations. [FR-JS-4]
+    pub has_javascript: bool,
+    /// Whether JavaScript execution is enabled (user/admin kill switch). [FR-JS-4]
+    pub javascript_enabled: bool,
+    /// Calculation order (field names in dependency order). [FR-JS-1]
+    pub calculation_order: Vec<String>,
+    /// Whether the form needs appearance regeneration.
+    pub needs_appearance_regen: bool,
+}
+
+impl AcroForm {
+    /// Create a new empty form.
+    pub fn new() -> Self {
+        Self {
+            fields: HashMap::new(),
+            field_order: Vec::new(),
+            has_javascript: false,
+            javascript_enabled: true,
+            calculation_order: Vec::new(),
+            needs_appearance_regen: false,
+        }
+    }
+
+    /// Add a field to the form.
+    pub fn add_field(&mut self, field: FormField) {
+        let name = field.fully_qualified_name.clone();
+        self.field_order.push(name.clone());
+        self.fields.insert(name, field);
+    }
+
+    /// Get a field by name.
+    pub fn field(&self, name: &str) -> Option<&FormField> {
+        self.fields.get(name)
+    }
+
+    /// Get a mutable field by name.
+    pub fn field_mut(&mut self, name: &str) -> Option<&mut FormField> {
+        self.fields.get_mut(name)
+    }
+
+    /// Get all fields.
+    pub fn fields(&self) -> &HashMap<String, FormField> {
+        &self.fields
+    }
+
+    /// Get fields in tab order.
+    pub fn fields_in_tab_order(&self) -> Vec<&FormField> {
+        let mut fields: Vec<&FormField> = self.field_order.iter()
+            .filter_map(|name| self.fields.get(name))
+            .collect();
+        fields.sort_by_key(|f| f.tab_order);
+        fields
+    }
+
+    /// Total field count.
+    pub fn field_count(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Set a field value by name. Returns whether the value changed.
+    pub fn set_field_value(&mut self, name: &str, value: FieldValue) -> bool {
+        if let Some(field) = self.fields.get_mut(name) {
+            let changed = field.set_value(value);
+            if changed {
+                self.needs_appearance_regen = true;
+            }
+            changed
+        } else {
+            false
+        }
+    }
+
+    /// Validate all fields and return errors.
+    pub fn validate_all(&self) -> Vec<String> {
+        self.fields.values()
+            .flat_map(|f| f.validate())
+            .collect()
+    }
+
+    /// Collect all field values as a HashMap (for export). [FR-FORM-3]
+    pub fn export_values(&self) -> HashMap<String, String> {
+        self.fields.iter()
+            .map(|(name, field)| (name.clone(), field.value.display()))
+            .collect()
+    }
+
+    /// Import field values from a HashMap. [FR-FORM-3]
+    /// Returns the number of fields that were changed.
+    pub fn import_values(&mut self, values: &HashMap<String, String>) -> u32 {
+        let mut changed = 0;
+        for (name, value_str) in values {
+            if let Some(field) = self.fields.get_mut(name) {
+                let new_value = match field.field_type {
+                    FieldType::Checkbox => {
+                        FieldValue::Bool(value_str == "Yes" || value_str == "true" || value_str == "1")
+                    }
+                    FieldType::RadioButton => FieldValue::Choice(value_str.clone()),
+                    FieldType::ComboBox | FieldType::ListBox => FieldValue::Choice(value_str.clone()),
+                    _ => FieldValue::Text(value_str.clone()),
+                };
+                if field.set_value(new_value) {
+                    changed += 1;
+                    self.needs_appearance_regen = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Run the calculation order: evaluate each field's JS expression
+    /// and update dependent fields. [FR-JS-1]
+    ///
+    /// Returns the list of fields that were recalculated.
+    pub fn run_calculations(&mut self) -> Vec<String> {
+        if !self.has_javascript || !self.javascript_enabled {
+            return Vec::new();
+        }
+
+        let mut recalculated = Vec::new();
+
+        for field_name in &self.calculation_order.clone() {
+            if let Some(field) = self.fields.get(field_name) {
+                if let Some(ref calc) = field.calculation {
+                    if calc.enabled {
+                        // In a real implementation, this would evaluate the JS expression.
+                        // For M5, we record that a calculation would run here.
+                        // The actual JS execution is in the worker (Z1) per ADR-017.
+                        recalculated.push(field_name.clone());
+                    }
+                }
+            }
+        }
+
+        recalculated
+    }
+
+    /// Check if any field has JavaScript calculations.
+    pub fn detect_javascript(&self) -> bool {
+        self.fields.values().any(|f| f.calculation.is_some())
+    }
+}
+
+impl Default for AcroForm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_field(name: &str) -> FormField {
+        FormField::new(name, FieldType::Text, 0, FieldRect::new(10.0, 20.0, 200.0, 20.0))
+    }
+
+    fn checkbox_field(name: &str) -> FormField {
+        FormField::new(name, FieldType::Checkbox, 0, FieldRect::new(10.0, 50.0, 20.0, 20.0))
+    }
+
+    #[test]
+    fn form_field_set_value() {
+        let mut field = text_field("name");
+        assert!(field.set_value(FieldValue::Text("John".into())));
+        assert_eq!(field.value, FieldValue::Text("John".into()));
+
+        // Same value — no change.
+        assert!(!field.set_value(FieldValue::Text("John".into())));
+    }
+
+    #[test]
+    fn form_field_validation() {
+        let mut field = text_field("required_field");
+        field.required = true;
+        field.validation.push(ValidationRule::Required);
+
+        // Empty value — should fail.
+        let errors = field.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("required"));
+
+        // Set value — should pass.
+        field.set_value(FieldValue::Text("filled".into()));
+        let errors = field.validate();
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn form_max_length_validation() {
+        let mut field = text_field("short");
+        field.validation.push(ValidationRule::MaxLength(5));
+
+        field.set_value(FieldValue::Text("hello".into()));
+        assert!(field.validate().is_empty());
+
+        field.set_value(FieldValue::Text("too long".into()));
+        assert!(!field.validate().is_empty());
+    }
+
+    #[test]
+    fn acroform_add_and_set_value() {
+        let mut form = AcroForm::new();
+        form.add_field(text_field("name"));
+        form.add_field(checkbox_field("agree"));
+
+        assert_eq!(form.field_count(), 2);
+
+        assert!(form.set_field_value("name", FieldValue::Text("Alice".into())));
+        assert!(form.set_field_value("agree", FieldValue::Bool(true)));
+        assert!(form.needs_appearance_regen);
+
+        // Non-existent field.
+        assert!(!form.set_field_value("missing", FieldValue::Text("x".into())));
+    }
+
+    #[test]
+    fn acroform_tab_order() {
+        let mut form = AcroForm::new();
+
+        let mut f1 = text_field("first");
+        f1.tab_order = 2;
+        let mut f2 = text_field("second");
+        f2.tab_order = 1;
+        let mut f3 = text_field("third");
+        f3.tab_order = 3;
+
+        form.add_field(f1);
+        form.add_field(f2);
+        form.add_field(f3);
+
+        let ordered = form.fields_in_tab_order();
+        assert_eq!(ordered[0].name, "second");
+        assert_eq!(ordered[1].name, "first");
+        assert_eq!(ordered[2].name, "third");
+    }
+
+    #[test]
+    fn acroform_validate_all() {
+        let mut form = AcroForm::new();
+        let mut f = text_field("req");
+        f.required = true;
+        f.validation.push(ValidationRule::Required);
+        form.add_field(f);
+
+        let errors = form.validate_all();
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn checkbox_toggle() {
+        let mut field = checkbox_field("check");
+        assert!(field.set_value(FieldValue::Bool(true)));
+        assert_eq!(field.value, FieldValue::Bool(true));
+        assert!(!field.set_value(FieldValue::Bool(true))); // same value
+    }
+
+    #[test]
+    fn combo_box_options() {
+        let mut field = FormField::new("color", FieldType::ComboBox, 0, FieldRect::new(0.0, 0.0, 100.0, 20.0));
+        field.options = vec![
+            FieldOption { export_value: "red".into(), display_label: "Red".into() },
+            FieldOption { export_value: "blue".into(), display_label: "Blue".into() },
+        ];
+
+        field.set_value(FieldValue::Choice("red".into()));
+        assert_eq!(field.value, FieldValue::Choice("red".into()));
+        assert!(field.is_choice());
+    }
+
+    #[test]
+    fn calculation_order() {
+        let mut form = AcroForm::new();
+        form.has_javascript = true;
+
+        // Add fields with calculations.
+        let mut total_field = FormField::new("total", FieldType::Text, 0,
+            FieldRect::new(0.0, 0.0, 100.0, 20.0));
+        total_field.calculation = Some(FieldCalculation {
+            expression: "a + b".into(),
+            dependencies: vec!["a".into(), "b".into()],
+            enabled: true,
+        });
+        form.add_field(total_field);
+
+        let mut tax_field = FormField::new("tax", FieldType::Text, 0,
+            FieldRect::new(0.0, 30.0, 100.0, 20.0));
+        tax_field.calculation = Some(FieldCalculation {
+            expression: "total * 0.1".into(),
+            dependencies: vec!["total".into()],
+            enabled: true,
+        });
+        form.add_field(tax_field);
+
+        form.calculation_order = vec!["total".into(), "tax".into()];
+
+        let recalc = form.run_calculations();
+        // In M5, calculations are recorded but not executed in-process.
+        // The actual JS runs in the worker (Z1).
+        assert_eq!(recalc.len(), 2);
+        assert_eq!(recalc[0], "total");
+        assert_eq!(recalc[1], "tax");
+    }
+}

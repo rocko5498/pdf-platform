@@ -7,63 +7,201 @@
 //!   FFI-6: two-reviewer rule; changes require one FFI-surface owner. [ADR-027]
 // SAFETY: cxx guarantees type-checked cross-language calls; no exceptions cross
 //         this boundary; ownership does not straddle languages. [ADR-004, ADR-027]
-#![allow(static_mut_refs)] // M0: single-threaded Qt main thread; replaced at multi-doc
+#![allow(static_mut_refs)] // single-threaded Qt main thread; multi-doc later
 
 use std::os::windows::io::AsRawHandle;
 
+use pdf_model::annotation::{
+    Annotation, AnnotationStore, AnnotationType, Color, Rect, TextMarkupKind,
+};
+use pdf_model::appearance::generate_appearance;
+use pdf_model::fdf::{export_xfdf, import_xfdf_to_store};
 use protocol::commands::{encode_command, Command};
 use protocol::events::{decode_worker_event, WorkerEvent};
 use protocol::handles::TILE_RGBA8_BYTES;
+use protocol::inspect::StructuralSummary;
 use sandbox::shmem::SharedRegion;
 use sandbox::spawn::{spawn_worker_with_attachments, SpawnAttachments};
+use search::{find_all, FindOptions};
 
-/// Holds the state for one open document's worker connection.
+/// Holds the state for one open document's worker connection + local model.
 struct DocSession {
     child: sandbox::spawn::WorkerChild,
     #[allow(dead_code)]
     region: SharedRegion,
-    /// Monotonic counter for correlation IDs.
     next_cid: u64,
+    page_count: u32,
+    page_width: f32,
+    page_height: f32,
+    summary: StructuralSummary,
+    /// Local annotation store for shell-authored markups. [FR-ANNOT, M4]
+    annotations: AnnotationStore,
+    /// Cached page text for find/copy (page_index → full text + reliable).
+    text_cache: std::collections::HashMap<u32, CachedPageText>,
+    path: String,
 }
 
-/// Global session storage (M0: one document at a time).
+struct CachedPageText {
+    full_text: String,
+    reliable: bool,
+    line_geom: Vec<String>,
+}
+
+/// Global session storage (one document at a time until multi-doc).
 // SAFETY: accessed only from the Qt main thread (single-threaded FFI).
-// The C++ shell guarantees no concurrent access. Will be replaced with
-// a proper pattern (OnceLock + Mutex or similar) when multi-document
-// support lands. [ADR-004, ADR-027]
 #[allow(static_mut_refs)]
 static mut SESSION: Option<Box<DocSession>> = None;
 
-/// Open a document: spawn worker, create shmem, store session.
-fn open_document_impl(_path: &str) -> Result<ffi::OpenResultFFI, String> {
+fn with_session_mut<T>(f: impl FnOnce(&mut DocSession) -> Result<T, String>) -> Result<T, String> {
+    // SAFETY: single-threaded Qt main thread.
+    let session = unsafe { SESSION.as_mut().ok_or("no open document")? };
+    f(session)
+}
+
+fn send_recv(session: &mut DocSession, cmd: Command) -> Result<WorkerEvent, String> {
+    let body = encode_command(&cmd);
+    session
+        .child
+        .transport
+        .send(&body)
+        .map_err(|e| e.to_string())?;
+    let reply = session
+        .child
+        .transport
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .map_err(|e| e.to_string())?;
+    decode_worker_event(&reply).map_err(|e| e.to_string())
+}
+
+fn next_cid(session: &mut DocSession) -> u64 {
+    let id = session.next_cid;
+    session.next_cid += 1;
+    id
+}
+
+/// Open a document: spawn worker (optional password), create shmem, inspect.
+fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, String> {
+    use std::path::Path;
+
+    let file_path = Path::new(path);
+    if !file_path.exists() {
+        return Err(format!("file not found: {path}"));
+    }
+
+    // Close any previous session first.
+    close_document_impl();
+
+    let doc_file = std::fs::File::open(file_path).map_err(|e| format!("open: {e}"))?;
     let region = SharedRegion::create(TILE_RGBA8_BYTES).map_err(|e| e.to_string())?;
 
     let exe = std::env::current_exe()
         .map_err(|e| e.to_string())?
         .parent()
         .ok_or("no exe parent")?
-        .join("worker.exe");
+        .join(if cfg!(windows) {
+            "worker.exe"
+        } else {
+            "worker"
+        });
+
+    let pw = if password.is_empty() {
+        None
+    } else {
+        Some(password)
+    };
 
     let child = spawn_worker_with_attachments(
         &exe,
-        &SpawnAttachments { doc: None, shmem: Some(region.file()), password: None },
+        &SpawnAttachments {
+            doc: Some(&doc_file),
+            shmem: Some(region.file()),
+            password: pw,
+        },
         &[],
     )
     .map_err(|e| e.to_string())?;
 
-    // SAFETY: raw_handle() returns HANDLE (void*) on Windows, cast to isize for FFI.
     let handle = region.file().as_raw_handle() as isize;
-    let page_count = 1024u32; // stub engine
 
-    // SAFETY: single-threaded Qt main thread; M0 single-document.
-    unsafe {
-        SESSION = Some(Box::new(DocSession { child, region, next_cid: 1 }));
+    let mut session = DocSession {
+        child,
+        region,
+        next_cid: 1,
+        page_count: 1,
+        page_width: 595.0,
+        page_height: 842.0,
+        summary: StructuralSummary {
+            page_count: 1,
+            has_acroform: false,
+            has_xfa: false,
+            has_js: false,
+            sig_count: 0,
+            leniency_count: 0,
+            leniency_events: vec![],
+            page_dimensions: vec![],
+            original_offsets: std::collections::HashMap::new(),
+        },
+        annotations: AnnotationStore::new(),
+        text_cache: std::collections::HashMap::new(),
+        path: path.to_string(),
+    };
+
+    match inspect_document(&mut session) {
+        Ok(summary) => {
+            let dims = summary.page_dimensions_f();
+            let (w, h) = if let Some((w, h, _)) = dims.first() {
+                (*w, *h)
+            } else {
+                (595.0, 842.0)
+            };
+            session.page_count = summary.page_count;
+            session.page_width = w;
+            session.page_height = h;
+            session.summary = summary;
+        }
+        Err(e) => {
+            // Password-required documents often fail inspect until password is correct.
+            let msg = e.to_lowercase();
+            if msg.contains("password") || msg.contains("encrypt") || msg.contains("security") {
+                return Err(format!("password required: {e}"));
+            }
+            eprintln!("ffi-bridge: inspect failed, using defaults: {e}");
+        }
     }
 
-    Ok(ffi::OpenResultFFI { page_count, shmem_handle: handle })
+    let result = ffi::OpenResultFFI {
+        page_count: session.page_count,
+        page_width: session.page_width,
+        page_height: session.page_height,
+        shmem_handle: handle,
+        leniency_count: session.summary.leniency_count,
+        has_acroform: session.summary.has_acroform,
+        has_js: session.summary.has_js,
+        has_xfa: session.summary.has_xfa,
+        sig_count: session.summary.sig_count,
+    };
+
+    // SAFETY: single-threaded Qt main thread.
+    unsafe {
+        SESSION = Some(Box::new(session));
+    }
+
+    Ok(result)
 }
 
-/// Render a tile. Returns (offset, len, generation).
+fn inspect_document(session: &mut DocSession) -> Result<StructuralSummary, String> {
+    let correlation_id = next_cid(session);
+    let event = send_recv(session, Command::Inspect { correlation_id })?;
+    match event {
+        WorkerEvent::Summary {
+            correlation_id: cid,
+            summary,
+        } if cid == correlation_id => Ok(summary),
+        WorkerEvent::RenderError { message, .. } => Err(message),
+        other => Err(format!("unexpected event: {other:?}")),
+    }
+}
+
 fn render_tile_impl(
     page: u32,
     x: u32,
@@ -73,44 +211,36 @@ fn render_tile_impl(
     scale: f32,
     generation: u64,
 ) -> Result<ffi::TileResultFFI, String> {
-    // SAFETY: single-threaded Qt main thread.
-    let session = unsafe { SESSION.as_mut().ok_or("no open document")? };
-
-    let correlation_id = session.next_cid;
-    session.next_cid += 1;
-
-    let cmd = Command::RenderTile {
-        correlation_id,
-        page, x, y, w, h,
-        scale, generation,
-        slot_offset: 0,
-        col: 0,
-        row: 0,
-    };
-    let body = encode_command(&cmd);
-    session.child.transport.send(&body).map_err(|e| e.to_string())?;
-    let reply = session.child
-        .transport
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .map_err(|e| e.to_string())?;
-
-    // Try typed event decode first, fall back to legacy.
-    match decode_worker_event(&reply) {
-        Ok(WorkerEvent::TileReady { desc, .. }) => {
-            Ok(ffi::TileResultFFI { offset: desc.offset, len: desc.len, generation: desc.generation })
+    with_session_mut(|session| {
+        let correlation_id = next_cid(session);
+        let event = send_recv(
+            session,
+            Command::RenderTile {
+                correlation_id,
+                page,
+                x,
+                y,
+                w,
+                h,
+                scale,
+                generation,
+                slot_offset: 0,
+                col: 0,
+                row: 0,
+            },
+        )?;
+        match event {
+            WorkerEvent::TileReady { desc, .. } => Ok(ffi::TileResultFFI {
+                offset: desc.offset,
+                len: desc.len,
+                generation: desc.generation,
+            }),
+            WorkerEvent::RenderError { message, .. } => Err(message),
+            _ => Err("unexpected event type".into()),
         }
-        Ok(WorkerEvent::RenderError { message, .. }) => Err(message),
-        Ok(_) => Err("unexpected event type".to_string()),
-        Err(_) => {
-            // Legacy TILE_READY fallback.
-            protocol::handles::decode_tile_ready(&reply)
-                .map(|desc| ffi::TileResultFFI { offset: desc.offset, len: desc.len, generation: desc.generation })
-                .map_err(|e| e.to_string())
-        }
-    }
+    })
 }
 
-/// Close the current document session.
 fn close_document_impl() {
     // SAFETY: single-threaded Qt main thread.
     if let Some(mut session) = unsafe { SESSION.take() } {
@@ -119,13 +249,303 @@ fn close_document_impl() {
     }
 }
 
+fn diagnostics_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        let s = &session.summary;
+        let mut out = String::new();
+        out.push_str(&format!("Path: {}\n", session.path));
+        out.push_str(&format!("Pages: {}\n", s.page_count));
+        out.push_str(&format!("AcroForm: {}\n", s.has_acroform));
+        out.push_str(&format!("JavaScript: {}\n", s.has_js));
+        out.push_str(&format!("XFA: {}\n", s.has_xfa));
+        out.push_str(&format!("Signatures: {}\n", s.sig_count));
+        out.push_str(&format!("Leniency: {}\n", s.leniency_count));
+        for e in &s.leniency_events {
+            out.push_str(&format!("  - {e}\n"));
+        }
+        out.push_str(&format!(
+            "Annotations (session): {}\n",
+            session.annotations.all_annotations().len()
+        ));
+        out.push_str(&format!("Text cache pages: {}\n", session.text_cache.len()));
+        Ok(out)
+    })
+}
+
+fn leniency_events_impl() -> Result<String, String> {
+    with_session_mut(|session| Ok(session.summary.leniency_events.join("\n")))
+}
+
+fn get_outline_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        let correlation_id = next_cid(session);
+        let event = send_recv(session, Command::GetOutline { correlation_id })?;
+        match event {
+            WorkerEvent::OutlineResult {
+                entry_count,
+                total_count,
+                data,
+                ..
+            } => Ok(format!(
+                "entries={entry_count}\ntotal={total_count}\n{data}"
+            )),
+            WorkerEvent::RenderError { message, .. } => Err(message),
+            other => Err(format!("unexpected: {other:?}")),
+        }
+    })
+}
+
+fn get_layers_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        let correlation_id = next_cid(session);
+        let event = send_recv(session, Command::GetLayers { correlation_id })?;
+        match event {
+            WorkerEvent::LayersResult {
+                group_count,
+                total_count,
+                has_layers,
+                ..
+            } => Ok(format!(
+                "has_layers={has_layers}\ngroups={group_count}\ntotal={total_count}"
+            )),
+            WorkerEvent::RenderError { message, .. } => Err(message),
+            other => Err(format!("unexpected: {other:?}")),
+        }
+    })
+}
+
+fn get_attachments_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        let correlation_id = next_cid(session);
+        let event = send_recv(session, Command::GetAttachments { correlation_id })?;
+        match event {
+            WorkerEvent::AttachmentsResult { count, data, .. } => {
+                Ok(format!("count={count}\n{data}"))
+            }
+            WorkerEvent::RenderError { message, .. } => Err(message),
+            other => Err(format!("unexpected: {other:?}")),
+        }
+    })
+}
+
+fn ensure_page_text(session: &mut DocSession, page_index: u32) -> Result<(), String> {
+    if session.text_cache.contains_key(&page_index) {
+        return Ok(());
+    }
+    let correlation_id = next_cid(session);
+    let event = send_recv(
+        session,
+        Command::ExtractPage {
+            correlation_id,
+            page_index,
+        },
+    )?;
+    match event {
+        WorkerEvent::TextExtracted {
+            full_text,
+            reliable,
+            line_geom,
+            page_index: pi,
+            ..
+        } if pi == page_index => {
+            session.text_cache.insert(
+                page_index,
+                CachedPageText {
+                    full_text,
+                    reliable,
+                    line_geom,
+                },
+            );
+            Ok(())
+        }
+        WorkerEvent::RenderError { message, .. } => Err(message),
+        other => Err(format!("unexpected extract: {other:?}")),
+    }
+}
+
+fn extract_page_text_impl(page_index: u32) -> Result<String, String> {
+    with_session_mut(|session| {
+        ensure_page_text(session, page_index)?;
+        let cached = session
+            .text_cache
+            .get(&page_index)
+            .ok_or("text cache miss")?;
+        Ok(format!(
+            "reliable={}\n{}",
+            cached.reliable, cached.full_text
+        ))
+    })
+}
+
+fn find_text_impl(query: &str) -> Result<String, String> {
+    with_session_mut(|session| {
+        if query.is_empty() {
+            return Ok(String::new());
+        }
+        let n = session.page_count;
+        let mut lines_out = Vec::new();
+        let mut total = 0u32;
+        for page in 0..n {
+            ensure_page_text(session, page)?;
+            let cached = session.text_cache.get(&page).unwrap();
+            // Build a minimal PageTextModel for search crate
+            let model = geom_to_model(page, cached);
+            let opts = FindOptions::default();
+            let matches = find_all(&model, query, &opts);
+            for m in matches {
+                total += 1;
+                lines_out.push(format!(
+                    "hit page={} line={} offset={} len={} x={:.1} y={:.1} w={:.1} h={:.1} text={:?} reliable={}",
+                    m.page_index,
+                    m.line_index,
+                    m.char_offset,
+                    m.char_len,
+                    m.x,
+                    m.y,
+                    m.width,
+                    m.height,
+                    m.matched_text,
+                    cached.reliable
+                ));
+            }
+        }
+        Ok(format!("total={total}\n{}", lines_out.join("\n")))
+    })
+}
+
+fn geom_to_model(page: u32, cached: &CachedPageText) -> engine_api::extract::PageTextModel {
+    use engine_api::extract::{PageTextModel, TextLine};
+    let lines: Vec<TextLine> = if !cached.line_geom.is_empty() {
+        cached
+            .line_geom
+            .iter()
+            .filter_map(|g| {
+                let parts: Vec<&str> = g.splitn(6, '|').collect();
+                if parts.len() < 6 {
+                    return None;
+                }
+                Some(TextLine {
+                    index: parts[0].parse().ok()?,
+                    x: parts[1].parse().ok()?,
+                    y: parts[2].parse().ok()?,
+                    width: parts[3].parse().ok()?,
+                    height: parts[4].parse().ok()?,
+                    text: parts[5]
+                        .replace("\\n", "\n")
+                        .replace("\\p", "|")
+                        .replace("\\\\", "\\"),
+                    spans: vec![],
+                })
+            })
+            .collect()
+    } else {
+        cached
+            .full_text
+            .lines()
+            .enumerate()
+            .map(|(i, t)| TextLine {
+                index: i as u32,
+                text: t.to_string(),
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 12.0,
+                spans: vec![],
+            })
+            .collect()
+    };
+    let char_count = lines.iter().map(|l| l.text.len() as u32).sum();
+    PageTextModel {
+        page_index: page,
+        lines,
+        reliable: cached.reliable,
+        char_count,
+        has_structure: false,
+    }
+}
+
+fn add_annotation_impl(
+    page_index: u32,
+    annot_type: &str,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    contents: &str,
+) -> Result<u64, String> {
+    with_session_mut(|session| {
+        let id = session.annotations.next_id();
+        let ty = match annot_type {
+            "highlight" => AnnotationType::TextMarkup(TextMarkupKind::Highlight),
+            "underline" => AnnotationType::TextMarkup(TextMarkupKind::Underline),
+            "strikeout" => AnnotationType::TextMarkup(TextMarkupKind::Strikeout),
+            "squiggly" => AnnotationType::TextMarkup(TextMarkupKind::Squiggly),
+            "note" | "sticky" => AnnotationType::StickyNote,
+            "freetext" | "text" => AnnotationType::FreeText,
+            "ink" => AnnotationType::Ink,
+            "rect" | "rectangle" => AnnotationType::Rectangle,
+            "ellipse" | "circle" => AnnotationType::Ellipse,
+            "stamp" => AnnotationType::Stamp,
+            "redact" => AnnotationType::Redaction,
+            _ => return Err(format!("unknown annotation type: {annot_type}")),
+        };
+        let mut ann = Annotation::new(id, page_index, ty, Rect::new(x, y, w, h))
+            .with_contents(contents)
+            .with_author("user");
+        // Default highlight color
+        if matches!(ty, AnnotationType::TextMarkup(TextMarkupKind::Highlight)) {
+            ann.properties.color = Color {
+                r: 1.0,
+                g: 1.0,
+                b: 0.0,
+                a: 0.4,
+            };
+        }
+        // QuadPoints for text markup covering the rect. [FR-ANNOT-3]
+        if matches!(ty, AnnotationType::TextMarkup(_)) {
+            use pdf_model::annotation::QuadPoints;
+            ann.quad_points = Some(QuadPoints::from_rect(&ann.rect));
+        }
+        ann.ensure_appearance();
+        debug_assert!(ann.has_appearance());
+        let _ = generate_appearance(&ann); // ensure generators stay warm
+        session.annotations.page_mut(page_index).add(ann);
+        Ok(id)
+    })
+}
+
+fn export_xfdf_impl() -> Result<String, String> {
+    with_session_mut(|session| Ok(export_xfdf(&session.annotations, None)))
+}
+
+fn import_xfdf_impl(xml: &str) -> Result<u32, String> {
+    with_session_mut(|session| {
+        let n = import_xfdf_to_store(xml, &mut session.annotations);
+        Ok(n as u32)
+    })
+}
+
+fn annotation_count_impl() -> Result<u32, String> {
+    with_session_mut(|session| Ok(session.annotations.all_annotations().len() as u32))
+}
+
+fn page_count_impl() -> Result<u32, String> {
+    with_session_mut(|session| Ok(session.page_count))
+}
+
 #[cxx::bridge(namespace = "pdf_platform")]
 mod ffi {
     /// Result of opening a document.
     struct OpenResultFFI {
         page_count: u32,
-        /// Windows HANDLE for the shared memory region.
+        page_width: f32,
+        page_height: f32,
         shmem_handle: isize,
+        leniency_count: u32,
+        has_acroform: bool,
+        has_js: bool,
+        has_xfa: bool,
+        sig_count: u32,
     }
 
     /// Tile descriptor returned after rendering.
@@ -136,10 +556,8 @@ mod ffi {
     }
 
     extern "Rust" {
-        /// Open a document and spawn a worker. Returns page count and shmem handle.
-        fn open_document_impl(path: &str) -> Result<OpenResultFFI>;
-
-        /// Render a tile. Must call after open_document.
+        /// Open document; pass empty password if none. [FR-VIEW, encrypt]
+        fn open_document_impl(path: &str, password: &str) -> Result<OpenResultFFI>;
         fn render_tile_impl(
             page: u32,
             x: u32,
@@ -149,8 +567,26 @@ mod ffi {
             scale: f32,
             generation: u64,
         ) -> Result<TileResultFFI>;
-
-        /// Close the document and kill the worker.
         fn close_document_impl();
+        fn page_count_impl() -> Result<u32>;
+        fn diagnostics_impl() -> Result<String>;
+        fn leniency_events_impl() -> Result<String>;
+        fn get_outline_impl() -> Result<String>;
+        fn get_layers_impl() -> Result<String>;
+        fn get_attachments_impl() -> Result<String>;
+        fn extract_page_text_impl(page_index: u32) -> Result<String>;
+        fn find_text_impl(query: &str) -> Result<String>;
+        fn add_annotation_impl(
+            page_index: u32,
+            annot_type: &str,
+            x: f32,
+            y: f32,
+            w: f32,
+            h: f32,
+            contents: &str,
+        ) -> Result<u64>;
+        fn export_xfdf_impl() -> Result<String>;
+        fn import_xfdf_impl(xml: &str) -> Result<u32>;
+        fn annotation_count_impl() -> Result<u32>;
     }
 }

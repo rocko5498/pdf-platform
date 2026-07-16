@@ -39,5 +39,7 @@ pub fn inspect(path: &Path) -> Result<StructuralSummary, InspectError> {
         sig_count: ds.sig_count,
         leniency_count: ds.leniency.len() as u32,
         leniency_events: ds.leniency.iter().map(|e| e.to_string()).collect(),
+        page_dimensions: Vec::new(), // scan-only path; dimensions come from engine
+        original_offsets: ds.xref_offsets,
     })
 }

@@ -8,3 +8,4 @@ edition.workspace = true
 pdf-types   = { path = "../pdf-types" }
 diagnostics = { path = "../diagnostics" }
 memmap2     = "0.9"
+flate2      = "1"

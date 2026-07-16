@@ -18,10 +18,29 @@ name = "viewport"
 harness = false
 path = "src/bench_viewport.rs"
 
+[[bench]]
+name = "startup"
+harness = false
+path = "src/bench_startup.rs"
+
+[[bench]]
+name = "large_doc"
+harness = false
+path = "src/bench_large_doc.rs"
+
+[[bench]]
+name = "m1"
+harness = false
+path = "src/bench_m1.rs"
+
 [dependencies]
 engine-api      = { path = "../engine-api" }
 engine-stub     = { path = "../engine-stub" }
 engine-pdfium   = { path = "../engine-pdfium" }
+pdf-model       = { path = "../pdf-model" }
+pdf-write       = { path = "../pdf-write" }
 protocol        = { path = "../protocol" }
 render-pipeline = { path = "../render-pipeline" }
+sandbox         = { path = "../sandbox" }
+coordinator     = { path = "../coordinator" }
 criterion       = { workspace = true }

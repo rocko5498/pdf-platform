@@ -19,6 +19,7 @@ engine-api    = { path = "../engine-api" }
 engine-pdfium = { path = "../engine-pdfium", optional = true }
 engine-hayro  = { path = "../engine-hayro", optional = true }
 engine-stub   = { path = "../engine-stub" }
+memmap2       = "0.9"
 pdf-cos       = { path = "../pdf-cos" }
 sandbox       = { path = "../sandbox" }
 protocol      = { path = "../protocol" }

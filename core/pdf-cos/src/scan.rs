@@ -15,6 +15,9 @@ pub struct DocumentStructure {
     pub has_js: bool,
     pub sig_count: u32,
     pub leniency: Vec<LeniencyEvent>,
+    /// Parsed xref offsets: maps object number -> byte offset in the file.
+    /// Used by IncrementalWriter for correct xref entries during incremental save. [ADR-012]
+    pub xref_offsets: std::collections::HashMap<u32, u32>,
 }
 
 /// Fatal scanner errors (not tolerable leniency events).
@@ -98,6 +101,14 @@ pub(crate) fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
         0
     };
 
+    // Extract xref offsets for incremental save.
+    let xref_offsets: std::collections::HashMap<u32, u32> = xref
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.in_use)
+        .map(|(obj_num, entry)| (obj_num as u32, entry.offset as u32))
+        .collect();
+
     Ok(DocumentStructure {
         page_count,
         has_acroform,
@@ -105,6 +116,7 @@ pub(crate) fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
         has_js,
         sig_count,
         leniency,
+        xref_offsets,
     })
 }
 

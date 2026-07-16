@@ -40,6 +40,70 @@ pub enum WorkerEvent {
         /// The scanned document structure.
         summary: StructuralSummary,
     },
+    /// Text extraction result for a page. [ADR-019, M2]
+    TextExtracted {
+        /// Correlation ID from the originating `ExtractPage` command.
+        correlation_id: CorrelationId,
+        /// 0-based page index.
+        page_index: u32,
+        /// Number of text lines extracted.
+        line_count: u32,
+        /// Total character count.
+        char_count: u32,
+        /// Whether the text layer is reliable.
+        reliable: bool,
+        /// Whether the page has a tagged structure tree.
+        has_structure: bool,
+        /// Full page text (lines joined by newlines). Escaped on the wire.
+        full_text: String,
+        /// Per-line geometry: each entry is "idx|x|y|w|h|text" with text escaped
+        /// (newlines as \\n, pipes as \\p). [ADR-019, FR-SRCH]
+        line_geom: Vec<String>,
+    },
+    /// Document outline (bookmarks) result. [FR-BOOK, M1]
+    OutlineResult {
+        /// Correlation ID from the originating `GetOutline` command.
+        correlation_id: CorrelationId,
+        /// Number of top-level entries.
+        entry_count: u32,
+        /// Total entries (recursive).
+        total_count: u32,
+        /// Serialized outline data (JSON-like for now).
+        data: String,
+    },
+    /// Optional content groups (layers) result. [FR-LAYER, M1]
+    LayersResult {
+        /// Correlation ID from the originating `GetLayers` command.
+        correlation_id: CorrelationId,
+        /// Number of top-level layer groups.
+        group_count: u32,
+        /// Total layers (recursive).
+        total_count: u32,
+        /// Whether layers are present.
+        has_layers: bool,
+    },
+    /// Embedded file attachments result. [FR-EMB, M1]
+    AttachmentsResult {
+        /// Correlation ID from the originating `GetAttachments` command.
+        correlation_id: CorrelationId,
+        /// Number of attachments.
+        count: u32,
+        /// Serialized attachment list.
+        data: String,
+    },
+    /// Raw object bytes response. [SDS §3.1]
+    ///
+    /// Returned by `GetObject` commands. The coordinator uses this to read
+    /// document structure (Pages /Kids, page /Rotate, AcroForm, etc.)
+    /// that isn't in the structural summary.
+    ObjectData {
+        /// Correlation ID from the originating `GetObject` command.
+        correlation_id: CorrelationId,
+        /// 1-based object number.
+        obj_num: u32,
+        /// Raw bytes of the object (including "N 0 obj\n...\nendobj\n").
+        data: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +155,77 @@ pub fn encode_worker_event(event: &WorkerEvent) -> Vec<u8> {
             for event in &summary.leniency_events {
                 out.push_str(&format!("leniency_event={event}\n"));
             }
+            // Page dimensions as bit-patterns for f32 Eq compatibility.
+            for (w_bits, h_bits, r) in &summary.page_dimensions {
+                out.push_str(&format!("page_dim={},{},{}\n",
+                    f32::from_bits(*w_bits), f32::from_bits(*h_bits), r));
+            }
+            // Xref offsets for incremental save.
+            let mut sorted_offsets: Vec<_> = summary.original_offsets.iter().collect();
+            sorted_offsets.sort_by_key(|(k, _)| **k);
+            for (obj_num, offset) in sorted_offsets {
+                out.push_str(&format!("xref_off={obj_num}:{offset}\n"));
+            }
             out.into_bytes()
+        }
+        WorkerEvent::TextExtracted {
+            correlation_id,
+            page_index,
+            line_count,
+            char_count,
+            reliable,
+            has_structure,
+            full_text,
+            line_geom,
+        } => {
+            let mut out = format!(
+                "EVT:TEXT_EXTRACTED:{correlation_id}\n\
+page_index={page_index}\nline_count={line_count}\n\
+char_count={char_count}\nreliable={reliable}\n\
+has_structure={has_structure}\nfull_text={}\n",
+                full_text.replace('\n', "\\n").replace('\r', "\\r")
+            );
+            for g in line_geom {
+                out.push_str("line_geom=");
+                out.push_str(g);
+                out.push('\n');
+            }
+            out.into_bytes()
+        }
+        WorkerEvent::OutlineResult { correlation_id, entry_count, total_count, data } => {
+            format!(
+                "EVT:OUTLINE_RESULT:{correlation_id}\n\
+                 entry_count={entry_count}\ntotal_count={total_count}\n\
+                 data={}\n",
+                data.replace('\n', "\\n")
+            )
+            .into_bytes()
+        }
+        WorkerEvent::LayersResult { correlation_id, group_count, total_count, has_layers } => {
+            format!(
+                "EVT:LAYERS_RESULT:{correlation_id}\n\
+                 group_count={group_count}\ntotal_count={total_count}\n\
+                 has_layers={has_layers}\n"
+            )
+            .into_bytes()
+        }
+        WorkerEvent::AttachmentsResult { correlation_id, count, data } => {
+            format!(
+                "EVT:ATTACHMENTS_RESULT:{correlation_id}\n\
+                 count={count}\ndata={}\n",
+                data.replace('\n', "\\n")
+            )
+            .into_bytes()
+        }
+        WorkerEvent::ObjectData { correlation_id, obj_num, data } => {
+            // Hex-encode the raw bytes for safe text transport.
+            let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+            format!(
+                "EVT:OBJECT_DATA:{correlation_id}\n\
+                 obj_num={obj_num}\ndata_len={}\ndata={hex}\n",
+                data.len()
+            )
+            .into_bytes()
         }
     }
 }
@@ -219,6 +353,8 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
             let mut sig_count = None;
             let mut leniency_count = None;
             let mut leniency_events = Vec::new();
+            let mut page_dimensions = Vec::new();
+            let mut original_offsets = std::collections::HashMap::new();
             for line in lines {
                 let Some((k, v)) = line.split_once('=') else {
                     continue;
@@ -266,6 +402,25 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
                     "leniency_event" => {
                         leniency_events.push(v.to_string());
                     }
+                    "page_dim" => {
+                        let dims: Vec<&str> = v.split(',').collect();
+                        if dims.len() == 3 {
+                            if let (Ok(w), Ok(h), Ok(r)) = (
+                                dims[0].parse::<f32>(),
+                                dims[1].parse::<f32>(),
+                                dims[2].parse::<u32>(),
+                            ) {
+                                page_dimensions.push((w.to_bits(), h.to_bits(), r));
+                            }
+                        }
+                    }
+                    "xref_off" => {
+                        if let Some((obj_s, off_s)) = v.split_once(':') {
+                            if let (Ok(obj), Ok(off)) = (obj_s.parse::<u32>(), off_s.parse::<u32>()) {
+                                original_offsets.insert(obj, off);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -280,7 +435,141 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
                     leniency_count: leniency_count
                         .ok_or(EventDecodeError::BadField("leniency_count"))?,
                     leniency_events,
+                    page_dimensions,
+                    original_offsets,
                 },
+            })
+        }
+        "TEXT_EXTRACTED" => {
+            let mut page_index = None;
+            let mut line_count = None;
+            let mut char_count = None;
+            let mut reliable = None;
+            let mut has_structure = None;
+            let mut full_text = None;
+            let mut line_geom = Vec::new();
+            for line in lines {
+                let Some((k, v)) = line.split_once('=') else {
+                    continue;
+                };
+                match k {
+                    "page_index" => {
+                        page_index = Some(v.parse().map_err(|_| EventDecodeError::BadField("page_index"))?)
+                    }
+                    "line_count" => {
+                        line_count = Some(v.parse().map_err(|_| EventDecodeError::BadField("line_count"))?)
+                    }
+                    "char_count" => {
+                        char_count = Some(v.parse().map_err(|_| EventDecodeError::BadField("char_count"))?)
+                    }
+                    "reliable" => {
+                        reliable = Some(v == "true");
+                    }
+                    "has_structure" => {
+                        has_structure = Some(v == "true");
+                    }
+                    "full_text" => {
+                        full_text = Some(v.replace("\\n", "\n").replace("\\r", "\r"));
+                    }
+                    "line_geom" => {
+                        line_geom.push(v.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(WorkerEvent::TextExtracted {
+                correlation_id,
+                page_index: page_index.ok_or(EventDecodeError::BadField("page_index"))?,
+                line_count: line_count.ok_or(EventDecodeError::BadField("line_count"))?,
+                char_count: char_count.ok_or(EventDecodeError::BadField("char_count"))?,
+                reliable: reliable.ok_or(EventDecodeError::BadField("reliable"))?,
+                has_structure: has_structure.unwrap_or(false),
+                full_text: full_text.unwrap_or_default(),
+                line_geom,
+            })
+        }
+        "OUTLINE_RESULT" => {
+            let mut entry_count = None;
+            let mut total_count = None;
+            let mut data = None;
+            for line in lines {
+                let Some((k, v)) = line.split_once('=') else { continue; };
+                match k {
+                    "entry_count" => entry_count = Some(v.parse().map_err(|_| EventDecodeError::BadField("entry_count"))?),
+                    "total_count" => total_count = Some(v.parse().map_err(|_| EventDecodeError::BadField("total_count"))?),
+                    "data" => data = Some(v.replace("\\n", "\n")),
+                    _ => {}
+                }
+            }
+            Ok(WorkerEvent::OutlineResult {
+                correlation_id,
+                entry_count: entry_count.ok_or(EventDecodeError::BadField("entry_count"))?,
+                total_count: total_count.ok_or(EventDecodeError::BadField("total_count"))?,
+                data: data.unwrap_or_default(),
+            })
+        }
+        "LAYERS_RESULT" => {
+            let mut group_count = None;
+            let mut total_count = None;
+            let mut has_layers = None;
+            for line in lines {
+                let Some((k, v)) = line.split_once('=') else { continue; };
+                match k {
+                    "group_count" => group_count = Some(v.parse().map_err(|_| EventDecodeError::BadField("group_count"))?),
+                    "total_count" => total_count = Some(v.parse().map_err(|_| EventDecodeError::BadField("total_count"))?),
+                    "has_layers" => has_layers = Some(v == "true"),
+                    _ => {}
+                }
+            }
+            Ok(WorkerEvent::LayersResult {
+                correlation_id,
+                group_count: group_count.ok_or(EventDecodeError::BadField("group_count"))?,
+                total_count: total_count.ok_or(EventDecodeError::BadField("total_count"))?,
+                has_layers: has_layers.ok_or(EventDecodeError::BadField("has_layers"))?,
+            })
+        }
+        "ATTACHMENTS_RESULT" => {
+            let mut count = None;
+            let mut data = None;
+            for line in lines {
+                let Some((k, v)) = line.split_once('=') else { continue; };
+                match k {
+                    "count" => count = Some(v.parse().map_err(|_| EventDecodeError::BadField("count"))?),
+                    "data" => data = Some(v.replace("\\n", "\n")),
+                    _ => {}
+                }
+            }
+            Ok(WorkerEvent::AttachmentsResult {
+                correlation_id,
+                count: count.ok_or(EventDecodeError::BadField("count"))?,
+                data: data.unwrap_or_default(),
+            })
+        }
+        "OBJECT_DATA" => {
+            let mut obj_num = None;
+            let mut data_len = None;
+            let mut data_hex = None;
+            for line in lines {
+                let Some((k, v)) = line.split_once('=') else { continue; };
+                match k {
+                    "obj_num" => obj_num = Some(v.parse().map_err(|_| EventDecodeError::BadField("obj_num"))?),
+                    "data_len" => data_len = Some(v.parse::<usize>().map_err(|_| EventDecodeError::BadField("data_len"))?),
+                    "data" => data_hex = Some(v.to_string()),
+                    _ => {}
+                }
+            }
+            let hex = data_hex.ok_or(EventDecodeError::BadField("data"))?;
+            let mut data = Vec::with_capacity(data_len.unwrap_or(hex.len() / 2));
+            let mut chars = hex.chars();
+            while let (Some(h1), Some(h2)) = (chars.next(), chars.next()) {
+                let byte_str = format!("{h1}{h2}");
+                data.push(u8::from_str_radix(&byte_str, 16)
+                    .map_err(|_| EventDecodeError::BadField("data"))?);
+            }
+            Ok(WorkerEvent::ObjectData {
+                correlation_id,
+                obj_num: obj_num.ok_or(EventDecodeError::BadField("obj_num"))?,
+                data,
             })
         }
         _ => Err(EventDecodeError::UnknownEvent),
@@ -317,6 +606,29 @@ pub enum CoordinatorEvent {
         session_id: u64,
         /// How death was observed.
         reason: WorkerDeathReason,
+    },
+    /// Document has been saved. [ADR-012]
+    DocumentSaved {
+        /// Path the document was saved to.
+        path: String,
+        /// Revision number after save.
+        revision: u64,
+    },
+    /// Undo/redo availability changed. [ADR-013]
+    UndoStateChanged {
+        /// Whether undo is available.
+        can_undo: bool,
+        /// Whether redo is available.
+        can_redo: bool,
+        /// Name of the next undoable action (if any).
+        undo_name: Option<String>,
+        /// Name of the next redoable action (if any).
+        redo_name: Option<String>,
+    },
+    /// Document is dirty (has unsaved changes).
+    DirtyStateChanged {
+        /// Whether the document has unsaved changes.
+        dirty: bool,
     },
 }
 
@@ -389,6 +701,9 @@ mod tests {
 
     #[test]
     fn summary_roundtrip() {
+        let mut offsets = std::collections::HashMap::new();
+        offsets.insert(1, 100);
+        offsets.insert(3, 250);
         let event = WorkerEvent::Summary {
             correlation_id: 99,
             summary: StructuralSummary {
@@ -399,6 +714,8 @@ mod tests {
                 sig_count: 1,
                 leniency_count: 2,
                 leniency_events: vec!["repaired xref".into(), "missing font".into()],
+                page_dimensions: vec![(612.0f32.to_bits(), 792.0f32.to_bits(), 0)],
+                original_offsets: offsets,
             },
         };
         let bytes = encode_worker_event(&event);
@@ -412,5 +729,29 @@ mod tests {
             decode_worker_event(b"EVT:BOGUS:0\n"),
             Err(EventDecodeError::UnknownEvent)
         ));
+    }
+
+    #[test]
+    fn object_data_roundtrip() {
+        let event = WorkerEvent::ObjectData {
+            correlation_id: 42,
+            obj_num: 3,
+            data: b"3 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n".to_vec(),
+        };
+        let bytes = encode_worker_event(&event);
+        let decoded = decode_worker_event(&bytes).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn object_data_empty() {
+        let event = WorkerEvent::ObjectData {
+            correlation_id: 1,
+            obj_num: 99,
+            data: vec![],
+        };
+        let bytes = encode_worker_event(&event);
+        let decoded = decode_worker_event(&bytes).unwrap();
+        assert_eq!(event, decoded);
     }
 }

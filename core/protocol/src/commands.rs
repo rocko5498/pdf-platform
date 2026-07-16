@@ -57,6 +57,78 @@ pub enum Command {
         /// Correlation ID for response matching.
         correlation_id: CorrelationId,
     },
+    /// Extract text from a page and return the canonical text model. [ADR-019, M2]
+    ExtractPage {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// 0-based page index.
+        page_index: u32,
+    },
+    /// Query the document outline (bookmarks). [FR-BOOK, M1]
+    GetOutline {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+    },
+    /// Query optional content groups (layers). [FR-LAYER, M1]
+    GetLayers {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+    },
+    /// Query embedded file attachments. [FR-EMB, M1]
+    GetAttachments {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+    },
+    /// Fetch raw bytes of a specific object by number. [SDS §3.1]
+    ///
+    /// Used by the coordinator to read document structure (e.g., Pages /Kids array,
+    /// page /Rotate values) that isn't available in the structural summary.
+    GetObject {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// 1-based PDF indirect object number.
+        obj_num: u32,
+    },
+    /// Delete pages by 0-based indices. [FR-ORG, M3, SDS §3.3]
+    DeletePages {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// 0-based page indices to delete (sorted ascending recommended).
+        page_indices: Vec<u32>,
+    },
+    /// Rotate pages by 0-based indices. [FR-ROTATE, M3]
+    RotatePages {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// 0-based page indices to rotate.
+        page_indices: Vec<u32>,
+        /// Rotation in degrees (90, 180, 270).
+        degrees: u32,
+    },
+    /// Add an annotation to a page. [FR-ANNOT, M4]
+    AddAnnotation {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// 0-based page index.
+        page_index: u32,
+        /// Annotation type as a string (e.g., "highlight", "sticky_note", "ink").
+        annotation_type: String,
+        /// Rect in PDF user-space: x,y,width,height (comma-separated).
+        rect: String,
+        /// Optional content text (for sticky notes, free text).
+        contents: Option<String>,
+        /// Optional color as "r,g,b,a" (0.0-1.0 each).
+        color: Option<String>,
+    },
+    /// Delete an annotation by ID. [FR-ANNOT, M4]
+    DeleteAnnotation {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// 0-based page index.
+        page_index: u32,
+        /// Annotation ID to delete.
+        annotation_id: u64,
+    },
     /// Clean shutdown — worker exits its main loop. [SDS §10.1]
     Quit,
 }
@@ -67,6 +139,15 @@ impl Command {
         match self {
             Self::RenderTile { correlation_id, .. } => Some(*correlation_id),
             Self::Inspect { correlation_id } => Some(*correlation_id),
+            Self::ExtractPage { correlation_id, .. } => Some(*correlation_id),
+            Self::GetOutline { correlation_id } => Some(*correlation_id),
+            Self::GetLayers { correlation_id } => Some(*correlation_id),
+            Self::GetAttachments { correlation_id } => Some(*correlation_id),
+            Self::GetObject { correlation_id, .. } => Some(*correlation_id),
+            Self::DeletePages { correlation_id, .. } => Some(*correlation_id),
+            Self::RotatePages { correlation_id, .. } => Some(*correlation_id),
+            Self::AddAnnotation { correlation_id, .. } => Some(*correlation_id),
+            Self::DeleteAnnotation { correlation_id, .. } => Some(*correlation_id),
             Self::Quit => None,
         }
     }
@@ -102,6 +183,60 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
         .into_bytes(),
         Command::Inspect { correlation_id } => {
             format!("CMD:INSPECT:{correlation_id}\n").into_bytes()
+        }
+        Command::ExtractPage { correlation_id, page_index } => {
+            format!("CMD:EXTRACT_PAGE:{correlation_id}\npage_index={page_index}\n").into_bytes()
+        }
+        Command::GetOutline { correlation_id } => {
+            format!("CMD:GET_OUTLINE:{correlation_id}\n").into_bytes()
+        }
+        Command::GetLayers { correlation_id } => {
+            format!("CMD:GET_LAYERS:{correlation_id}\n").into_bytes()
+        }
+        Command::GetAttachments { correlation_id } => {
+            format!("CMD:GET_ATTACHMENTS:{correlation_id}\n").into_bytes()
+        }
+        Command::GetObject { correlation_id, obj_num } => {
+            format!("CMD:GET_OBJECT:{correlation_id}\nobj_num={obj_num}\n").into_bytes()
+        }
+        Command::DeletePages { correlation_id, page_indices } => {
+            let indices_str = page_indices.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "CMD:DELETE_PAGES:{correlation_id}\n\
+                 page_indices={indices_str}\n"
+            ).into_bytes()
+        }
+        Command::RotatePages { correlation_id, page_indices, degrees } => {
+            let indices_str = page_indices.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "CMD:ROTATE_PAGES:{correlation_id}\n\
+                 page_indices={indices_str}\ndegrees={degrees}\n"
+            ).into_bytes()
+        }
+        Command::AddAnnotation { correlation_id, page_index, annotation_type, rect, contents, color } => {
+            let mut out = format!(
+                "CMD:ADD_ANNOTATION:{correlation_id}\n\
+                 page_index={page_index}\nannotation_type={annotation_type}\nrect={rect}\n"
+            );
+            if let Some(c) = contents {
+                out.push_str(&format!("contents={c}\n"));
+            }
+            if let Some(clr) = color {
+                out.push_str(&format!("color={clr}\n"));
+            }
+            out.into_bytes()
+        }
+        Command::DeleteAnnotation { correlation_id, page_index, annotation_id } => {
+            format!(
+                "CMD:DELETE_ANNOTATION:{correlation_id}\n\
+                 page_index={page_index}\nannotation_id={annotation_id}\n"
+            ).into_bytes()
         }
         Command::Quit => b"CMD:QUIT\n".to_vec(),
     }
@@ -260,6 +395,138 @@ fn try_decode_typed(text: &str) -> Result<Option<Command>, CommandDecodeError> {
         "INSPECT" => Ok(Some(Command::Inspect {
             correlation_id: correlation_id.unwrap_or(0),
         })),
+        "EXTRACT_PAGE" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut page_index = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    if k == "page_index" {
+                        page_index = Some(v.parse().map_err(|_| CommandDecodeError::BadField("page_index"))?);
+                    }
+                }
+            }
+            Ok(Some(Command::ExtractPage {
+                correlation_id: cid,
+                page_index: page_index.ok_or(CommandDecodeError::BadField("page_index"))?,
+            }))
+        }
+        "GET_OUTLINE" => Ok(Some(Command::GetOutline {
+            correlation_id: correlation_id.unwrap_or(0),
+        })),
+        "GET_LAYERS" => Ok(Some(Command::GetLayers {
+            correlation_id: correlation_id.unwrap_or(0),
+        })),
+        "GET_ATTACHMENTS" => Ok(Some(Command::GetAttachments {
+            correlation_id: correlation_id.unwrap_or(0),
+        })),
+        "GET_OBJECT" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut obj_num = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    if k == "obj_num" {
+                        obj_num = Some(v.parse().map_err(|_| CommandDecodeError::BadField("obj_num"))?);
+                    }
+                }
+            }
+            Ok(Some(Command::GetObject {
+                correlation_id: cid,
+                obj_num: obj_num.ok_or(CommandDecodeError::BadField("obj_num"))?,
+            }))
+        },
+        "DELETE_PAGES" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut page_indices = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    if k == "page_indices" {
+                        let indices: Vec<u32> = v.split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.parse().map_err(|_| CommandDecodeError::BadField("page_indices")))
+                            .collect::<Result<_, _>>()?;
+                        page_indices = Some(indices);
+                    }
+                }
+            }
+            Ok(Some(Command::DeletePages {
+                correlation_id: cid,
+                page_indices: page_indices.ok_or(CommandDecodeError::BadField("page_indices"))?,
+            }))
+        }
+        "ROTATE_PAGES" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut page_indices = None;
+            let mut degrees = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "page_indices" => {
+                            let indices: Vec<u32> = v.split(',')
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.parse().map_err(|_| CommandDecodeError::BadField("page_indices")))
+                                .collect::<Result<_, _>>()?;
+                            page_indices = Some(indices);
+                        }
+                        "degrees" => {
+                            degrees = Some(v.parse().map_err(|_| CommandDecodeError::BadField("degrees"))?);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Command::RotatePages {
+                correlation_id: cid,
+                page_indices: page_indices.ok_or(CommandDecodeError::BadField("page_indices"))?,
+                degrees: degrees.ok_or(CommandDecodeError::BadField("degrees"))?,
+            }))
+        }
+        "ADD_ANNOTATION" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut page_index = None;
+            let mut annotation_type = None;
+            let mut rect = None;
+            let mut contents = None;
+            let mut color = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "page_index" => page_index = Some(v.parse().map_err(|_| CommandDecodeError::BadField("page_index"))?),
+                        "annotation_type" => annotation_type = Some(v.to_string()),
+                        "rect" => rect = Some(v.to_string()),
+                        "contents" => contents = Some(v.to_string()),
+                        "color" => color = Some(v.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Command::AddAnnotation {
+                correlation_id: cid,
+                page_index: page_index.ok_or(CommandDecodeError::BadField("page_index"))?,
+                annotation_type: annotation_type.ok_or(CommandDecodeError::BadField("annotation_type"))?,
+                rect: rect.ok_or(CommandDecodeError::BadField("rect"))?,
+                contents,
+                color,
+            }))
+        }
+        "DELETE_ANNOTATION" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut page_index = None;
+            let mut annotation_id = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "page_index" => page_index = Some(v.parse().map_err(|_| CommandDecodeError::BadField("page_index"))?),
+                        "annotation_id" => annotation_id = Some(v.parse().map_err(|_| CommandDecodeError::BadField("annotation_id"))?),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Command::DeleteAnnotation {
+                correlation_id: cid,
+                page_index: page_index.ok_or(CommandDecodeError::BadField("page_index"))?,
+                annotation_id: annotation_id.ok_or(CommandDecodeError::BadField("annotation_id"))?,
+            }))
+        }
         "QUIT" => Ok(Some(Command::Quit)),
         _ => Err(CommandDecodeError::UnknownCommand),
     }
@@ -477,5 +744,81 @@ mod tests {
             decode_command(b"bogus"),
             Err(CommandDecodeError::UnknownCommand)
         ));
+    }
+
+    #[test]
+    fn typed_delete_pages_roundtrip() {
+        let cmd = Command::DeletePages {
+            correlation_id: 55,
+            page_indices: vec![0, 2, 4],
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn typed_rotate_pages_roundtrip() {
+        let cmd = Command::RotatePages {
+            correlation_id: 66,
+            page_indices: vec![1, 3],
+            degrees: 90,
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn delete_pages_empty_indices() {
+        let cmd = Command::DeletePages {
+            correlation_id: 1,
+            page_indices: vec![],
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn typed_add_annotation_roundtrip() {
+        let cmd = Command::AddAnnotation {
+            correlation_id: 77,
+            page_index: 2,
+            annotation_type: "highlight".into(),
+            rect: "100,200,50,12".into(),
+            contents: None,
+            color: Some("1.0,1.0,0.0,0.5".into()),
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn typed_add_annotation_with_contents() {
+        let cmd = Command::AddAnnotation {
+            correlation_id: 78,
+            page_index: 0,
+            annotation_type: "sticky_note".into(),
+            rect: "50,50,20,20".into(),
+            contents: Some("TODO: review this".into()),
+            color: None,
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn typed_delete_annotation_roundtrip() {
+        let cmd = Command::DeleteAnnotation {
+            correlation_id: 88,
+            page_index: 1,
+            annotation_id: 42,
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
     }
 }

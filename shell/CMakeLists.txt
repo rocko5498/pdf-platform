@@ -6,10 +6,9 @@ project(pdf-platform-shell CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets OpenGL)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
 qt_standard_project_setup()
 
-# ffi-bridge static lib produced by Cargo. Path set by parent build script.
 if(NOT DEFINED FFI_BRIDGE_LIB)
     message(FATAL_ERROR "FFI_BRIDGE_LIB must be set to the path of the ffi-bridge static library.")
 endif()
@@ -17,7 +16,9 @@ endif()
 add_library(ffi-bridge STATIC IMPORTED)
 set_target_properties(ffi-bridge PROPERTIES IMPORTED_LOCATION "${FFI_BRIDGE_LIB}")
 
-# M0: only bridge, canvas, and app. Others deferred to M1+.
+# M1: bridge, panels, a11y, canvas (GPU), app. [SDS §14 M1]
 add_subdirectory(bridge)
+add_subdirectory(panels)
+add_subdirectory(a11y)
 add_subdirectory(canvas)
 add_subdirectory(app)

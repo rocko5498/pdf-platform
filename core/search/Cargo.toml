@@ -7,3 +7,4 @@ edition.workspace = true
 [dependencies]
 pdf-types    = { path = "../pdf-types" }
 text-extract = { path = "../text-extract" }
+engine-api   = { path = "../engine-api" }

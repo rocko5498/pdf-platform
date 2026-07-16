@@ -77,6 +77,47 @@ pub struct WorkerSession {
     next_cid: std::sync::atomic::AtomicU64,
 }
 
+/// Result of a document structure query (outline / layers / attachments). [M1]
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructureQueryResult {
+    /// Query kind label.
+    pub kind: String,
+    /// Primary count (top-level entries / groups / files).
+    pub count: u32,
+    /// Total count (recursive where applicable).
+    pub total: u32,
+    /// Serialized detail payload.
+    pub data: String,
+    /// Presence flag (has layers / non-empty).
+    pub flag: bool,
+}
+
+fn parse_line_geom(g: &str) -> Option<engine_api::extract::TextLine> {
+    // idx|x|y|w|h|text
+    let parts: Vec<&str> = g.splitn(6, '|').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    let index: u32 = parts[0].parse().ok()?;
+    let x: f32 = parts[1].parse().ok()?;
+    let y: f32 = parts[2].parse().ok()?;
+    let width: f32 = parts[3].parse().ok()?;
+    let height: f32 = parts[4].parse().ok()?;
+    let text = parts[5]
+        .replace("\\n", "\n")
+        .replace("\\p", "|")
+        .replace("\\\\", "\\");
+    Some(engine_api::extract::TextLine {
+        index,
+        text,
+        x,
+        y,
+        width,
+        height,
+        spans: vec![],
+    })
+}
+
 impl WorkerSession {
     /// Spawn a worker and attach it to a new session (no document).
     pub fn spawn(worker_exe: &Path) -> Result<Self, SessionError> {
@@ -126,6 +167,185 @@ impl WorkerSession {
                 protocol::inspect::decode_summary(&reply)
                     .map_err(|_| SessionError::Protocol(format!("decode failed: {e}")))
             }
+        }
+    }
+
+    /// Fetch raw bytes of a PDF object from the worker. [SDS §3.1]
+    ///
+    /// Used by the coordinator to read document structure (Pages /Kids,
+    /// page /Rotate, AcroForm, etc.) that isn't in the structural summary.
+    pub fn get_object(&mut self, obj_num: u32) -> Result<Vec<u8>, SessionError> {
+        let correlation_id = self.next_correlation_id();
+        let cmd = Command::GetObject { correlation_id, obj_num };
+        let body = encode_command(&cmd);
+        self.send(&body)?;
+        let reply = self.recv_frame(Duration::from_secs(10))?;
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::ObjectData { correlation_id: cid, obj_num: on, data })
+                if cid == correlation_id && on == obj_num =>
+            {
+                Ok(data)
+            }
+            Ok(WorkerEvent::RenderError { correlation_id: cid, message })
+                if cid == correlation_id =>
+            {
+                Err(SessionError::Protocol(message))
+            }
+            Ok(other) => Err(SessionError::Protocol(
+                format!("unexpected event: {other:?}"),
+            )),
+            Err(e) => Err(SessionError::Protocol(format!("decode failed: {e}"))),
+        }
+    }
+
+    /// Extract the canonical text model for a page via the Z1 worker. [ADR-019]
+    pub fn extract_page(
+        &mut self,
+        page_index: u32,
+    ) -> Result<engine_api::extract::PageTextModel, SessionError> {
+        use engine_api::extract::{PageTextModel, TextLine};
+
+        let correlation_id = self.next_correlation_id();
+        let cmd = Command::ExtractPage {
+            correlation_id,
+            page_index,
+        };
+        let body = encode_command(&cmd);
+        self.send(&body)?;
+        let reply = self.recv_frame(Duration::from_secs(30))?;
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::TextExtracted {
+                correlation_id: cid,
+                page_index: pi,
+                line_count: _,
+                char_count,
+                reliable,
+                has_structure,
+                full_text,
+                line_geom,
+            }) if cid == correlation_id && pi == page_index =>
+            {
+                let lines = if !line_geom.is_empty() {
+                    line_geom
+                        .iter()
+                        .filter_map(|g| parse_line_geom(g))
+                        .collect()
+                } else if full_text.is_empty() {
+                    Vec::new()
+                } else {
+                    full_text
+                        .lines()
+                        .enumerate()
+                        .map(|(i, line)| TextLine {
+                            index: i as u32,
+                            text: line.to_string(),
+                            x: 0.0,
+                            y: 0.0,
+                            width: 0.0,
+                            height: 0.0,
+                            spans: vec![],
+                        })
+                        .collect()
+                };
+                Ok(PageTextModel {
+                    page_index,
+                    lines,
+                    reliable,
+                    char_count,
+                    has_structure,
+                })
+            }
+            Ok(WorkerEvent::RenderError {
+                correlation_id: cid,
+                message,
+            }) if cid == correlation_id => Err(SessionError::Protocol(message)),
+            Ok(other) => Err(SessionError::Protocol(format!(
+                "unexpected event: {other:?}"
+            ))),
+            Err(e) => Err(SessionError::Protocol(format!("decode failed: {e}"))),
+        }
+    }
+
+    /// Query document outline (bookmarks). [FR-BOOK, M1]
+    pub fn get_outline(&mut self) -> Result<StructureQueryResult, SessionError> {
+        let correlation_id = self.next_correlation_id();
+        let cmd = Command::GetOutline { correlation_id };
+        self.send(&encode_command(&cmd))?;
+        let reply = self.recv_frame(Duration::from_secs(10))?;
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::OutlineResult {
+                correlation_id: cid,
+                entry_count,
+                total_count,
+                data,
+            }) if cid == correlation_id => Ok(StructureQueryResult {
+                kind: "outline".into(),
+                count: entry_count,
+                total: total_count,
+                data,
+                flag: total_count > 0,
+            }),
+            Ok(WorkerEvent::RenderError {
+                correlation_id: cid,
+                message,
+            }) if cid == correlation_id => Err(SessionError::Protocol(message)),
+            Ok(other) => Err(SessionError::Protocol(format!("unexpected: {other:?}"))),
+            Err(e) => Err(SessionError::Protocol(format!("decode: {e}"))),
+        }
+    }
+
+    /// Query optional content groups (layers). [FR-LAYER, M1]
+    pub fn get_layers(&mut self) -> Result<StructureQueryResult, SessionError> {
+        let correlation_id = self.next_correlation_id();
+        let cmd = Command::GetLayers { correlation_id };
+        self.send(&encode_command(&cmd))?;
+        let reply = self.recv_frame(Duration::from_secs(10))?;
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::LayersResult {
+                correlation_id: cid,
+                group_count,
+                total_count,
+                has_layers,
+            }) if cid == correlation_id => Ok(StructureQueryResult {
+                kind: "layers".into(),
+                count: group_count,
+                total: total_count,
+                data: String::new(),
+                flag: has_layers,
+            }),
+            Ok(WorkerEvent::RenderError {
+                correlation_id: cid,
+                message,
+            }) if cid == correlation_id => Err(SessionError::Protocol(message)),
+            Ok(other) => Err(SessionError::Protocol(format!("unexpected: {other:?}"))),
+            Err(e) => Err(SessionError::Protocol(format!("decode: {e}"))),
+        }
+    }
+
+    /// Query embedded file attachments. [FR-EMB, M1]
+    pub fn get_attachments(&mut self) -> Result<StructureQueryResult, SessionError> {
+        let correlation_id = self.next_correlation_id();
+        let cmd = Command::GetAttachments { correlation_id };
+        self.send(&encode_command(&cmd))?;
+        let reply = self.recv_frame(Duration::from_secs(10))?;
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::AttachmentsResult {
+                correlation_id: cid,
+                count,
+                data,
+            }) if cid == correlation_id => Ok(StructureQueryResult {
+                kind: "attachments".into(),
+                count,
+                total: count,
+                data,
+                flag: count > 0,
+            }),
+            Ok(WorkerEvent::RenderError {
+                correlation_id: cid,
+                message,
+            }) if cid == correlation_id => Err(SessionError::Protocol(message)),
+            Ok(other) => Err(SessionError::Protocol(format!("unexpected: {other:?}"))),
+            Err(e) => Err(SessionError::Protocol(format!("decode: {e}"))),
         }
     }
 

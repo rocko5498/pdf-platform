@@ -4,7 +4,7 @@
 
 /// Structural summary of a PDF document, returned by the inspect command.
 /// Wire type owned by protocol; pdf-cos owns the raw parse result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructuralSummary {
     /// Number of pages reported by the scanner.
     pub page_count: u32,
@@ -20,6 +20,30 @@ pub struct StructuralSummary {
     pub leniency_count: u32,
     /// Human-readable leniency event descriptions (M0: strings; M6: structured).
     pub leniency_events: Vec<String>,
+    /// Per-page dimensions as (width_pt_bits, height_pt_bits, rotation_degrees).
+    /// Stored as u32 bit-patterns of f32 for Eq/Hash compatibility.
+    /// Use [`page_dimensions_f`] to decode.
+    pub page_dimensions: Vec<(u32, u32, u32)>,
+    /// Original xref table: maps object number -> byte offset in the original file.
+    /// Populated by the worker during bootstrap parse for incremental save. [ADR-012]
+    pub original_offsets: std::collections::HashMap<u32, u32>,
+}
+
+impl StructuralSummary {
+    /// Decode page dimensions from bit-pattern storage to (width_pt, height_pt, rotation).
+    pub fn page_dimensions_f(&self) -> Vec<(f32, f32, u32)> {
+        self.page_dimensions
+            .iter()
+            .map(|(w, h, r)| (f32::from_bits(*w), f32::from_bits(*h), *r))
+            .collect()
+    }
+
+    /// Encode page dimensions from (width_pt, height_pt, rotation) to bit-pattern storage.
+    pub fn encode_page_dimensions(dims: &[(f32, f32, u32)]) -> Vec<(u32, u32, u32)> {
+        dims.iter()
+            .map(|(w, h, r)| (w.to_bits(), h.to_bits(), *r))
+            .collect()
+    }
 }
 
 /// Error decoding a summary frame body.
@@ -61,6 +85,15 @@ pub fn encode_summary(s: &StructuralSummary) -> Vec<u8> {
         out.push_str(&flat);
         out.push('\n');
     }
+    for (w, h, r) in &s.page_dimensions {
+        out.push_str(&format!("page_dim={},{},{}\n", f32::from_bits(*w), f32::from_bits(*h), r));
+    }
+    // Write xref offsets as obj_num:offset pairs.
+    let mut sorted_offsets: Vec<_> = s.original_offsets.iter().collect();
+    sorted_offsets.sort_by_key(|(k, _)| **k);
+    for (obj_num, offset) in sorted_offsets {
+        out.push_str(&format!("xref_off={obj_num}:{offset}\n"));
+    }
     out.into_bytes()
 }
 
@@ -84,6 +117,8 @@ pub fn decode_summary(body: &[u8]) -> Result<StructuralSummary, SummaryDecodeErr
     let mut sig_count = None;
     let mut leniency_count = None;
     let mut leniency_events = Vec::new();
+    let mut page_dimensions = Vec::new();
+    let mut original_offsets = std::collections::HashMap::new();
 
     for line in lines {
         if line.is_empty() {
@@ -121,6 +156,22 @@ pub fn decode_summary(body: &[u8]) -> Result<StructuralSummary, SummaryDecodeErr
                 );
             }
             "leniency" => leniency_events.push(v.to_string()),
+            "page_dim" => {
+                let dims: Vec<&str> = v.split(',').collect();
+                if dims.len() == 3 {
+                    let w: f32 = dims[0].parse().map_err(|_| SummaryDecodeError::BadField("page_dim.w"))?;
+                    let h: f32 = dims[1].parse().map_err(|_| SummaryDecodeError::BadField("page_dim.h"))?;
+                    let r: u32 = dims[2].parse().map_err(|_| SummaryDecodeError::BadField("page_dim.r"))?;
+                    page_dimensions.push((w.to_bits(), h.to_bits(), r));
+                }
+            }
+            "xref_off" => {
+                if let Some((obj_s, off_s)) = v.split_once(':') {
+                    if let (Ok(obj), Ok(off)) = (obj_s.parse::<u32>(), off_s.parse::<u32>()) {
+                        original_offsets.insert(obj, off);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -133,6 +184,8 @@ pub fn decode_summary(body: &[u8]) -> Result<StructuralSummary, SummaryDecodeErr
         sig_count: sig_count.ok_or(SummaryDecodeError::BadField("sig_count"))?,
         leniency_count: leniency_count.ok_or(SummaryDecodeError::BadField("leniency_count"))?,
         leniency_events,
+        page_dimensions,
+        original_offsets,
     })
 }
 
@@ -150,6 +203,9 @@ mod tests {
 
     #[test]
     fn summary_codec_roundtrip() {
+        let mut offsets = std::collections::HashMap::new();
+        offsets.insert(1, 100);
+        offsets.insert(3, 250);
         let s = StructuralSummary {
             page_count: 3,
             has_acroform: true,
@@ -158,9 +214,14 @@ mod tests {
             sig_count: 2,
             leniency_count: 1,
             leniency_events: vec!["missing-pdf-header: no %PDF-".into()],
+            page_dimensions: vec![(595.0f32.to_bits(), 842.0f32.to_bits(), 0), (612.0f32.to_bits(), 792.0f32.to_bits(), 90)],
+            original_offsets: offsets,
         };
         let bytes = encode_summary(&s);
         let back = decode_summary(&bytes).unwrap();
         assert_eq!(back, s);
+        // Verify decode helper works.
+        let dims = back.page_dimensions_f();
+        assert_eq!(dims, vec![(595.0, 842.0, 0), (612.0, 792.0, 90)]);
     }
 }

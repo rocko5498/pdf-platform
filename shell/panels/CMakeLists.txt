@@ -1,7 +1,15 @@
-# Side panels: outline, thumbnails, annotations, search results. [SDS §13, PRD]
-# ponytail: stub — M1+ implementation
+# Side panels: outline, diagnostics, annotation tools. [SDS §2.1, M1/M4]
+# Shell is view-only over protocol events; no document truth. [ADR-026, GR-2]
 
 add_library(shell-panels STATIC
-    # ponytail: stub
+    outline_panel.cc
+    outline_panel.h
+    diagnostics_panel.cc
+    diagnostics_panel.h
+    annotation_tools.cc
+    annotation_tools.h
 )
-target_link_libraries(shell-panels PUBLIC shell-bridge Qt6::Widgets)
+target_include_directories(shell-panels PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_link_libraries(shell-panels PUBLIC Qt6::Widgets)

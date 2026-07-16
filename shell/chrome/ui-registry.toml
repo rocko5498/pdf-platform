@@ -1,18 +1,54 @@
-# Shortcut and menu registry. [ADR-032]
+# Shortcut and menu registry. [ADR-032, ADR-030, PRIN-4]
 # CI will reject any PR that bumps schema_version without a corresponding migration.
 schema_version = 1
 profile_version = "0.1.0"
 
 # ---------------------------------------------------------------------------
-# Shortcuts
+# Shortcuts — M1 chrome set. [UX-KEY-1, DS-PHIL-5]
+# Values are the interface-stability contract; do not change casually.
 # ---------------------------------------------------------------------------
 [shortcuts]
-# ponytail: stub — populate per DS-* action IDs at M0 implementation
-# Example format (do not remove — used by CI schema validator):
-# open_document   = { key = "Ctrl+O", action = "document.open" }
+open_document   = { key = "Ctrl+O", action = "document.open" }
+close_document  = { key = "Ctrl+W", action = "document.close" }
+quit_app        = { key = "Ctrl+Q", action = "app.quit" }
+find            = { key = "Ctrl+F", action = "document.find" }
+zoom_in         = { key = "Ctrl+=", action = "view.zoom_in" }
+zoom_out        = { key = "Ctrl+-", action = "view.zoom_out" }
+zoom_fit        = { key = "Ctrl+0", action = "view.zoom_fit" }
+next_page       = { key = "PageDown", action = "nav.next_page" }
+prev_page       = { key = "PageUp", action = "nav.prev_page" }
+first_page      = { key = "Home", action = "nav.first_page" }
+last_page       = { key = "End", action = "nav.last_page" }
+focus_canvas    = { key = "F6", action = "focus.canvas" }
 
 # ---------------------------------------------------------------------------
-# Menus
+# Menus — M1 taxonomy (Acrobat-familiar). [DS-MENU-*, PRIN-4]
 # ---------------------------------------------------------------------------
 [[menus]]
-# ponytail: stub — File/Edit/View/... menus at M0 implementation
+id = "file"
+title = "&File"
+items = [
+  { action = "document.open",  title = "&Open…",     shortcut = "Ctrl+O" },
+  { action = "document.close", title = "&Close",     shortcut = "Ctrl+W" },
+  { separator = true },
+  { action = "app.quit",       title = "E&xit",      shortcut = "Ctrl+Q" },
+]
+
+[[menus]]
+id = "view"
+title = "&View"
+items = [
+  { action = "view.zoom_in",  title = "Zoom &In",  shortcut = "Ctrl+=" },
+  { action = "view.zoom_out", title = "Zoom &Out", shortcut = "Ctrl+-" },
+  { action = "view.zoom_fit", title = "&Fit Page", shortcut = "Ctrl+0" },
+]
+
+[[menus]]
+id = "navigate"
+title = "&Navigate"
+items = [
+  { action = "nav.next_page",  title = "&Next Page",     shortcut = "PageDown" },
+  { action = "nav.prev_page",  title = "&Previous Page", shortcut = "PageUp" },
+  { action = "nav.first_page", title = "&First Page",    shortcut = "Home" },
+  { action = "nav.last_page",  title = "&Last Page",     shortcut = "End" },
+]
