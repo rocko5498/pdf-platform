@@ -1813,6 +1813,7 @@ dependencies = [
  "engine-api",
  "pdf-cos",
  "pdf-types",
+ "search",
 ]
 
 [[package]]
@@ -2432,6 +2433,7 @@ dependencies = [
  "engine-stub",
  "memmap2",
  "pdf-cos",
+ "pdf-model",
  "protocol",
  "sandbox",
 ]

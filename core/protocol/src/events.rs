@@ -104,6 +104,17 @@ pub enum WorkerEvent {
         /// Raw bytes of the object (including "N 0 obj\n...\nendobj\n").
         data: Vec<u8>,
     },
+    /// Forms JS subset evaluation result. [ADR-017, FR-JS-*, M5]
+    FormsCalcResult {
+        /// Correlation ID from the originating `FormsCalc` command.
+        correlation_id: CorrelationId,
+        /// Whether evaluation succeeded on the supported subset.
+        ok: bool,
+        /// Numeric result when `ok`; otherwise 0.
+        value: f64,
+        /// Error or honesty-log detail (unsupported surfaces, kill switch).
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +235,20 @@ has_structure={has_structure}\nfull_text={}\n",
                 "EVT:OBJECT_DATA:{correlation_id}\n\
                  obj_num={obj_num}\ndata_len={}\ndata={hex}\n",
                 data.len()
+            )
+            .into_bytes()
+        }
+        WorkerEvent::FormsCalcResult {
+            correlation_id,
+            ok,
+            value,
+            message,
+        } => {
+            let escaped = message.replace('\n', "\\n");
+            format!(
+                "EVT:FORMS_CALC_RESULT:{correlation_id}\n\
+                 ok={}\nvalue={value}\nmessage={escaped}\n",
+                u8::from(*ok),
             )
             .into_bytes()
         }
@@ -572,6 +597,35 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
                 data,
             })
         }
+        "FORMS_CALC_RESULT" => {
+            let mut ok = None;
+            let mut value = None;
+            let mut message = None;
+            for line in lines {
+                let Some((k, v)) = line.split_once('=') else {
+                    continue;
+                };
+                match k {
+                    "ok" => {
+                        ok = Some(v == "1" || v.eq_ignore_ascii_case("true"));
+                    }
+                    "value" => {
+                        value = Some(
+                            v.parse()
+                                .map_err(|_| EventDecodeError::BadField("value"))?,
+                        );
+                    }
+                    "message" => message = Some(v.replace("\\n", "\n")),
+                    _ => {}
+                }
+            }
+            Ok(WorkerEvent::FormsCalcResult {
+                correlation_id,
+                ok: ok.ok_or(EventDecodeError::BadField("ok"))?,
+                value: value.ok_or(EventDecodeError::BadField("value"))?,
+                message: message.unwrap_or_default(),
+            })
+        }
         _ => Err(EventDecodeError::UnknownEvent),
     }
 }
@@ -749,6 +803,19 @@ mod tests {
             correlation_id: 1,
             obj_num: 99,
             data: vec![],
+        };
+        let bytes = encode_worker_event(&event);
+        let decoded = decode_worker_event(&bytes).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn forms_calc_result_roundtrip() {
+        let event = WorkerEvent::FormsCalcResult {
+            correlation_id: 44,
+            ok: true,
+            value: 15.0,
+            message: String::new(),
         };
         let bytes = encode_worker_event(&event);
         let decoded = decode_worker_event(&bytes).unwrap();

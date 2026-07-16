@@ -20,14 +20,15 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M2** | Canonical text model + cache | **Met** | text-extract + coordinator + FFI cache |
 | **M2** | Find + geometry | **Mostly** | UTF-8-safe find, CLI/GUI find, selection overlay |
 | **M2** | Copy text | **Mostly** | Ctrl+C page text |
-| **M2** | Extraction correctness suite | **Partial** | Ligature/CJK/RTL unit tests; full corpus open |
+| **M2** | Extraction correctness suite | **Mostly** | `text-extract` extraction_correctness (ligature/soft-hyphen/CJK/RTL/unreliable); multi-engine corpus still open |
 | **M3** | Fault-injection gate | **Met** | `fault_injection.rs` 7 tests |
 | **M3** | Incremental save + recovery | **Met** | coordinator save + sidecar |
 | **M4** | Appearance streams always written | **Met** | `build_annotation_pdf_objects` + tests |
 | **M4** | XFDF import/export | **Mostly** | Unit interop + shell export/save XFDF |
 | **M4** | Annot persist to PDF | **Mostly** | Incremental save + page `/Annots` patch via FFI |
 | **M4** | Acrobat/Foxit matrix | **Unit matrix CI** | `interop_matrix` + CI; external apps still release-train |
-| **M5** | Forms JS subset | **Subset landed** | `forms_js` AFSimple_Calculate + kill switch + honesty log [ADR-017] |
+| **M5** | Forms JS subset | **Subset + Z1 wire** | `forms_js` + `CMD:FORMS_CALC` / session API; appearance note; full AcroForm product open |
+| **M6** | Merge/split/optimize CLI | **qpdf-backed** | `assembly_ops` + CLI; needs `qpdf` on PATH; pure-Rust assembly deferred |
 | **M5+** | Full forms/assembly/redaction product exits | **Partial models** | Broader product exit criteria still open |
 
 ## Roadmap invariants (SDS §14)

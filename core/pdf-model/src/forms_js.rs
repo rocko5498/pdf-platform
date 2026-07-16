@@ -4,8 +4,14 @@
 //! automation (file I/O, network, UI) is permanently out of scope.
 //!
 //! Execution belongs conceptually in Z1; this module is pure evaluation with
-//! zero broker reach — safe to unit-test in Z0 tests. Unsupported constructs
-//! are logged, never silently mis-emulated. [PRIN-6, ADR-017]
+//! zero broker reach — safe to unit-test in Z0 tests. The worker protocol
+//! command `FormsCalc` runs the same evaluator across the Z0↔Z1 boundary.
+//! Unsupported constructs are logged, never silently mis-emulated. [PRIN-6, ADR-017]
+//!
+//! **Appearance note (M5):** after calculated field values change, product code
+//! must regenerate widget appearance streams (`/AP`) before incremental save —
+//! same non-negotiable rule as annotations ([FR-ANNOT-2]). Leaving a value
+//! updated without an appearance is a silent interop failure.
 
 use std::collections::HashMap;
 use std::fmt;

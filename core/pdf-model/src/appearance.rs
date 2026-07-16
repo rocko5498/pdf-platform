@@ -7,6 +7,10 @@
 //! Appearance streams are PDF content streams that define how an annotation
 //! looks: paths, text, colors, and transforms. Each annotation type has
 //! its own generation strategy.
+//!
+//! **Forms (M5):** widget annotations for form fields follow the same honesty
+//! rule after forms JS calculations update values — regenerate `/AP` before
+//! save; see `forms_js` module docs. [ADR-017, FR-JS]
 
 use std::io::Write;
 

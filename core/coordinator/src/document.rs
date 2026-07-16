@@ -702,6 +702,16 @@ impl DocumentCoordinator {
     }
 
 
+    /// Forms JS subset evaluation via Z1 worker. [ADR-017, FR-JS-*, M5]
+    pub fn forms_calc(
+        &mut self,
+        expression: &str,
+        fields: &[(String, f64)],
+        enabled: bool,
+    ) -> Result<(bool, f64, String), SessionError> {
+        self.session.forms_calc(expression, fields, enabled)
+    }
+
     /// Document outline (bookmarks). [FR-BOOK, M1]
     pub fn get_outline(&mut self) -> Result<crate::session::StructureQueryResult, SessionError> {
         self.session.get_outline()

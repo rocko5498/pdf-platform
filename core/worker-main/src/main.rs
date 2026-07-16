@@ -126,6 +126,20 @@ fn main() -> ExitCode {
                         Command::GetObject { correlation_id, obj_num } => {
                             handle_get_object(&doc_file, correlation_id, obj_num, &mut transport);
                         }
+                        Command::FormsCalc {
+                            correlation_id,
+                            expression,
+                            fields,
+                            enabled,
+                        } => {
+                            handle_forms_calc(
+                                correlation_id,
+                                &expression,
+                                &fields,
+                                enabled,
+                                &mut transport,
+                            );
+                        }
                         // Coordinator-level commands — should not reach the worker.
                         Command::DeletePages { correlation_id, .. } |
                         Command::RotatePages { correlation_id, .. } |
@@ -539,6 +553,53 @@ fn parse_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
 fn skip_ws(data: &[u8], pos: &mut usize) {
     while *pos < data.len() && matches!(data[*pos], b' ' | b'\t' | b'\r' | b'\n') {
         *pos += 1;
+    }
+}
+
+/// Evaluate forms JS subset expression in Z1 (isolated path). [ADR-017, FR-JS-*, M5]
+fn handle_forms_calc(
+    correlation_id: u64,
+    expression: &str,
+    fields: &[(String, f64)],
+    enabled: bool,
+    transport: &mut Box<dyn protocol::transport::WorkerTransport>,
+) {
+    use pdf_model::forms_js::{evaluate_expression, FormsJsError};
+    use std::collections::HashMap;
+
+    let event = if !enabled {
+        WorkerEvent::FormsCalcResult {
+            correlation_id,
+            ok: false,
+            value: 0.0,
+            message: "forms JavaScript kill switch active".into(),
+        }
+    } else {
+        let map: HashMap<String, f64> = fields.iter().cloned().collect();
+        match evaluate_expression(expression, &map) {
+            Ok(value) => WorkerEvent::FormsCalcResult {
+                correlation_id,
+                ok: true,
+                value,
+                message: String::new(),
+            },
+            Err(FormsJsError::Unsupported(s)) => WorkerEvent::FormsCalcResult {
+                correlation_id,
+                ok: false,
+                value: 0.0,
+                message: format!("unsupported: {s}"),
+            },
+            Err(e) => WorkerEvent::FormsCalcResult {
+                correlation_id,
+                ok: false,
+                value: 0.0,
+                message: e.to_string(),
+            },
+        }
+    };
+    let body = encode_worker_event(&event);
+    if let Err(e) = transport.send(&body) {
+        eprintln!("worker: send FORMS_CALC_RESULT failed: {e}");
     }
 }
 

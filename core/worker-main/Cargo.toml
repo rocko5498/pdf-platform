@@ -24,6 +24,7 @@ pdf-cos       = { path = "../pdf-cos" }
 sandbox       = { path = "../sandbox" }
 protocol      = { path = "../protocol" }
 diagnostics   = { path = "../diagnostics" }
+pdf-model     = { path = "../pdf-model" }
 
 [dev-dependencies]
 # Integration tests link spawn + protocol + session types.

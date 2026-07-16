@@ -8,3 +8,6 @@ edition.workspace = true
 pdf-types    = { path = "../pdf-types" }
 pdf-cos      = { path = "../pdf-cos" }
 engine-api   = { path = "../engine-api" }
+
+[dev-dependencies]
+search = { path = "../search" }

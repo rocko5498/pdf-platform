@@ -15,6 +15,7 @@ pub mod annotation;
 pub mod appearance;
 pub mod page_patch;
 pub mod assembly;
+pub mod assembly_ops;
 pub mod command;
 pub mod fdf;
 pub mod form;

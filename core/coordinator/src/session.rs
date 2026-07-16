@@ -198,6 +198,45 @@ impl WorkerSession {
         }
     }
 
+    /// Evaluate a forms JS subset expression in the Z1 worker. [ADR-017, FR-JS-*, M5]
+    ///
+    /// After field values change in a full forms product path, callers must
+    /// regenerate widget appearance streams (same honesty rule as annotations:
+    /// never leave appearance-less visible widgets). [FR-ANNOT-2 pattern, M5]
+    pub fn forms_calc(
+        &mut self,
+        expression: &str,
+        fields: &[(String, f64)],
+        enabled: bool,
+    ) -> Result<(bool, f64, String), SessionError> {
+        let correlation_id = self.next_correlation_id();
+        let cmd = Command::FormsCalc {
+            correlation_id,
+            expression: expression.to_string(),
+            fields: fields.to_vec(),
+            enabled,
+        };
+        let body = encode_command(&cmd);
+        self.send(&body)?;
+        let reply = self.recv_frame(Duration::from_secs(10))?;
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::FormsCalcResult {
+                correlation_id: cid,
+                ok,
+                value,
+                message,
+            }) if cid == correlation_id => Ok((ok, value, message)),
+            Ok(WorkerEvent::RenderError {
+                correlation_id: cid,
+                message,
+            }) if cid == correlation_id => Err(SessionError::Protocol(message)),
+            Ok(other) => Err(SessionError::Protocol(format!(
+                "unexpected event: {other:?}"
+            ))),
+            Err(e) => Err(SessionError::Protocol(format!("decode failed: {e}"))),
+        }
+    }
+
     /// Extract the canonical text model for a page via the Z1 worker. [ADR-019]
     pub fn extract_page(
         &mut self,

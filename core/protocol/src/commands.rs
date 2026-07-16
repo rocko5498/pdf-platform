@@ -129,6 +129,21 @@ pub enum Command {
         /// Annotation ID to delete.
         annotation_id: u64,
     },
+    /// Evaluate a forms JavaScript **subset** expression in Z1. [ADR-017, FR-JS-*, M5]
+    ///
+    /// Field values are a snapshot (`name=value` pairs). Full AcroForm parse
+    /// from the open document is a later product step; this command proves the
+    /// isolated evaluation path and honesty log over the worker boundary.
+    FormsCalc {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// Expression in the supported subset (e.g. AFSimple_Calculate).
+        expression: String,
+        /// Numeric field snapshot: (name, value).
+        fields: Vec<(String, f64)>,
+        /// When false, evaluation is blocked (kill switch). [FR-JS]
+        enabled: bool,
+    },
     /// Clean shutdown — worker exits its main loop. [SDS §10.1]
     Quit,
 }
@@ -148,6 +163,7 @@ impl Command {
             Self::RotatePages { correlation_id, .. } => Some(*correlation_id),
             Self::AddAnnotation { correlation_id, .. } => Some(*correlation_id),
             Self::DeleteAnnotation { correlation_id, .. } => Some(*correlation_id),
+            Self::FormsCalc { correlation_id, .. } => Some(*correlation_id),
             Self::Quit => None,
         }
     }
@@ -237,6 +253,23 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
                 "CMD:DELETE_ANNOTATION:{correlation_id}\n\
                  page_index={page_index}\nannotation_id={annotation_id}\n"
             ).into_bytes()
+        }
+        Command::FormsCalc {
+            correlation_id,
+            expression,
+            fields,
+            enabled,
+        } => {
+            let mut out = format!(
+                "CMD:FORMS_CALC:{correlation_id}\n\
+                 expr={}\nenabled={}\n",
+                expression.replace('\n', "\\n"),
+                u8::from(*enabled),
+            );
+            for (name, val) in fields {
+                out.push_str(&format!("field={name}:{val}\n"));
+            }
+            out.into_bytes()
         }
         Command::Quit => b"CMD:QUIT\n".to_vec(),
     }
@@ -525,6 +558,39 @@ fn try_decode_typed(text: &str) -> Result<Option<Command>, CommandDecodeError> {
                 correlation_id: cid,
                 page_index: page_index.ok_or(CommandDecodeError::BadField("page_index"))?,
                 annotation_id: annotation_id.ok_or(CommandDecodeError::BadField("annotation_id"))?,
+            }))
+        }
+        "FORMS_CALC" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut expression = None;
+            let mut enabled = true;
+            let mut fields = Vec::new();
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "expr" => expression = Some(v.replace("\\n", "\n")),
+                        "enabled" => {
+                            enabled = v == "1" || v.eq_ignore_ascii_case("true");
+                        }
+                        "field" => {
+                            if let Some((name, val_s)) = v.split_once(':') {
+                                let val: f64 = val_s
+                                    .parse()
+                                    .map_err(|_| CommandDecodeError::BadField("field"))?;
+                                fields.push((name.to_string(), val));
+                            } else {
+                                return Err(CommandDecodeError::BadField("field"));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Command::FormsCalc {
+                correlation_id: cid,
+                expression: expression.ok_or(CommandDecodeError::BadField("expr"))?,
+                fields,
+                enabled,
             }))
         }
         "QUIT" => Ok(Some(Command::Quit)),
@@ -816,6 +882,19 @@ mod tests {
             correlation_id: 88,
             page_index: 1,
             annotation_id: 42,
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn typed_forms_calc_roundtrip() {
+        let cmd = Command::FormsCalc {
+            correlation_id: 91,
+            expression: r#"AFSimple_Calculate("SUM", ["a","b"])"#.into(),
+            fields: vec![("a".into(), 10.0), ("b".into(), 5.0)],
+            enabled: true,
         };
         let bytes = encode_command(&cmd);
         let decoded = decode_command(&bytes).unwrap();

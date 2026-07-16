@@ -82,9 +82,13 @@ jobs:
       - name: Interop matrix (unit)
         run: cargo test -p pdf-model --test interop_matrix
 
-      - name: Forms JS subset + confinement unit tests
+      - name: Extraction correctness suite (M2)
+        run: cargo test -p text-extract --test extraction_correctness
+
+      - name: Forms JS subset + confinement + assembly ops
         run: |
           cargo test -p pdf-model forms_js
+          cargo test -p pdf-model assembly_ops
           cargo test -p sandbox confinement
 
       - name: A11y static audit + p95 gate table

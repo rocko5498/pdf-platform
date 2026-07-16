@@ -45,6 +45,10 @@ fn main() {
         "find",
         "export-text",
         "optimize-preflight",
+        "merge",
+        "split",
+        "optimize",
+        "extract-pages",
     ];
 
     let (cmd, path, rest) = if file_cmds.contains(&args[1].as_str()) {
@@ -71,6 +75,24 @@ fn main() {
         return;
     }
 
+    if cmd == "merge" {
+        cmd_merge(&path, &rest);
+        return;
+    }
+    if cmd == "split" {
+        cmd_split(&path, &rest);
+        return;
+    }
+    if cmd == "optimize" {
+        cmd_optimize(&path, &rest);
+        return;
+    }
+    if cmd == "extract-pages" {
+        cmd_extract_pages(&path, &rest);
+        return;
+    }
+
+
     match cmd {
         "summary" => cmd_summary(&path),
         "outline" | "layers" | "attachments" | "diagnostics" | "find" | "export-text" => {
@@ -91,6 +113,10 @@ fn usage() {
          \x20 pdf-platform find <file> <query>\n\
          \x20 pdf-platform export-text <file> [page]\n\
          \x20 pdf-platform optimize-preflight <file> [screen|print|archive]\n\
+         \x20 pdf-platform merge <file1> <file2> [...] -o <out.pdf>\n\
+         \x20 pdf-platform split <file> -o <outdir>\n\
+         \x20 pdf-platform extract-pages <file> <first> <last> -o <out.pdf>\n\
+         \x20 pdf-platform optimize <file> -o <out.pdf> [screen|print|archive]\n\
          \x20 pdf-platform forms-calc-demo\n\
          \x20 pdf-platform confinement"
     );
@@ -238,6 +264,139 @@ fn cmd_confinement() {
     print!("{}", report.display_text());
     process::exit(0);
 }
+
+
+fn parse_dash_o(rest: &[String]) -> Result<(Vec<String>, PathBuf), String> {
+    let mut out = None;
+    let mut inputs = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == "-o" {
+            i += 1;
+            if i >= rest.len() {
+                return Err("-o requires a path".into());
+            }
+            out = Some(PathBuf::from(&rest[i]));
+        } else {
+            inputs.push(rest[i].clone());
+        }
+        i += 1;
+    }
+    let out = out.ok_or_else(|| "missing -o <path>".to_string())?;
+    Ok((inputs, out))
+}
+
+fn cmd_merge(first: &Path, rest: &[String]) {
+    use pdf_model::assembly_ops::merge_pdfs;
+    let (more, out) = match parse_dash_o(rest) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+    let mut paths: Vec<PathBuf> = vec![first.to_path_buf()];
+    for m in more {
+        paths.push(PathBuf::from(m));
+    }
+    let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    match merge_pdfs(&refs, &out) {
+        Ok(()) => {
+            println!("merged {} files -> {}", paths.len(), out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+fn cmd_split(path: &Path, rest: &[String]) {
+    use pdf_model::assembly_ops::split_pdf_per_page;
+    let (_, out_dir) = match parse_dash_o(rest) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+    match split_pdf_per_page(path, &out_dir) {
+        Ok(files) => {
+            println!("split into {} file(s) under {}", files.len(), out_dir.display());
+            for f in files {
+                println!("  {}", f.display());
+            }
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+fn cmd_extract_pages(path: &Path, rest: &[String]) {
+    use pdf_model::assembly_ops::extract_pages;
+    // extract-pages <file> <first> <last> -o out
+    if rest.len() < 2 {
+        eprintln!("error: extract-pages requires <first> <last> -o <out>");
+        process::exit(1);
+    }
+    let first: u32 = rest[0].parse().unwrap_or(0);
+    let last: u32 = rest[1].parse().unwrap_or(0);
+    let (_, out) = match parse_dash_o(&rest[2..]) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+    match extract_pages(path, first, last, &out) {
+        Ok(()) => {
+            println!("extracted pages {first}-{last} -> {}", out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+fn cmd_optimize(path: &Path, rest: &[String]) {
+    use pdf_model::assembly::OptimizeProfile;
+    use pdf_model::assembly_ops::optimize_pdf;
+    let profile_name = rest
+        .iter()
+        .find(|s| *s != "-o" && !s.ends_with(".pdf"))
+        .map(|s| s.as_str())
+        .unwrap_or("screen");
+    let profile = match profile_name {
+        "print" => OptimizeProfile::Print,
+        "archive" => OptimizeProfile::ArchivePreserving,
+        _ => OptimizeProfile::Screen,
+    };
+    let (_, out) = match parse_dash_o(rest) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+    match optimize_pdf(path, &out, profile) {
+        Ok(preflight) => {
+            print!("{preflight}");
+            println!("\nWrote {}", out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
 
 fn find_worker() -> PathBuf {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
