@@ -479,7 +479,55 @@ mod tests {
     }
 
     #[test]
+    fn find_soft_hyphen_across_break() {
+        use engine_api::extract::{PageTextModel, TextLine};
+        // soft-hyphen (U+00AD) elided so query "softhyphen" matches [M2, ADR-019]
+        let model = PageTextModel {
+            page_index: 0,
+            lines: vec![TextLine {
+                index: 0,
+                text: "soft\u{00AD}hyphen".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 80.0,
+                height: 12.0,
+                spans: vec![],
+            }],
+            reliable: true,
+            char_count: 11,
+            has_structure: false,
+        };
+        let hits = find_all(&model, "softhyphen", &FindOptions::default());
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn find_hard_hyphen_not_elided() {
+        use engine_api::extract::{PageTextModel, TextLine};
+        let model = PageTextModel {
+            page_index: 0,
+            lines: vec![TextLine {
+                index: 0,
+                text: "soft-hyphen".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 80.0,
+                height: 12.0,
+                spans: vec![],
+            }],
+            reliable: true,
+            char_count: 11,
+            has_structure: false,
+        };
+        // ASCII hyphen remains; exact query with hyphen works
+        assert_eq!(find_all(&model, "soft-hyphen", &FindOptions::default()).len(), 1);
+        // Without hyphen should not match hard-hyphenated token under current policy
+        assert!(find_all(&model, "softhyphen", &FindOptions::default()).is_empty());
+    }
+
+    #[test]
     fn unreliable_flag_propagates_in_model() {
+
         use engine_api::extract::{PageTextModel, TextLine};
         let model = PageTextModel {
             page_index: 0,

@@ -51,11 +51,15 @@ cd core
 cargo build -p cli -p worker-main
 cargo run -p cli --bin pdf-platform -- path/to/file.pdf
 cargo run -p cli --bin pdf-platform -- find path/to/file.pdf "query"
-cargo run -p cli --bin pdf-platform -- diagnostics path/to/file.pdf
+cargo run -p cli --bin pdf-platform -- export-text path/to/file.pdf 0
+cargo run -p cli --bin pdf-platform -- optimize-preflight path/to/file.pdf screen
+cargo run -p cli --bin pdf-platform -- forms-calc-demo
+cargo run -p cli --bin pdf-platform -- confinement
 cargo test --workspace
 cargo run -p corpus-diff   # needs qpdf; exit 0 = gate pass
 cargo bench -p benchmarks --bench startup
 ```
+
 
 The Qt shell requires Qt 6 (Widgets + OpenGLWidgets) and CMake. The Rust core builds and tests independently.
 
