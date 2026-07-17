@@ -134,7 +134,7 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
         },
         &[],
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("spawn worker ({}): {e}", exe.display()))?;
 
 
     let mut session = DocSession {
