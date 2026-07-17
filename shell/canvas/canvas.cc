@@ -250,23 +250,28 @@ void MainWindow::setupChrome() {
     addToolBar(Qt::TopToolBarArea, annot_tools_);
     connect(annot_tools_, &AnnotationToolBar::toolChanged, this, [this](AnnotationTool t) {
         annot_tool_ = static_cast<int>(t);
-        statusBar()->showMessage(QStringLiteral("Tool %1 Ã¢â‚¬â€ click canvas to place").arg(annot_tool_),
-                                 2500);
+        statusBar()->showMessage(
+        QStringLiteral("Tool %1 - click canvas to place").arg(annot_tool_), 2500);
     });
 
     outline_ = new OutlinePanel(this);
     auto* od = new QDockWidget(QStringLiteral("Bookmarks"), this);
+    od->setObjectName(QStringLiteral("bookmarksDock"));
+    od->setAccessibleName(QStringLiteral("Bookmarks"));
     od->setWidget(outline_);
     addDockWidget(Qt::LeftDockWidgetArea, od);
 
     diagnostics_ = new DiagnosticsPanel(this);
     auto* dd = new QDockWidget(QStringLiteral("Diagnostics"), this);
+    dd->setObjectName(QStringLiteral("diagnosticsDock"));
+    dd->setAccessibleName(QStringLiteral("Diagnostics"));
     dd->setWidget(diagnostics_);
     addDockWidget(Qt::RightDockWidgetArea, dd);
 
     forms_ = new FormsPanel(this);
     auto* fd = new QDockWidget(QStringLiteral("Forms"), this);
     fd->setObjectName(QStringLiteral("formsDock"));
+    fd->setAccessibleName(QStringLiteral("Forms"));
     fd->setWidget(forms_);
     addDockWidget(Qt::RightDockWidgetArea, fd);
     connect(forms_, &FormsPanel::seedDemoRequested, this, &MainWindow::seedFormDemo);
@@ -348,6 +353,8 @@ bool MainWindow::openDocumentWithPassword(const QString& path, const QString& pa
         }
         QMessageBox::warning(this, QStringLiteral("Open failed"), msg);
         if (diagnostics_) diagnostics_->setReport(msg, {});
+        // Keep prior doc only if open failed without replacing session; core already closed.
+        clearDocumentUi();
         return false;
     }
 
@@ -588,6 +595,37 @@ void MainWindow::setFormsJsEnabled(bool enabled) {
     }
 }
 
+
+void MainWindow::clearDocumentUi() {
+    page_count_ = 0;
+    current_page_ = 0;
+    scale_ = 1.0f;
+    scroll_y_ = 0.f;
+    path_.clear();
+    if (shmem_section_) {
+        if (shmem_mapping_) {
+            UnmapViewOfFile(shmem_mapping_);
+        }
+        CloseHandle(static_cast<HANDLE>(shmem_section_));
+        shmem_section_ = nullptr;
+    }
+    // Pointer owned by Rust session; drop local view only.
+    shmem_mapping_ = nullptr;
+    if (outline_) {
+        outline_->clear();
+    }
+    if (diagnostics_) {
+        diagnostics_->clear();
+    }
+    if (forms_) {
+        forms_->clear();
+    }
+    if (canvas_) {
+        canvas_->clearSelectionOverlay();
+    }
+    announceDocumentStatus();
+    setWindowTitle(QStringLiteral("PDF Platform - no document"));
+}
 
 void MainWindow::announceDocumentStatus() {
     if (!canvas_) {

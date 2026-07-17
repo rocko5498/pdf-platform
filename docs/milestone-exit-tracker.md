@@ -12,9 +12,9 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M0** | Sandbox confinement | **Advisory + review package** | `docs/security/confinement-review-package.md`; `confinement_report()`; no silent enforce |
 | **M0/M1** | Shell open→shmem→tile (Windows) | **Met (smoke)** | Human open+view; path/shmem/password hardened; single PDFium engine; resilient panels |
 | **M1** | Multi-page + zoom + scroll | **Mostly** | Continuous multi-tile composite + wheel scroll |
-| **M1** | Outline / layers / attachments | **Mostly** | Single engine serves Structure; empty outline OK when doc has none |
-| **M1** | Diagnostics / leniency | **Mostly** | Panel isolated refresh; shows path/pages/flags after open |
-| **M1** | Accessible chrome | **Mostly** | QAccessible + focus/keyboard |
+| **M1** | Outline / layers / attachments | **Mostly** | Single engine; e2e_get_outline_with_engine passes |
+| **M1** | Diagnostics / leniency | **Mostly** | Isolated panel refresh; dock a11y names; clear on failed open |
+| **M1** | Accessible chrome | **Mostly** | QAccessible + page status announce + dock names; static audit 12/12 |
 | **M1** | Encrypted open | **Mostly** | Password prompt + env password to worker |
 | **M1** | Formal a11y audit | **Partial** | Static audit 12 gates + page-status announce (AQA-10 code); manual SR still required |
 | **M1** | Large-doc p95 budgets | **Harness + gate table** | `tools/bench/p95_gates.toml` + check script; hard gate on ref hardware |

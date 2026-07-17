@@ -267,7 +267,9 @@ fn render_tile_impl(
 fn close_document_impl() {
     // SAFETY: single-threaded Qt main thread.
     if let Some(mut session) = unsafe { SESSION.take() } {
-        let _ = session.child.transport.send(b"CMD:QUIT\n");
+        // Typed quit — same path as protocol tests. [ADR-004, SDS §10]
+        let body = encode_command(&Command::Quit);
+        let _ = session.child.transport.send(&body);
         let _ = session.child.child.wait();
     }
 }

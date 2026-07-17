@@ -108,6 +108,7 @@ private:
     bool renderVisibleTiles();
     void refreshPanels();
     void announceDocumentStatus();
+    void clearDocumentUi();
     float docHeightPx() const;
     void clampScroll();
     void mapShmem(qintptr handle);

@@ -84,7 +84,12 @@ fn main() -> ExitCode {
                     Ok(cmd) => match cmd {
                         Command::Quit => break,
                         Command::Inspect { correlation_id } => {
-                            handle_inspect(&doc_file, correlation_id, &mut transport);
+                            handle_inspect(
+                                &doc_file,
+                                pdfium.as_ref(),
+                                correlation_id,
+                                &mut transport,
+                            );
                         }
                         Command::RenderTile {
                             correlation_id,
@@ -191,13 +196,19 @@ fn main() -> ExitCode {
 // Typed command handlers
 // ---------------------------------------------------------------------------
 
-fn handle_inspect(doc_file: &Option<File>, correlation_id: u64, transport: &mut Box<dyn protocol::transport::WorkerTransport>) {
+fn handle_inspect(
+    doc_file: &Option<File>,
+    #[cfg(feature = "pdfium")] pdfium: Option<&engine_pdfium::PdfiumEngine>,
+    #[cfg(not(feature = "pdfium"))] _pdfium: Option<&()>,
+    correlation_id: u64,
+    transport: &mut Box<dyn protocol::transport::WorkerTransport>,
+) {
     let Some(file) = doc_file.as_ref() else {
         eprintln!("worker: inspect requested but no inherited document");
         send_error(transport, correlation_id, "no inherited document");
         return;
     };
-    match scan_and_encode(file) {
+    match scan_and_encode(file, pdfium) {
         Ok(summary) => {
             let event = WorkerEvent::Summary { correlation_id, summary };
             let body = encode_worker_event(&event);
@@ -674,58 +685,14 @@ fn handle_legacy(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create the best available rendering engine from an inherited document handle.
-///
-/// Prefers PDFium (real rendering) when the feature is enabled; falls back to stub.
-/// `password` is used for encrypted documents.
-fn create_engine(file: &File, password: Option<&str>) -> Option<Box<dyn Rasterize>> {
-    #[cfg(feature = "pdfium")]
-    {
-        match engine_pdfium::PdfiumEngine::from_file_handle_with_password(file, password) {
-            Ok(engine) => {
-                eprintln!("worker: loaded PDFium engine ({} pages)", Rasterize::page_count(&engine));
-                return Some(Box::new(engine));
-            }
-            Err(e) => {
-                eprintln!("worker: PDFium load failed, falling back to stub: {e}");
-            }
-        }
-    }
-    None
-}
-
-/// Create a Structure engine for outline/layers/attachments queries.
-#[cfg(feature = "pdfium")]
-fn create_structure_engine(file: &File, password: Option<&str>) -> Option<Box<dyn engine_api::structure::Structure>> {
-    match engine_pdfium::PdfiumEngine::from_file_handle_with_password(file, password) {
-        Ok(engine) => Some(Box::new(engine)),
-        Err(_) => None,
-    }
-}
-
-/// Create an Extract engine for text extraction. [ADR-019, M2]
-#[cfg(feature = "pdfium")]
-fn create_extract_engine(file: &File, password: Option<&str>) -> Option<Box<dyn Extract>> {
-    match engine_pdfium::PdfiumEngine::from_file_handle_with_password(file, password) {
-        Ok(engine) => Some(Box::new(engine)),
-        Err(_) => None,
-    }
-}
-
-#[cfg(not(feature = "pdfium"))]
-fn create_structure_engine(_file: &File, _password: Option<&str>) -> Option<Box<dyn engine_api::structure::Structure>> {
-    None
-}
-
-#[cfg(not(feature = "pdfium"))]
-fn create_extract_engine(_file: &File, _password: Option<&str>) -> Option<Box<dyn Extract>> {
-    None
-}
-
-fn scan_and_encode(file: &File) -> Result<StructuralSummary, String> {
+fn scan_and_encode(
+    file: &File,
+    #[cfg(feature = "pdfium")] pdfium: Option<&engine_pdfium::PdfiumEngine>,
+    #[cfg(not(feature = "pdfium"))] _pdfium: Option<&()>,
+) -> Result<StructuralSummary, String> {
     let ds = scan_file(file).map_err(|e| e.to_string())?;
-    // Try to get page dimensions from PDFium if available.
-    let page_dimensions = get_page_dimensions(file);
+    // Prefer page meta from the already-loaded engine — never re-open the handle. [ADR-005]
+    let page_dimensions = page_dimensions_from_engine(pdfium);
     Ok(StructuralSummary {
         page_count: ds.page_count,
         has_acroform: ds.has_acroform,
@@ -739,17 +706,26 @@ fn scan_and_encode(file: &File) -> Result<StructuralSummary, String> {
     })
 }
 
-/// Try to get page dimensions from PDFium.
-/// Returns empty vec if PDFium is unavailable or the file can't be loaded.
-fn get_page_dimensions(file: &File) -> Vec<(u32, u32, u32)> {
+#[cfg(feature = "pdfium")]
+fn page_dimensions_from_engine(
+    pdfium: Option<&engine_pdfium::PdfiumEngine>,
+) -> Vec<(u32, u32, u32)> {
     use engine_api::structure::Structure;
-    match engine_pdfium::PdfiumEngine::from_file_handle(file) {
-        Ok(engine) => match engine.page_meta() {
-            Ok(metas) => metas.into_iter().map(|m| (m.width.to_bits(), m.height.to_bits(), m.rotation)).collect(),
-            Err(_) => Vec::new(),
-        },
+    let Some(engine) = pdfium else {
+        return Vec::new();
+    };
+    match engine.page_meta() {
+        Ok(metas) => metas
+            .into_iter()
+            .map(|m| (m.width.to_bits(), m.height.to_bits(), m.rotation))
+            .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+#[cfg(not(feature = "pdfium"))]
+fn page_dimensions_from_engine(_pdfium: Option<&()>) -> Vec<(u32, u32, u32)> {
+    Vec::new()
 }
 
 fn fill_tile_smoke(file: &File) -> Result<Vec<u8>, String> {

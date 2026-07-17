@@ -17,18 +17,30 @@ use protocol::commands::{encode_command, Command};
 use protocol::events::{decode_worker_event, WorkerEvent};
 
 fn worker_path() -> PathBuf {
-    // Find the worker binary in the target directory.
+    // Prefer the newest built worker so e2e tracks rebuilds. [SDS M0]
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let target_dir = manifest_dir.parent().unwrap().join("target");
-    let debug = target_dir.join("debug").join(if cfg!(windows) { "worker.exe" } else { "worker" });
-    if debug.exists() {
-        return debug;
+    let name = if cfg!(windows) { "worker.exe" } else { "worker" };
+    let debug = target_dir.join("debug").join(name);
+    let release = target_dir.join("release").join(name);
+    match (debug.exists(), release.exists()) {
+        (true, true) => {
+            let d = std::fs::metadata(&debug).and_then(|m| m.modified()).ok();
+            let r = std::fs::metadata(&release).and_then(|m| m.modified()).ok();
+            if r >= d {
+                release
+            } else {
+                debug
+            }
+        }
+        (true, false) => debug,
+        (false, true) => release,
+        (false, false) => panic!(
+            "worker binary not found at {} or {}",
+            debug.display(),
+            release.display()
+        ),
     }
-    let release = target_dir.join("release").join(if cfg!(windows) { "worker.exe" } else { "worker" });
-    if release.exists() {
-        return release;
-    }
-    panic!("worker binary not found at {} or {}", debug.display(), release.display());
 }
 
 /// Generate a minimal N-page PDF with correct xref offsets.
@@ -726,5 +738,41 @@ fn e2e_open_with_recovery_clean_open() {
     assert!(!coord.sidecar_path().exists());
 
     drop(coord);
+    std::fs::remove_file(&path).ok();
+}
+
+
+// ---------------------------------------------------------------------------
+// Outline / structure uses the same loaded engine (no second PDFium open)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_get_outline_with_engine() {
+    let (pdf_bytes, _, _) = generate_pdf(3);
+    let path = temp_pdf(&pdf_bytes, "outline-engine");
+    let brokered = open_read_only(&path).expect("broker open");
+    let mut session =
+        WorkerSession::spawn_with_document(&worker_path(), brokered).expect("spawn with doc");
+
+    let summary = session.inspect().expect("inspect");
+    assert_eq!(summary.page_count, 3);
+
+    // Must not fail with "no engine loaded" after single-engine worker fix. [ADR-005]
+    let outline = session
+        .get_outline()
+        .unwrap_or_else(|e| panic!("GetOutline failed (engine missing?): {e}"));
+    assert_eq!(outline.kind, "outline");
+    // Generated PDF has no outline — empty count is OK.
+
+    let layers = session
+        .get_layers()
+        .unwrap_or_else(|e| panic!("GetLayers failed: {e}"));
+    assert_eq!(layers.kind, "layers");
+
+    let atts = session
+        .get_attachments()
+        .unwrap_or_else(|e| panic!("GetAttachments failed: {e}"));
+    assert_eq!(atts.kind, "attachments");
+
     std::fs::remove_file(&path).ok();
 }
