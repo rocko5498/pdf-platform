@@ -30,7 +30,7 @@ Precedence on conflict: ADR → SDS → PRD → UI/UX Design System → Implemen
 | **M2** Text / search | **Mostly complete** | Text cache, geometry IPC, find/copy, UTF-8-safe ligature/CJK find, `extraction_correctness` suite. Multi-engine corpus still expands. |
 | **M3** Mutation core | **Gate passed** | CoW, journal, incremental save, autosave recovery, fault-injection suite. |
 | **M4** Annotations | **Mostly complete** | Appearance streams, QuadPoints, tools, XFDF + interop unit matrix, incremental save with `/Annots` patch + XFDF sidecar. External Acrobat/Foxit lab still open. |
-| **M5** Forms JS | **Subset + Z1 wire + AP** | `forms_js` subset, kill switch, honesty log, `CMD:FORMS_CALC`, widget `/AP` regen, shell Forms panel (`Ctrl+G`). COS field import not claimed. |
+| **M5** Forms JS | **Subset + wire + AP + COS import** | `forms_js`, kill switch, `CMD:FORMS_CALC`, widget `/AP`, shell Forms panel, **AcroForm leaf import on open**. Flatten/FDF full product still open. |
 | **M6** Assembly | **CLI (qpdf)** | merge / split / extract-pages / optimize + preflight honesty. Pure-Rust assembly deferred. |
 | **M7–M12** | Models ahead | Redaction/sign/OCR crates exist; product exits not claimed. |
 

@@ -1,4 +1,4 @@
-//! Minimal structural scanner. [ADR-006, SDS §14 M0, FR-DIAG-2]
+﻿//! Minimal structural scanner. [ADR-006, SDS Â§14 M0, FR-DIAG-2]
 //!
 //! Reads classic xref tables only. Compressed xref (PDF 1.5+), encryption,
 //! and linearized hint streams are deferred to M1.
@@ -56,7 +56,7 @@ pub fn scan_structure(path: &Path) -> Result<DocumentStructure, ScanError> {
     scan_file(&file)
 }
 
-/// Scan an already-opened file (read-only mmap). [ADR-011, SDS §3.1 step 4]
+/// Scan an already-opened file (read-only mmap). [ADR-011, SDS Â§3.1 step 4]
 pub fn scan_file(file: &std::fs::File) -> Result<DocumentStructure, ScanError> {
     // SAFETY: read-only shared mapping; the file is not mutated while the Mmap is live.
     let map = unsafe { memmap2::Mmap::map(file) }?;
@@ -123,13 +123,13 @@ pub(crate) fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
 // --- private helpers ---
 
 #[derive(Clone, Default)]
-struct XrefEntry {
+pub(crate) struct XrefEntry {
     offset: u64,
     in_use: bool,
 }
 
 /// Scan last 1024 bytes for `startxref\n<N>`, return N as a file offset.
-fn find_startxref(data: &[u8]) -> Option<usize> {
+pub(crate) fn find_startxref(data: &[u8]) -> Option<usize> {
     const NEEDLE: &[u8] = b"startxref";
     let search_start = data.len().saturating_sub(1024);
     let tail = &data[search_start..];
@@ -153,14 +153,14 @@ fn find_startxref(data: &[u8]) -> Option<usize> {
 }
 
 /// Parse a classic (non-compressed) xref table at `offset`.
-fn parse_xref_table(
+pub(crate) fn parse_xref_table(
     data: &[u8],
     offset: usize,
     leniency: &mut Vec<LeniencyEvent>,
 ) -> Result<Vec<XrefEntry>, ScanError> {
     let d = data.get(offset..).ok_or(ScanError::MalformedXref)?;
     if !d.starts_with(b"xref") {
-        // Likely a compressed xref stream (PDF 1.5+) — not supported at M0.
+        // Likely a compressed xref stream (PDF 1.5+) â€” not supported at M0.
         return Err(ScanError::MalformedXref);
     }
     let mut pos = 4; // after "xref"
@@ -169,7 +169,7 @@ fn parse_xref_table(
     let mut entries: Vec<XrefEntry> = Vec::new();
 
     loop {
-        // Check for trailer keyword — marks end of xref sections.
+        // Check for trailer keyword â€” marks end of xref sections.
         if d.get(pos..).map_or(false, |s| s.starts_with(b"trailer")) {
             break;
         }
@@ -217,7 +217,7 @@ fn parse_xref_table(
 }
 
 /// Return the slice starting at the trailer dictionary <<...
-fn find_trailer<'a>(data: &'a [u8], xref_offset: usize) -> Option<&'a [u8]> {
+pub(crate) fn find_trailer<'a>(data: &'a [u8], xref_offset: usize) -> Option<&'a [u8]> {
     let region = data.get(xref_offset..)?;
     let tpos = region.windows(7).position(|w| w == b"trailer")?;
     let after = tpos + 7;
@@ -226,7 +226,7 @@ fn find_trailer<'a>(data: &'a [u8], xref_offset: usize) -> Option<&'a [u8]> {
 }
 
 /// Fetch the body of an indirect object by number (between obj/endobj).
-fn fetch_object<'a>(data: &'a [u8], xref: &[XrefEntry], num: u32) -> Option<&'a [u8]> {
+pub(crate) fn fetch_object<'a>(data: &'a [u8], xref: &[XrefEntry], num: u32) -> Option<&'a [u8]> {
     let entry = xref.get(num as usize)?;
     if !entry.in_use {
         return None;
@@ -250,12 +250,12 @@ fn fetch_object<'a>(data: &'a [u8], xref: &[XrefEntry], num: u32) -> Option<&'a 
 }
 
 /// Find the first occurrence of `key` bytes in `data`. Returns the position of the key start.
-fn find_key(data: &[u8], key: &[u8]) -> Option<usize> {
+pub(crate) fn find_key(data: &[u8], key: &[u8]) -> Option<usize> {
     data.windows(key.len()).position(|w| w == key)
 }
 
 /// Find `/Key N G R` in `data` and return (N, G).
-fn find_indirect_ref(data: &[u8], key: &[u8]) -> Option<(u32, u16)> {
+pub(crate) fn find_indirect_ref(data: &[u8], key: &[u8]) -> Option<(u32, u16)> {
     let pos = find_key(data, key)?;
     let after = &data[pos + key.len()..];
     let mut i = 0;
@@ -272,7 +272,7 @@ fn find_indirect_ref(data: &[u8], key: &[u8]) -> Option<(u32, u16)> {
 }
 
 /// Follow an indirect ref from a named key and return the target object body.
-fn fetch_key_dict<'a>(
+pub(crate) fn fetch_key_dict<'a>(
     data: &'a [u8],
     xref: &[XrefEntry],
     parent: &[u8],
@@ -283,7 +283,7 @@ fn fetch_key_dict<'a>(
 }
 
 /// Parse `/Key <integer>` and return the integer value.
-fn parse_int_after_key(data: &[u8], key: &[u8]) -> Option<i64> {
+pub(crate) fn parse_int_after_key(data: &[u8], key: &[u8]) -> Option<i64> {
     let pos = find_key(data, key)?;
     let after = &data[pos + key.len()..];
     let mut i = 0;
@@ -327,7 +327,7 @@ fn count_sig_field_pattern(acroform_body: &[u8]) -> u32 {
     count
 }
 
-fn parse_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
+pub(crate) fn parse_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
     let start = *pos;
     while *pos < data.len() && data[*pos].is_ascii_digit() {
         *pos += 1;
@@ -338,13 +338,13 @@ fn parse_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
     std::str::from_utf8(&data[start..*pos]).ok()?.parse().ok()
 }
 
-fn skip_ws(data: &[u8], pos: &mut usize) {
+pub(crate) fn skip_ws(data: &[u8], pos: &mut usize) {
     while *pos < data.len() && matches!(data[*pos], b' ' | b'\t' | b'\r' | b'\n') {
         *pos += 1;
     }
 }
 
-fn skip_eol(data: &[u8], pos: &mut usize) {
+pub(crate) fn skip_eol(data: &[u8], pos: &mut usize) {
     if data.get(*pos) == Some(&b'\r') {
         *pos += 1;
     }

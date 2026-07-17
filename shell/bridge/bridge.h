@@ -66,6 +66,10 @@ inline std::string list_form_fields() { return std::string(list_form_fields_impl
 
 inline std::string seed_form_demo() { return std::string(seed_form_demo_impl()); }
 
+inline std::string reload_form_from_document() {
+    return std::string(reload_form_from_document_impl());
+}
+
 inline std::string set_form_field(const std::string& name, const std::string& value) {
     return std::string(set_form_field_impl(name, value));
 }

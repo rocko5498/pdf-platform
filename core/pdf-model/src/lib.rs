@@ -19,6 +19,7 @@ pub mod assembly_ops;
 pub mod command;
 pub mod fdf;
 pub mod form;
+pub mod form_import;
 pub mod forms_js;
 pub mod journal;
 pub mod overlay;

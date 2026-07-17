@@ -18,6 +18,7 @@ use pdf_model::appearance::{
     build_annotation_pdf_objects, build_widget_pdf_objects, generate_appearance,
 };
 use pdf_model::form::{AcroForm, FieldCalculation, FieldRect, FieldType, FieldValue, FormField};
+use pdf_model::form_import::import_acroform_from_bytes;
 use pdf_model::forms_js::run_form_calculations;
 use pdf_model::overlay::CowOverlay;
 use pdf_model::page_patch::inject_annot_refs;
@@ -45,9 +46,11 @@ struct DocSession {
     annotations: AnnotationStore,
     /// Session AcroForm fill model (widget AP regen). [FR-FORM, FR-JS, M5]
     ///
-    /// COS field import from the open document is not yet wired; the shell
-    /// seeds a demo fill set so calc + appearance can be exercised honestly.
+    /// Populated from COS `/AcroForm` on open when present; otherwise empty
+    /// until the user seeds the demo fill set.
     form: AcroForm,
+    /// Honesty notes from the last form import.
+    form_import_notes: Vec<String>,
     /// Cached page text for find/copy (page_index → full text + reliable).
     text_cache: std::collections::HashMap<u32, CachedPageText>,
     path: String,
@@ -155,6 +158,7 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
         },
         annotations: AnnotationStore::new(),
         form: AcroForm::new(),
+        form_import_notes: Vec::new(),
         text_cache: std::collections::HashMap::new(),
         path: path.to_string(),
     };
@@ -181,6 +185,9 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
             eprintln!("ffi-bridge: inspect failed, using defaults: {e}");
         }
     }
+
+    // Import AcroForm fields from COS when the document declares them. [FR-FORM-1]
+    load_form_from_path(&mut session);
 
     let result = ffi::OpenResultFFI {
         page_count: session.page_count,
@@ -288,6 +295,9 @@ fn diagnostics_impl() -> Result<String, String> {
             "Forms JS enabled: {}\n",
             session.form.javascript_enabled
         ));
+        for n in &session.form_import_notes {
+            out.push_str(&format!("Form import: {n}\n"));
+        }
         out.push_str(&format!("Text cache pages: {}\n", session.text_cache.len()));
         Ok(out)
     })
@@ -733,6 +743,40 @@ fn save_document_impl(out_path: &str) -> Result<String, String> {
 }
 
 
+/// Load session form from document bytes (COS AcroForm walk). [FR-FORM-1]
+fn load_form_from_path(session: &mut DocSession) {
+    session.form_import_notes.clear();
+    match std::fs::read(&session.path) {
+        Ok(bytes) => match import_acroform_from_bytes(&bytes) {
+            Ok(imported) => {
+                session.form_import_notes = imported.notes;
+                if imported.field_count > 0 {
+                    session.form = imported.form;
+                    session.form_import_notes.push(format!(
+                        "imported {} fields from document AcroForm",
+                        imported.field_count
+                    ));
+                } else if session.summary.has_acroform {
+                    session.form_import_notes.push(
+                        "document has AcroForm but no leaf fields parsed (Kids/compressed unsupported?)"
+                            .into(),
+                    );
+                }
+            }
+            Err(e) => {
+                session
+                    .form_import_notes
+                    .push(format!("form import failed: {e}"));
+            }
+        },
+        Err(e) => {
+            session
+                .form_import_notes
+                .push(format!("form import read failed: {e}"));
+        }
+    }
+}
+
 /// Seed a session form with a simple SUM calc demo. [FR-FORM-1, FR-JS-1, M5]
 fn seed_demo_form(form: &mut AcroForm, page_height: f32) {
     *form = AcroForm::new();
@@ -771,19 +815,29 @@ fn seed_demo_form(form: &mut AcroForm, page_height: f32) {
 fn list_form_fields_impl() -> Result<String, String> {
     with_session_mut(|session| {
         if session.form.field_count() == 0 {
-            return Ok(
-                "count=0\nnote=session form empty; use seed_form_demo for fill model (COS import deferred)\n"
-                    .into(),
-            );
+            let note = if session.summary.has_acroform {
+                "count=0\nnote=AcroForm present but no leaf fields imported; try Seed demo or check Kids/xref"
+            } else {
+                "count=0\nnote=no AcroForm in document; Seed demo for local fill model"
+            };
+            let mut out = note.to_string();
+            for n in &session.form_import_notes {
+                out.push_str(&format!("\nimport:{n}"));
+            }
+            out.push('\n');
+            return Ok(out);
         }
         let mut lines = Vec::new();
         lines.push(format!(
-            "count={}\nhas_js={}\njs_enabled={}\nneeds_ap={}\nnote=session fill model (COS field import deferred)\n",
+            "count={}\nhas_js={}\njs_enabled={}\nneeds_ap={}\nnote=COS import + session fill model\n",
             session.form.field_count(),
             session.form.has_javascript || session.form.detect_javascript(),
             session.form.javascript_enabled,
             session.form.needs_appearance_regen,
         ));
+        for n in &session.form_import_notes {
+            lines.push(format!("import:{n}"));
+        }
         for f in session.form.fields_in_tab_order() {
             let ap = if f.appearance.is_some() { "yes" } else { "no" };
             let ro = if f.read_only { "ro" } else { "rw" };
@@ -806,9 +860,22 @@ fn list_form_fields_impl() -> Result<String, String> {
 fn seed_form_demo_impl() -> Result<String, String> {
     with_session_mut(|session| {
         seed_demo_form(&mut session.form, session.page_height);
+        session.form_import_notes = vec!["seeded demo form (replaced COS import)".into()];
         Ok(format!(
             "seeded {} fields (a,b,total SUM); appearances regenerated",
             session.form.field_count()
+        ))
+    })
+}
+
+/// Re-run COS AcroForm import from the open file. [FR-FORM-1]
+fn reload_form_from_document_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        load_form_from_path(session);
+        Ok(format!(
+            "reloaded {} fields; notes={:?}",
+            session.form.field_count(),
+            session.form_import_notes
         ))
     })
 }
@@ -965,6 +1032,8 @@ mod ffi {
         fn list_form_fields_impl() -> Result<String>;
         /// Seed demo form (a,b,total SUM) for fill/calc/AP. [FR-FORM, FR-JS]
         fn seed_form_demo_impl() -> Result<String>;
+        /// Re-import AcroForm fields from the open document. [FR-FORM-1]
+        fn reload_form_from_document_impl() -> Result<String>;
         /// Set field value; regenerates widget /AP. [FR-FORM-1]
         fn set_form_field_impl(name: &str, value: &str) -> Result<String>;
         /// Run forms JS subset + regenerate appearances. [FR-JS-1, FR-FORM-1]
