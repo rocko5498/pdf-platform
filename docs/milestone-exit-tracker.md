@@ -16,7 +16,7 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M1** | Diagnostics / leniency | **Mostly** | Panel isolated refresh; shows path/pages/flags after open |
 | **M1** | Accessible chrome | **Mostly** | QAccessible + focus/keyboard |
 | **M1** | Encrypted open | **Mostly** | Password prompt + env password to worker |
-| **M1** | Formal a11y audit | **Partial** | `tools/a11y_audit.py` CI + `docs/a11y-audit-checklist.md` manual |
+| **M1** | Formal a11y audit | **Partial** | Static audit 12 gates + page-status announce (AQA-10 code); manual SR still required |
 | **M1** | Large-doc p95 budgets | **Harness + gate table** | `tools/bench/p95_gates.toml` + check script; hard gate on ref hardware |
 | **M2** | Canonical text model + cache | **Met** | text-extract + coordinator + FFI cache |
 | **M2** | Find + geometry | **Mostly** | UTF-8-safe find, CLI/GUI find, selection overlay |
