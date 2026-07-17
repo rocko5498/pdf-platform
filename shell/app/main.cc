@@ -1,7 +1,8 @@
-// Qt application entry. [ADR-003, SDS §1.3]
+﻿// Qt application entry. [ADR-003, SDS A1.3]
 // M1: accessible chrome, docked panels, GPU canvas, annotation tools.
 
 #include <QApplication>
+#include <QFileInfo>
 #include <QSurfaceFormat>
 
 #include "a11y.h"
@@ -26,8 +27,16 @@ int main(int argc, char* argv[]) {
     pdf_platform::configureMainWindowAccessibility(&window, window.canvasWidget());
     window.setFocusPolicy(Qt::StrongFocus);
 
-    if (argc > 1) {
-        window.openDocument(QString::fromLocal8Bit(argv[1]));
+    // Command-line file open. Windows splits unquoted paths on spaces, so
+    // `R:\Rust Project\file.pdf` becomes argv[1]="R:\Rust" argv[2]="Project\...".
+    // Rejoin when the first segment alone is not an existing file. [FR-VIEW]
+    const QStringList args = app.arguments();
+    if (args.size() > 1) {
+        QString path = args.at(1);
+        if (!QFileInfo::exists(path) && args.size() > 2) {
+            path = args.mid(1).join(QLatin1Char(' '));
+        }
+        window.openDocument(path);
     } else {
         window.setWindowTitle(QStringLiteral("PDF Platform — no document"));
     }

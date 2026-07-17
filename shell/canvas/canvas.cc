@@ -248,7 +248,7 @@ void MainWindow::setupChrome() {
     addToolBar(Qt::TopToolBarArea, annot_tools_);
     connect(annot_tools_, &AnnotationToolBar::toolChanged, this, [this](AnnotationTool t) {
         annot_tool_ = static_cast<int>(t);
-        statusBar()->showMessage(QStringLiteral("Tool %1 — click canvas to place").arg(annot_tool_),
+        statusBar()->showMessage(QStringLiteral("Tool %1 â€” click canvas to place").arg(annot_tool_),
                                  2500);
     });
 
@@ -273,42 +273,63 @@ void MainWindow::setupChrome() {
     connect(forms_, &FormsPanel::jsEnabledRequested, this, &MainWindow::setFormsJsEnabled);
 
     statusBar()->showMessage(
-        QStringLiteral("Ready — Ctrl+O open, Ctrl+F find, Ctrl+G forms calc, Ctrl+C copy text"));
+        QStringLiteral("Ready â€” Ctrl+O open, Ctrl+F find, Ctrl+G forms calc, Ctrl+C copy text"));
 }
 
 MainWindow::~MainWindow() {
-    if (shmem_mapping_) {
-        UnmapViewOfFile(shmem_mapping_);
-        shmem_mapping_ = nullptr;
+    // Only UnmapViewOfFile when we created a Win32 section (legacy path).
+    // Normal path: pointer is owned by Rust SharedRegion. [ADR-011]
+    if (shmem_section_) {
+        if (shmem_mapping_) {
+            UnmapViewOfFile(shmem_mapping_);
+        }
+        CloseHandle(static_cast<HANDLE>(shmem_section_));
+        shmem_section_ = nullptr;
     }
+    shmem_mapping_ = nullptr;
     close_document();
 }
 
+
 void MainWindow::mapShmem(qintptr handle) {
-    if (shmem_mapping_) {
-        UnmapViewOfFile(shmem_mapping_);
-        shmem_mapping_ = nullptr;
+    // Same-process FFI: Rust SharedRegion is already mapped with memmap2.
+    // `handle` is the base pointer of that view — not a Win32 file/section handle.
+    // Do not MapViewOfFile / UnmapViewOfFile on it. [ADR-011, SDS §6.3]
+    if (shmem_section_) {
+        if (shmem_mapping_) {
+            UnmapViewOfFile(shmem_mapping_);
+        }
+        CloseHandle(static_cast<HANDLE>(shmem_section_));
+        shmem_section_ = nullptr;
     }
-    HANDLE h = reinterpret_cast<HANDLE>(handle);
-    shmem_mapping_ = MapViewOfFile(h, FILE_MAP_READ, 0, 0, 0);
+    shmem_mapping_ = nullptr;
+    if (handle == 0) {
+        return;
+    }
+    shmem_mapping_ = reinterpret_cast<void*>(handle);
 }
+
 
 bool MainWindow::openDocument(const QString& path) {
     path_ = path;
-    // Try without password first; if core reports password required, prompt.
-    if (openDocumentWithPassword(path, QString())) {
+    bool needs_password = false;
+    if (openDocumentWithPassword(path, QString(), &needs_password)) {
         return true;
     }
-    // Second chance: password dialog. [FR-VIEW encrypt]
+    // Only prompt when the core reported encryption — not on missing file, etc. [FR-VIEW]
+    if (!needs_password) {
+        return false;
+    }
     bool ok = false;
     QString pw = QInputDialog::getText(this, QStringLiteral("Password"),
                                        QStringLiteral("Document is encrypted. Enter password:"),
                                        QLineEdit::Password, {}, &ok);
     if (!ok) return false;
-    return openDocumentWithPassword(path, pw);
+    return openDocumentWithPassword(path, pw, nullptr);
 }
 
-bool MainWindow::openDocumentWithPassword(const QString& path, const QString& password) {
+bool MainWindow::openDocumentWithPassword(const QString& path, const QString& password,
+                                           bool* needs_password) {
     OpenResultFFI result;
     try {
         result = open_document(path.toStdString(), password.toStdString());
@@ -318,6 +339,7 @@ bool MainWindow::openDocumentWithPassword(const QString& path, const QString& pa
             // Caller may retry with password.
             return false;
         }
+        QFile logf(QStringLiteral("open_error.log")); if (logf.open(QIODevice::WriteOnly|QIODevice::Truncate)) { logf.write(msg.toUtf8()); logf.close(); }
         QMessageBox::warning(this, QStringLiteral("Open failed"), msg);
         if (diagnostics_) diagnostics_->setReport(msg, {});
         return false;
@@ -326,7 +348,7 @@ bool MainWindow::openDocumentWithPassword(const QString& path, const QString& pa
     mapShmem(static_cast<qintptr>(result.shmem_handle));
     if (!shmem_mapping_) {
         QMessageBox::warning(this, QStringLiteral("Open failed"),
-                             QStringLiteral("Could not map shared memory."));
+                             QStringLiteral("Could not map shared memory (ptr=%1).").arg(result.shmem_handle));
         return false;
     }
 
@@ -340,11 +362,11 @@ bool MainWindow::openDocumentWithPassword(const QString& path, const QString& pa
 
     if (!renderCurrentPage()) return false;
 
-    setWindowTitle(QString("PDF Platform — %1 (%2 pages)").arg(path).arg(page_count_));
+    setWindowTitle(QString("PDF Platform â€” %1 (%2 pages)").arg(path).arg(page_count_));
     refreshPanels();
     canvas_->setFocus(Qt::OtherFocusReason);
     statusBar()->showMessage(
-        QString("Opened %1 pages · leniency %2 · GPU %3")
+        QString("Opened %1 pages Â· leniency %2 Â· GPU %3")
             .arg(page_count_)
             .arg(result.leniency_count)
             .arg(canvas_->usingGpu() ? "yes" : "software"),

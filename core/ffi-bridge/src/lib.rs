@@ -1,9 +1,9 @@
-//! Sole Rust↔Qt FFI boundary. [ADR-004]
+//! Sole Rustâ†”Qt FFI boundary. [ADR-004]
 //!
 //! RULES (enforced in review):
-//!   FFI-1: cxx-checked interface only — no hand-rolled ABI.
+//!   FFI-1: cxx-checked interface only â€” no hand-rolled ABI.
 //!   FFI-3: no raw pointers owned across the boundary.
-//!   FFI-4: carries commands/events/handles only — never document objects.
+//!   FFI-4: carries commands/events/handles only â€” never document objects.
 //!   FFI-6: two-reviewer rule; changes require one FFI-surface owner. [ADR-027]
 // SAFETY: cxx guarantees type-checked cross-language calls; no exceptions cross
 //         this boundary; ownership does not straddle languages. [ADR-004, ADR-027]
@@ -51,7 +51,7 @@ struct DocSession {
     form: AcroForm,
     /// Honesty notes from the last form import.
     form_import_notes: Vec<String>,
-    /// Cached page text for find/copy (page_index → full text + reliable).
+    /// Cached page text for find/copy (page_index â†’ full text + reliable).
     text_cache: std::collections::HashMap<u32, CachedPageText>,
     path: String,
 }
@@ -136,7 +136,9 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
     )
     .map_err(|e| e.to_string())?;
 
-    let handle = region.file().as_raw_handle() as isize;
+    // Shell is in-process with the coordinator: pass the already-mapped view pointer
+    // (not a Windows file HANDLE — MapViewOfFile cannot use a plain file handle). [ADR-011]
+    let shmem_ptr = region.as_slice().as_ptr() as isize;
 
     let mut session = DocSession {
         child,
@@ -193,7 +195,7 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
         page_count: session.page_count,
         page_width: session.page_width,
         page_height: session.page_height,
-        shmem_handle: handle,
+        shmem_handle: shmem_ptr,
         leniency_count: session.summary.leniency_count,
         has_acroform: session.summary.has_acroform,
         has_js: session.summary.has_js,

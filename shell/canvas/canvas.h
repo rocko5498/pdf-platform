@@ -1,5 +1,5 @@
 // Canvas + main window: multi-page, zoom, find, annotations, live panels.
-// [ADR-007, SDS §6, FR-VIEW, FR-SRCH, FR-ANNOT, FR-BOOK, FR-DIAG, M1–M4]
+// [ADR-007, SDS Â§6, FR-VIEW, FR-SRCH, FR-ANNOT, FR-BOOK, FR-DIAG, M1â€“M4]
 
 #pragma once
 
@@ -103,7 +103,7 @@ protected:
 
 private:
     void setupChrome();
-    bool openDocumentWithPassword(const QString& path, const QString& password);
+    bool openDocumentWithPassword(const QString& path, const QString& password, bool* needs_password = nullptr);
     bool renderCurrentPage();
     bool renderVisibleTiles();
     void refreshPanels();
@@ -119,6 +119,7 @@ private:
     FormsPanel* forms_ = nullptr;
 
     void* shmem_mapping_ = nullptr;
+    void* shmem_section_ = nullptr;  // CreateFileMapping handle (Windows); not the file handle
     uint32_t page_count_ = 0;
     uint32_t current_page_ = 0;
     float scale_ = 1.0f;
