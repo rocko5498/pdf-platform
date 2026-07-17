@@ -15,7 +15,7 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M1** | Outline / layers / attachments | **Mostly** | Single engine; e2e_get_outline_with_engine passes |
 | **M1** | Diagnostics / leniency | **Mostly** | Isolated panel refresh; dock a11y names; clear on failed open |
 | **M1** | Accessible chrome | **Mostly** | QAccessible + page status announce + dock names; static audit 12/12 |
-| **M1** | Encrypted open | **Mostly** | Password prompt + env password to worker |
+| **M1** | Encrypted open | **Mostly** | spawn_with_document_password + e2e encrypt/wrong-pw; shell password dialog gated |
 | **M1** | Formal a11y audit | **Partial** | Static audit 12 gates + page-status announce (AQA-10 code); manual SR still required |
 | **M1** | Large-doc p95 budgets | **Harness + gate table** | `tools/bench/p95_gates.toml` + check script; hard gate on ref hardware |
 | **M2** | Canonical text model + cache | **Met** | text-extract + coordinator + FFI cache |
@@ -55,3 +55,12 @@ Update when a criterion is proven by test, bench, or audited demo.
 | corpus-diff | 2 fixtures PASS |
 | Hard p95 on ref hardware | Not run (lab) |
 | Manual SR audit | Not run (lab) |
+
+### Encrypt / reopen e2e (automated)
+
+| Test | Result |
+|---|---|
+| e2e_encrypted_open_requires_password | pass (qpdf) |
+| e2e_wrong_password_does_not_load_engine | pass |
+| e2e_reopen_second_document | pass |
+| pipeline_e2e total | 15 passed |

@@ -1,7 +1,7 @@
-//! Worker process spawn + IPC + document/shmem handle inherit. [ADR-008, SDS §3.1, §4.2, §10.1]
+//! Worker process spawn + IPC + document/shmem handle inherit. [ADR-008, SDS Â§3.1, Â§4.2, Â§10.1]
 //!
-//! **Call order (M0):** create IPC listen end → mark handles inheritable →
-//! spawn worker → accept IPC → return parent transport.
+//! **Call order (M0):** create IPC listen end â†’ mark handles inheritable â†’
+//! spawn worker â†’ accept IPC â†’ return parent transport.
 //!
 //! ## Env contract (child)
 //!
@@ -57,11 +57,11 @@ impl<'a> Default for SpawnAttachments<'a> {
     }
 }
 
-/// Parent-side handle: framed IPC + child process. [SDS §10.1]
+/// Parent-side handle: framed IPC + child process. [SDS Â§10.1]
 pub struct WorkerChild {
     /// Control channel to the worker.
     pub transport: Box<dyn protocol::transport::WorkerTransport>,
-    /// OS process; drop does not kill — call `kill` or `wait` explicitly.
+    /// OS process; drop does not kill â€” call `kill` or `wait` explicitly.
     pub child: Child,
 }
 
@@ -78,10 +78,11 @@ pub fn spawn_worker_with_env(
     spawn_impl(worker_exe, &SpawnAttachments::default(), extra_env)
 }
 
-/// Spawn worker with an inheritable document file (no path string). [SDS §3.1]
+/// Spawn worker with an inheritable document file (no path string). [SDS Â§3.1]
 pub fn spawn_worker_with_file(
     worker_exe: &Path,
     doc: &File,
+    password: Option<&str>,
     extra_env: &[(&str, &str)],
 ) -> io::Result<WorkerChild> {
     spawn_impl(
@@ -89,7 +90,7 @@ pub fn spawn_worker_with_file(
         &SpawnAttachments {
             doc: Some(doc),
             shmem: None,
-            password: None,
+            password,
         },
         extra_env,
     )
@@ -339,7 +340,7 @@ mod unix {
 }
 
 // ---------------------------------------------------------------------------
-// Windows — Named pipes [ADR-031]
+// Windows â€” Named pipes [ADR-031]
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]

@@ -73,6 +73,8 @@ pub struct WorkerSession {
     state: LiveState,
     /// Z0-owned document; re-inherited on each spawn/respawn. [SDS §10.1 step 2]
     doc: Option<BrokeredFile>,
+    /// Optional open password re-applied on respawn. [FR-VIEW encrypt]
+    password: Option<String>,
     /// Monotonic counter for correlation IDs.
     next_cid: std::sync::atomic::AtomicU64,
 }
@@ -127,6 +129,7 @@ impl WorkerSession {
             worker_exe: worker_exe.to_path_buf(),
             state: LiveState::Alive { child },
             doc: None,
+            password: None,
             next_cid: AtomicU64::new(1),
         })
     }
@@ -138,12 +141,22 @@ impl WorkerSession {
         worker_exe: &Path,
         doc: BrokeredFile,
     ) -> Result<Self, SessionError> {
-        let child = spawn_worker_with_file(worker_exe, doc.file(), &[])?;
+        Self::spawn_with_document_password(worker_exe, doc, None)
+    }
+
+    /// Spawn with document and optional user password for encryption. [FR-VIEW encrypt]
+    pub fn spawn_with_document_password(
+        worker_exe: &Path,
+        doc: BrokeredFile,
+        password: Option<&str>,
+    ) -> Result<Self, SessionError> {
+        let child = spawn_worker_with_file(worker_exe, doc.file(), password, &[])?;
         Ok(Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             worker_exe: worker_exe.to_path_buf(),
             state: LiveState::Alive { child },
             doc: Some(doc),
+            password: password.map(str::to_string),
             next_cid: AtomicU64::new(1),
         })
     }
@@ -532,7 +545,7 @@ impl WorkerSession {
             LiveState::Dead { .. } => {}
         }
         let child = if let Some(doc) = self.doc.as_ref() {
-            spawn_worker_with_file(&self.worker_exe, doc.file(), &[])?
+            spawn_worker_with_file(&self.worker_exe, doc.file(), self.password.as_deref(), &[])?
         } else {
             spawn_worker(&self.worker_exe)?
         };

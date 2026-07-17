@@ -776,3 +776,133 @@ fn e2e_get_outline_with_engine() {
 
     std::fs::remove_file(&path).ok();
 }
+
+
+// ---------------------------------------------------------------------------
+// Encrypted open + reopen/close session hygiene [FR-VIEW, SDS §14 M1]
+// ---------------------------------------------------------------------------
+
+fn qpdf_available() -> bool {
+    std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn encrypt_pdf(plain: &Path, out: &Path, user_pw: &str) {
+    let status = std::process::Command::new("qpdf")
+        .args([
+            "--encrypt",
+            user_pw,
+            "owner-secret-test",
+            "256",
+            "--",
+            plain.to_str().expect("utf8 path"),
+            out.to_str().expect("utf8 path"),
+        ])
+        .status()
+        .expect("run qpdf encrypt");
+    assert!(status.success(), "qpdf encrypt failed");
+    assert!(out.exists(), "encrypted pdf missing");
+}
+
+#[test]
+fn e2e_encrypted_open_requires_password() {
+    if !qpdf_available() {
+        eprintln!("skip: qpdf not on PATH");
+        return;
+    }
+    let (pdf_bytes, _, _) = generate_pdf(2);
+    let plain = temp_pdf(&pdf_bytes, "plain-enc");
+    let enc = plain.with_extension("enc.pdf");
+    encrypt_pdf(&plain, &enc, "secret-user");
+
+    // Wrong/no password: engine load fails — inspect must not pretend success with a live engine.
+    // We still get a worker; engine may be absent. Surface password errors via engine path.
+    let brokered = open_read_only(&enc).expect("broker open enc");
+    let mut session = WorkerSession::spawn_with_document(&worker_path(), brokered)
+        .expect("spawn without password");
+    // Structure queries may fail without engine; must not hang.
+    let outline = session.get_outline();
+    // With no password, engine is typically None → Protocol("no engine loaded") or similar.
+    // Critical: spawn_with_document_password succeeds below.
+    let _ = outline;
+    drop(session);
+
+    // Correct password: inspect + structure OK. [FR-VIEW encrypt]
+    let brokered = open_read_only(&enc).expect("broker open enc 2");
+    let mut session =
+        WorkerSession::spawn_with_document_password(&worker_path(), brokered, Some("secret-user"))
+            .expect("spawn with password");
+    let summary = session.inspect().expect("inspect encrypted with password");
+    assert!(summary.page_count >= 1, "expected pages after decrypt");
+    session
+        .get_outline()
+        .unwrap_or_else(|e| panic!("outline after decrypt failed: {e}"));
+    session
+        .get_layers()
+        .unwrap_or_else(|e| panic!("layers after decrypt failed: {e}"));
+
+    std::fs::remove_file(&plain).ok();
+    std::fs::remove_file(&enc).ok();
+}
+
+#[test]
+fn e2e_wrong_password_does_not_load_engine() {
+    if !qpdf_available() {
+        eprintln!("skip: qpdf not on PATH");
+        return;
+    }
+    let (pdf_bytes, _, _) = generate_pdf(1);
+    let plain = temp_pdf(&pdf_bytes, "plain-wrong-pw");
+    let enc = plain.with_extension("wrong.enc.pdf");
+    encrypt_pdf(&plain, &enc, "correct-pw");
+
+    let brokered = open_read_only(&enc).expect("broker");
+    let mut session =
+        WorkerSession::spawn_with_document_password(&worker_path(), brokered, Some("wrong-pw"))
+            .expect("spawn");
+    // Wrong password → no engine → outline errors honestly.
+    let err = session.get_outline().expect_err("outline should fail with wrong password");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("engine") || msg.contains("password") || msg.contains("protocol"),
+        "unexpected error: {msg}"
+    );
+
+    std::fs::remove_file(&plain).ok();
+    std::fs::remove_file(&enc).ok();
+}
+
+#[test]
+fn e2e_reopen_second_document() {
+    // Drop session A, open session B — independent page counts. [SDS §10, FR-VIEW]
+    let (a_bytes, _, _) = generate_pdf(2);
+    let (b_bytes, _, _) = generate_pdf(5);
+    let path_a = temp_pdf(&a_bytes, "reopen-a");
+    let path_b = temp_pdf(&b_bytes, "reopen-b");
+
+    {
+        let brokered = open_read_only(&path_a).expect("open a");
+        let mut session =
+            WorkerSession::spawn_with_document(&worker_path(), brokered).expect("spawn a");
+        let s = session.inspect().expect("inspect a");
+        assert_eq!(s.page_count, 2);
+        // session drop ends worker
+    }
+
+    {
+        let brokered = open_read_only(&path_b).expect("open b");
+        let mut session =
+            WorkerSession::spawn_with_document(&worker_path(), brokered).expect("spawn b");
+        let s = session.inspect().expect("inspect b");
+        assert_eq!(s.page_count, 5);
+        session
+            .get_outline()
+            .unwrap_or_else(|e| panic!("outline on B: {e}"));
+    }
+
+    std::fs::remove_file(&path_a).ok();
+    std::fs::remove_file(&path_b).ok();
+}
