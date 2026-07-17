@@ -10,6 +10,7 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M0** | Corpus-diff + CI | **Met** | GitHub Actions |
 | **M0** | Cold-start / first-page budgets | **Met** | ~11ms / ~13ms recorded |
 | **M0** | Sandbox confinement | **Advisory + review package** | `docs/security/confinement-review-package.md`; `confinement_report()`; no silent enforce |
+| **M0/M1** | Shell open→shmem→tile (Windows) | **Hardened (code)** | Path rejoin for spaces; shmem **pointer** not file HANDLE; password dialog only on encrypt; absolute paths. **Human smoke still required** |
 | **M1** | Multi-page + zoom + scroll | **Mostly** | Continuous multi-tile composite + wheel scroll |
 | **M1** | Outline / layers / attachments | **Mostly** | Live worker queries + dock panels |
 | **M1** | Diagnostics / leniency | **Mostly** | Panel + CLI + FFI |
@@ -27,9 +28,9 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M4** | XFDF import/export | **Mostly** | Unit interop + shell export/save XFDF |
 | **M4** | Annot persist to PDF | **Mostly** | Incremental save + page `/Annots` patch via FFI |
 | **M4** | Acrobat/Foxit matrix | **Unit matrix CI** | `interop_matrix` + CI; external apps still release-train |
-| **M5** | Forms JS subset | **Subset + Z1 wire + AP regen** | `forms_js` + `CMD:FORMS_CALC`; widget `/AP` via `regenerate_appearances`; shell Forms panel + FFI fill/calc |
-| **M5** | AcroForm product fill | **Mostly** | COS leaf-field import on open + session fill/calc/AP/save; seed demo fallback; nested Kids; compressed xref / full FDF flatten still open |
-| **M6** | Merge/split/optimize CLI | **qpdf-backed** | `assembly_ops` + CLI; needs `qpdf` on PATH; pure-Rust assembly deferred |
+| **M5** | Forms JS subset | **Subset + Z1 wire + AP regen** | `forms_js` + `CMD:FORMS_CALC`; widget `/AP`; shell Forms panel + FFI |
+| **M5** | AcroForm product fill | **Partial** | COS leaf import + session fill; full product exit (corpus/FDF/flatten) still open |
+| **M6** | Merge/split/optimize CLI | **qpdf-backed** | `assembly_ops` + CLI; pure-Rust assembly deferred |
 | **M5+** | Full forms/assembly/redaction product exits | **Partial models** | Broader product exit criteria still open |
 
 ## Roadmap invariants (SDS §14)
@@ -37,4 +38,4 @@ Update when a criterion is proven by test, bench, or audited demo.
 1. No M4+ *shipping* without M3 fault gate — **satisfied**.  
 2. Corpus/interop/bench updates with milestones — **in progress**.  
 3. GUI/CLI parity where meaningful — **CLI ahead on structure/find; GUI catching up**.  
-4. Releasable builds per milestone — **M0 yes; M1–M4 approaching**.
+4. Releasable builds per milestone — **M0 yes; M1–M4 approaching**. Substrate open path code-hardened; **human shell smoke still required before claim**.

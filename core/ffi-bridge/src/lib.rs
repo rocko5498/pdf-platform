@@ -1,9 +1,9 @@
-//! Sole Rustâ†”Qt FFI boundary. [ADR-004]
+//! Sole RustÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂQt FFI boundary. [ADR-004]
 //!
 //! RULES (enforced in review):
-//!   FFI-1: cxx-checked interface only â€” no hand-rolled ABI.
+//!   FFI-1: cxx-checked interface only ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no hand-rolled ABI.
 //!   FFI-3: no raw pointers owned across the boundary.
-//!   FFI-4: carries commands/events/handles only â€” never document objects.
+//!   FFI-4: carries commands/events/handles only ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â never document objects.
 //!   FFI-6: two-reviewer rule; changes require one FFI-surface owner. [ADR-027]
 // SAFETY: cxx guarantees type-checked cross-language calls; no exceptions cross
 //         this boundary; ownership does not straddle languages. [ADR-004, ADR-027]
@@ -51,7 +51,7 @@ struct DocSession {
     form: AcroForm,
     /// Honesty notes from the last form import.
     form_import_notes: Vec<String>,
-    /// Cached page text for find/copy (page_index â†’ full text + reliable).
+    /// Cached page text for find/copy (page_index ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ full text + reliable).
     text_cache: std::collections::HashMap<u32, CachedPageText>,
     path: String,
 }
@@ -136,9 +136,6 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
     )
     .map_err(|e| e.to_string())?;
 
-    // Shell is in-process with the coordinator: pass the already-mapped view pointer
-    // (not a Windows file HANDLE — MapViewOfFile cannot use a plain file handle). [ADR-011]
-    let shmem_ptr = region.as_slice().as_ptr() as isize;
 
     let mut session = DocSession {
         child,
@@ -190,6 +187,10 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
 
     // Import AcroForm fields from COS when the document declares them. [FR-FORM-1]
     load_form_from_path(&mut session);
+
+    // Same-process shell: base pointer of Rust SharedRegion map (not a Win32 file HANDLE).
+    // MapViewOfFile cannot take a plain file handle. [ADR-011, SDS Ã‚Â§6.3]
+    let shmem_ptr = session.region.as_slice().as_ptr() as isize;
 
     let result = ffi::OpenResultFFI {
         page_count: session.page_count,

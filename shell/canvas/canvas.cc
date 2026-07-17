@@ -13,6 +13,7 @@
 #include <QClipboard>
 #include <QDockWidget>
 #include <QFile>
+#include <QFileInfo>
 #include <QFileDialog>
 #include <QFocusEvent>
 #include <QInputDialog>
@@ -248,7 +249,7 @@ void MainWindow::setupChrome() {
     addToolBar(Qt::TopToolBarArea, annot_tools_);
     connect(annot_tools_, &AnnotationToolBar::toolChanged, this, [this](AnnotationTool t) {
         annot_tool_ = static_cast<int>(t);
-        statusBar()->showMessage(QStringLiteral("Tool %1 â€” click canvas to place").arg(annot_tool_),
+        statusBar()->showMessage(QStringLiteral("Tool %1 Ã¢â‚¬â€ click canvas to place").arg(annot_tool_),
                                  2500);
     });
 
@@ -273,7 +274,7 @@ void MainWindow::setupChrome() {
     connect(forms_, &FormsPanel::jsEnabledRequested, this, &MainWindow::setFormsJsEnabled);
 
     statusBar()->showMessage(
-        QStringLiteral("Ready â€” Ctrl+O open, Ctrl+F find, Ctrl+G forms calc, Ctrl+C copy text"));
+        QStringLiteral("Ready - Ctrl+O open, Ctrl+F find, Ctrl+C copy"));
 }
 
 MainWindow::~MainWindow() {
@@ -293,8 +294,8 @@ MainWindow::~MainWindow() {
 
 void MainWindow::mapShmem(qintptr handle) {
     // Same-process FFI: Rust SharedRegion is already mapped with memmap2.
-    // `handle` is the base pointer of that view — not a Win32 file/section handle.
-    // Do not MapViewOfFile / UnmapViewOfFile on it. [ADR-011, SDS §6.3]
+    // `handle` is the base pointer of that view â€” not a Win32 file/section handle.
+    // Do not MapViewOfFile / UnmapViewOfFile on it. [ADR-011, SDS Â§6.3]
     if (shmem_section_) {
         if (shmem_mapping_) {
             UnmapViewOfFile(shmem_mapping_);
@@ -311,12 +312,14 @@ void MainWindow::mapShmem(qintptr handle) {
 
 
 bool MainWindow::openDocument(const QString& path) {
-    path_ = path;
+    // Canonical absolute path so spaces / relative CLI args resolve. [FR-VIEW]
+    const QString abs = QFileInfo(path).absoluteFilePath();
+    path_ = abs;
     bool needs_password = false;
-    if (openDocumentWithPassword(path, QString(), &needs_password)) {
+    if (openDocumentWithPassword(abs, QString(), &needs_password)) {
         return true;
     }
-    // Only prompt when the core reported encryption — not on missing file, etc. [FR-VIEW]
+    // Only prompt when the core reported encryption â€” not on missing file, etc. [FR-VIEW]
     if (!needs_password) {
         return false;
     }
@@ -325,7 +328,7 @@ bool MainWindow::openDocument(const QString& path) {
                                        QStringLiteral("Document is encrypted. Enter password:"),
                                        QLineEdit::Password, {}, &ok);
     if (!ok) return false;
-    return openDocumentWithPassword(path, pw, nullptr);
+    return openDocumentWithPassword(path_, pw, nullptr);
 }
 
 bool MainWindow::openDocumentWithPassword(const QString& path, const QString& password,
@@ -336,10 +339,12 @@ bool MainWindow::openDocumentWithPassword(const QString& path, const QString& pa
     } catch (const std::exception& e) {
         QString msg = QString::fromUtf8(e.what());
         if (msg.contains(QStringLiteral("password"), Qt::CaseInsensitive) && password.isEmpty()) {
-            // Caller may retry with password.
+            // Only encrypt failures request the password dialog. [FR-VIEW, PRIN-6]
+            if (needs_password) {
+                *needs_password = true;
+            }
             return false;
         }
-        QFile logf(QStringLiteral("open_error.log")); if (logf.open(QIODevice::WriteOnly|QIODevice::Truncate)) { logf.write(msg.toUtf8()); logf.close(); }
         QMessageBox::warning(this, QStringLiteral("Open failed"), msg);
         if (diagnostics_) diagnostics_->setReport(msg, {});
         return false;
@@ -360,13 +365,17 @@ bool MainWindow::openDocumentWithPassword(const QString& path, const QString& pa
     scroll_y_ = 0.f;
     generation_ = 1;
 
-    if (!renderCurrentPage()) return false;
+    if (!renderCurrentPage()) {
+        QMessageBox::warning(this, QStringLiteral("Open failed"),
+                             QStringLiteral("Document opened but first-page render failed."));
+        return false;
+    }
 
-    setWindowTitle(QString("PDF Platform â€” %1 (%2 pages)").arg(path).arg(page_count_));
+    setWindowTitle(QStringLiteral("PDF Platform - %1 (%2 pages)").arg(path_).arg(page_count_));
     refreshPanels();
     canvas_->setFocus(Qt::OtherFocusReason);
     statusBar()->showMessage(
-        QString("Opened %1 pages Â· leniency %2 Â· GPU %3")
+        QStringLiteral("Opened %1 pages | leniency %2 | GPU %3")
             .arg(page_count_)
             .arg(result.leniency_count)
             .arg(canvas_->usingGpu() ? "yes" : "software"),
