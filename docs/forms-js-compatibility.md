@@ -31,11 +31,14 @@
 | Layer | API |
 |---|---|
 | Pure eval | `pdf_model::forms_js::evaluate_expression` / `run_form_calculations` |
+| Widget `/AP` | `generate_widget_appearance` / `build_widget_pdf_objects` / `AcroForm::regenerate_appearances` |
 | Protocol | `Command::FormsCalc` → `WorkerEvent::FormsCalcResult` |
 | Session | `WorkerSession::forms_calc(expr, fields, enabled)` |
-| CLI demo | `pdf-platform forms-calc-demo` (local AcroForm, no worker) |
+| FFI / shell | `list_form_fields` / `set_form_field` / `run_forms_calc` / `seed_form_demo` / JS kill switch |
+| CLI demo | `pdf-platform forms-calc-demo` (local AcroForm + AP regen) |
+| Shell panel | Forms dock: seed demo, edit, Apply, Calc, JS on/off (`Ctrl+G` = calc) |
 
-**Appearance:** after values change, regenerate widget `/AP` before save (same honesty rule as annotations).
+**Appearance:** after values change, regenerate widget `/AP` before save (same honesty rule as annotations). Session form is a fill model — **COS field import from the open document is still deferred** (honest note in the panel).
 
 ## How to extend
 

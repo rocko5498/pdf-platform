@@ -23,6 +23,7 @@ namespace pdf_platform {
 class OutlinePanel;
 class DiagnosticsPanel;
 class AnnotationToolBar;
+class FormsPanel;
 
 class CanvasWidget : public PDF_CANVAS_BASE
 #if defined(PDF_PLATFORM_USE_OPENGL) && PDF_PLATFORM_USE_OPENGL
@@ -91,6 +92,11 @@ public slots:
     void findNext();
     void copyPageText();
     void exportAnnotationsXfdf();
+    void refreshFormsPanel();
+    void seedFormDemo();
+    void applyFormField(const QString& name, const QString& value);
+    void runFormsCalc();
+    void setFormsJsEnabled(bool enabled);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -110,6 +116,7 @@ private:
     OutlinePanel* outline_ = nullptr;
     DiagnosticsPanel* diagnostics_ = nullptr;
     AnnotationToolBar* annot_tools_ = nullptr;
+    FormsPanel* forms_ = nullptr;
 
     void* shmem_mapping_ = nullptr;
     uint32_t page_count_ = 0;

@@ -201,9 +201,12 @@ impl FormField {
     }
 
     /// Set the value, returning whether it changed.
+    ///
+    /// Clears cached appearance so callers must regenerate `/AP` [FR-FORM-1].
     pub fn set_value(&mut self, value: FieldValue) -> bool {
         if self.value != value {
             self.value = value;
+            self.appearance = None;
             true
         } else {
             false
@@ -405,8 +408,28 @@ impl AcroForm {
     /// Unsupported constructs are not silently emulated — see `forms_js` log
     /// when using [`crate::forms_js::run_form_calculations`]. Returns field
     /// names that were recalculated successfully.
+    ///
+    /// After any value change, regenerates widget appearances [FR-FORM-1].
     pub fn run_calculations(&mut self) -> Vec<String> {
-        crate::forms_js::run_form_calculations(self).updated_fields
+        let updated = crate::forms_js::run_form_calculations(self).updated_fields;
+        if self.needs_appearance_regen {
+            self.regenerate_appearances();
+        }
+        updated
+    }
+
+    /// Regenerate `/AP` appearance streams for all fields. [FR-FORM-1]
+    ///
+    /// Required after fill or calculation so other readers show values (PRIN-7).
+    /// Returns the number of fields whose appearance was written.
+    pub fn regenerate_appearances(&mut self) -> u32 {
+        let mut n = 0u32;
+        for field in self.fields.values_mut() {
+            crate::appearance::ensure_widget_appearance(field);
+            n += 1;
+        }
+        self.needs_appearance_regen = false;
+        n
     }
 
     /// Check if any field has JavaScript calculations.
@@ -540,6 +563,22 @@ mod tests {
         field.set_value(FieldValue::Choice("red".into()));
         assert_eq!(field.value, FieldValue::Choice("red".into()));
         assert!(field.is_choice());
+    }
+
+    #[test]
+    fn regenerate_appearances_after_fill() {
+        // [FR-FORM-1] fill marks regen needed; regenerate_appearances writes /AP.
+        let mut form = AcroForm::new();
+        form.add_field(text_field("name"));
+        assert!(form.set_field_value("name", FieldValue::Text("Bob".into())));
+        assert!(form.needs_appearance_regen);
+        assert!(form.field("name").unwrap().appearance.is_none());
+        let n = form.regenerate_appearances();
+        assert_eq!(n, 1);
+        assert!(!form.needs_appearance_regen);
+        let ap = form.field("name").unwrap().appearance.as_ref().unwrap();
+        let text = String::from_utf8_lossy(ap);
+        assert!(text.contains("Bob"));
     }
 
     #[test]

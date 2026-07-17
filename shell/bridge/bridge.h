@@ -60,4 +60,20 @@ inline std::string save_document(const std::string& out_path) {
     return std::string(save_document_impl(out_path));
 }
 
+// --- Forms (M5) [FR-FORM, FR-JS, ADR-017] ---
+
+inline std::string list_form_fields() { return std::string(list_form_fields_impl()); }
+
+inline std::string seed_form_demo() { return std::string(seed_form_demo_impl()); }
+
+inline std::string set_form_field(const std::string& name, const std::string& value) {
+    return std::string(set_form_field_impl(name, value));
+}
+
+inline std::string run_forms_calc() { return std::string(run_forms_calc_impl()); }
+
+inline std::string set_forms_js_enabled(bool enabled) {
+    return std::string(set_forms_js_enabled_impl(enabled));
+}
+
 }  // namespace pdf_platform

@@ -6,6 +6,7 @@
 #include "annotation_tools.h"
 #include "bridge.h"
 #include "diagnostics_panel.h"
+#include "forms_panel.h"
 #include "outline_panel.h"
 
 #include <QApplication>
@@ -261,7 +262,18 @@ void MainWindow::setupChrome() {
     dd->setWidget(diagnostics_);
     addDockWidget(Qt::RightDockWidgetArea, dd);
 
-    statusBar()->showMessage(QStringLiteral("Ready — Ctrl+O open, Ctrl+F find, Ctrl+C copy text"));
+    forms_ = new FormsPanel(this);
+    auto* fd = new QDockWidget(QStringLiteral("Forms"), this);
+    fd->setObjectName(QStringLiteral("formsDock"));
+    fd->setWidget(forms_);
+    addDockWidget(Qt::RightDockWidgetArea, fd);
+    connect(forms_, &FormsPanel::seedDemoRequested, this, &MainWindow::seedFormDemo);
+    connect(forms_, &FormsPanel::setFieldRequested, this, &MainWindow::applyFormField);
+    connect(forms_, &FormsPanel::runCalcRequested, this, &MainWindow::runFormsCalc);
+    connect(forms_, &FormsPanel::jsEnabledRequested, this, &MainWindow::setFormsJsEnabled);
+
+    statusBar()->showMessage(
+        QStringLiteral("Ready — Ctrl+O open, Ctrl+F find, Ctrl+G forms calc, Ctrl+C copy text"));
 }
 
 MainWindow::~MainWindow() {
@@ -460,10 +472,64 @@ void MainWindow::refreshPanels() {
             }
             diagnostics_->setReport(report, events);
         }
+        refreshFormsPanel();
     } catch (const std::exception& e) {
         if (diagnostics_) {
             diagnostics_->setReport(QString("Panel refresh: %1").arg(e.what()), {});
         }
+    }
+}
+
+void MainWindow::refreshFormsPanel() {
+    if (!forms_) return;
+    try {
+        forms_->setFieldsData(QString::fromStdString(list_form_fields()));
+    } catch (const std::exception& e) {
+        forms_->setFieldsData(QStringLiteral("count=0\nnote=%1").arg(e.what()));
+    }
+}
+
+void MainWindow::seedFormDemo() {
+    try {
+        QString msg = QString::fromStdString(seed_form_demo());
+        statusBar()->showMessage(msg, 4000);
+        refreshFormsPanel();
+    } catch (const std::exception& e) {
+        QMessageBox::warning(this, QStringLiteral("Forms"), QString::fromUtf8(e.what()));
+    }
+}
+
+void MainWindow::applyFormField(const QString& name, const QString& value) {
+    try {
+        QString msg = QString::fromStdString(
+            set_form_field(name.toStdString(), value.toStdString()));
+        statusBar()->showMessage(msg, 4000);
+        refreshFormsPanel();
+    } catch (const std::exception& e) {
+        QMessageBox::warning(this, QStringLiteral("Forms"), QString::fromUtf8(e.what()));
+    }
+}
+
+void MainWindow::runFormsCalc() {
+    try {
+        QString msg = QString::fromStdString(run_forms_calc());
+        statusBar()->showMessage(msg.section('\n', 0, 0), 5000);
+        if (diagnostics_) {
+            diagnostics_->setReport(QStringLiteral("Forms calc\n%1").arg(msg), {});
+        }
+        refreshFormsPanel();
+    } catch (const std::exception& e) {
+        QMessageBox::warning(this, QStringLiteral("Forms calc"), QString::fromUtf8(e.what()));
+    }
+}
+
+void MainWindow::setFormsJsEnabled(bool enabled) {
+    try {
+        QString msg = QString::fromStdString(set_forms_js_enabled(enabled));
+        statusBar()->showMessage(msg, 3000);
+        refreshFormsPanel();
+    } catch (const std::exception& e) {
+        QMessageBox::warning(this, QStringLiteral("Forms JS"), QString::fromUtf8(e.what()));
     }
 }
 
@@ -585,6 +651,11 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
     }
     if (event->modifiers() & Qt::ControlModifier && event->key() == Qt::Key_E) {
         exportAnnotationsXfdf();
+        event->accept();
+        return;
+    }
+    if (event->modifiers() & Qt::ControlModifier && event->key() == Qt::Key_G) {
+        runFormsCalc();
         event->accept();
         return;
     }

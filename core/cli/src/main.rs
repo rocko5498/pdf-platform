@@ -1,4 +1,4 @@
-//! `pdf-platform` CLI entry point. [ADR-025, FR-CLI, US-DEV-6, SDS §14]
+﻿//! `pdf-platform` CLI entry point. [ADR-025, FR-CLI, US-DEV-6, SDS Â§14]
 //!
 //! Commands:
 //!   pdf-platform <file>                              structural summary
@@ -163,7 +163,7 @@ fn cmd_summary(path: &Path) {
                 println!("Leniency:   0 repairs");
             } else {
                 println!(
-                    "Leniency:   {} repair(s) — details on stderr",
+                    "Leniency:   {} repair(s) â€” details on stderr",
                     s.leniency_count
                 );
                 for event in &s.leniency_events {
@@ -179,7 +179,7 @@ fn cmd_summary(path: &Path) {
     }
 }
 
-/// Optimization pre-flight honesty report — no mutation. [FR-OPT-2, PRIN-6, M6]
+/// Optimization pre-flight honesty report â€” no mutation. [FR-OPT-2, PRIN-6, M6]
 fn cmd_optimize_preflight(path: &Path, rest: &[String]) {
     use pdf_model::assembly::{OptimizeProfile, OptimizeSettings};
 
@@ -205,7 +205,7 @@ fn cmd_forms_calc_demo() {
     };
     use pdf_model::forms_js::{run_form_calculations, SUPPORTED_SUBSET};
 
-    println!("Forms JS subset — supported constructs:");
+    println!("Forms JS subset â€” supported constructs:");
     for s in SUPPORTED_SUBSET {
         println!("  - {s}");
     }
@@ -232,6 +232,11 @@ fn cmd_forms_calc_demo() {
     form.calculation_order = vec!["total".into()];
 
     let result = run_form_calculations(&mut form);
+    let ap_n = form.regenerate_appearances();
+    println!("Appearances regenerated: {ap_n} fields");
+    if let Some(f) = form.fields().get("total") {
+        println!("total AP present: {} ({} bytes)", f.appearance.is_some(), f.appearance.as_ref().map(|b| b.len()).unwrap_or(0));
+    }
     println!("Updated: {:?}", result.updated_fields);
     println!(
         "total = {:?}",
@@ -253,7 +258,7 @@ fn cmd_forms_calc_demo() {
     use std::collections::HashMap;
     match evaluate_expression("app.alert('x')", &HashMap::new()) {
         Err(e) => println!("Honesty check: {e}"),
-        Ok(_) => println!("Honesty check FAILED — app.alert should be unsupported"),
+        Ok(_) => println!("Honesty check FAILED â€” app.alert should be unsupported"),
     }
     process::exit(0);
 }
@@ -552,7 +557,7 @@ fn cmd_with_coordinator(cmd: &str, path: &Path, rest: &[String]) {
                     println!("structured={}", model.has_structure);
                     if !model.reliable {
                         eprintln!(
-                            "warning: text layer flagged unreliable — do not treat as authoritative"
+                            "warning: text layer flagged unreliable â€” do not treat as authoritative"
                         );
                     }
                     println!("---");

@@ -27,7 +27,8 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M4** | XFDF import/export | **Mostly** | Unit interop + shell export/save XFDF |
 | **M4** | Annot persist to PDF | **Mostly** | Incremental save + page `/Annots` patch via FFI |
 | **M4** | Acrobat/Foxit matrix | **Unit matrix CI** | `interop_matrix` + CI; external apps still release-train |
-| **M5** | Forms JS subset | **Subset + Z1 wire** | `forms_js` + `CMD:FORMS_CALC` / session API; appearance note; full AcroForm product open |
+| **M5** | Forms JS subset | **Subset + Z1 wire + AP regen** | `forms_js` + `CMD:FORMS_CALC`; widget `/AP` via `regenerate_appearances`; shell Forms panel + FFI fill/calc |
+| **M5** | AcroForm product fill | **Session model** | Session seed demo + fill/calc/save widgets; COS field import from document still open |
 | **M6** | Merge/split/optimize CLI | **qpdf-backed** | `assembly_ops` + CLI; needs `qpdf` on PATH; pure-Rust assembly deferred |
 | **M5+** | Full forms/assembly/redaction product exits | **Partial models** | Broader product exit criteria still open |
 

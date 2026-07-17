@@ -10,7 +10,8 @@
 //!
 //! **Forms (M5):** widget annotations for form fields follow the same honesty
 //! rule after forms JS calculations update values — regenerate `/AP` before
-//! save; see `forms_js` module docs. [ADR-017, FR-JS]
+//! save via [`generate_widget_appearance`] / [`build_widget_pdf_objects`].
+//! [ADR-017, FR-FORM-1, FR-JS]
 
 use std::io::Write;
 
@@ -18,6 +19,7 @@ use crate::annotation::{
     Annotation, AnnotationType, BorderStyle, Color,
     Rect, TextMarkupKind,
 };
+use crate::form::{FieldType, FieldValue, FormField};
 
 /// Generate an appearance stream for an annotation. [FR-ANNOT-2]
 ///
@@ -493,6 +495,209 @@ fn generate_redaction_appearance(rect: &Rect, color: &Color) -> Vec<u8> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Form widget appearances [FR-FORM-1, ADR-017, SDS §14 M5]
+// ---------------------------------------------------------------------------
+
+/// PDF object pair for a filled form widget (field dict + appearance stream).
+#[derive(Debug, Clone)]
+pub struct WidgetPdfObjects {
+    /// 1-based object number for the widget / field dictionary.
+    pub widget_obj_num: u32,
+    /// 1-based object number for the appearance stream.
+    pub ap_obj_num: u32,
+    /// Serialized widget annotation / field dictionary bytes.
+    pub widget_bytes: Vec<u8>,
+    /// Serialized appearance stream object bytes.
+    pub ap_bytes: Vec<u8>,
+}
+
+/// Generate a widget appearance stream for a form field. [FR-FORM-1]
+///
+/// Content is in **local** form-XObject coordinates with origin at the
+/// bottom-left of the widget rect (BBox `[0 0 width height]`).
+pub fn generate_widget_appearance(field: &FormField) -> Vec<u8> {
+    match field.field_type {
+        FieldType::Checkbox | FieldType::RadioButton => generate_checkbox_widget_appearance(field),
+        FieldType::Button => generate_button_widget_appearance(field),
+        FieldType::Signature => generate_signature_widget_appearance(field),
+        FieldType::Text | FieldType::ComboBox | FieldType::ListBox => {
+            generate_text_widget_appearance(field)
+        }
+    }
+}
+
+/// Ensure `field.appearance` is populated. Always regenerates from current value.
+pub fn ensure_widget_appearance(field: &mut FormField) {
+    field.appearance = Some(generate_widget_appearance(field));
+}
+
+/// Build PDF objects for a form widget with always-written `/AP`. [FR-FORM-1]
+pub fn build_widget_pdf_objects(
+    field: &mut FormField,
+    widget_obj_num: u32,
+    ap_obj_num: u32,
+) -> WidgetPdfObjects {
+    ensure_widget_appearance(field);
+    let content = field
+        .appearance
+        .as_ref()
+        .expect("ensure_widget_appearance always sets appearance")
+        .clone();
+    let rect = Rect::new(field.rect.x, field.rect.y, field.rect.width, field.rect.height);
+    let ap_bytes = serialize_appearance_stream_object(ap_obj_num, &rect, &content);
+    let widget_bytes = serialize_widget_dict_object(field, widget_obj_num, ap_obj_num);
+    field.widget_obj_num = Some(widget_obj_num);
+    WidgetPdfObjects {
+        widget_obj_num,
+        ap_obj_num,
+        widget_bytes,
+        ap_bytes,
+    }
+}
+
+fn generate_text_widget_appearance(field: &FormField) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let w = field.rect.width;
+    let h = field.rect.height;
+    let font_size = field.font_size.unwrap_or(10.0).clamp(6.0, 24.0);
+
+    // Background + border in local coords.
+    write!(&mut buf, "1 1 1 rg\n").unwrap();
+    write!(&mut buf, "0 0 {w:.1} {h:.1} re f\n").unwrap();
+    write!(&mut buf, "0 0 0 RG\n").unwrap();
+    write!(&mut buf, "0.5 w\n").unwrap();
+    write!(&mut buf, "0 0 {w:.1} {h:.1} re S\n").unwrap();
+
+    let display = match &field.value {
+        FieldValue::None => String::new(),
+        other => {
+            if field.password {
+                "•".repeat(other.display().chars().count().min(32))
+            } else {
+                other.display()
+            }
+        }
+    };
+
+    if !display.is_empty() {
+        write!(&mut buf, "BT\n").unwrap();
+        write!(&mut buf, "/F1 {font_size:.1} Tf\n").unwrap();
+        write!(&mut buf, "0 0 0 rg\n").unwrap();
+        let escaped = escape_pdf_string(&display);
+        let baseline = (h - font_size).max(2.0);
+        write!(&mut buf, "2.0 {baseline:.1} Td\n").unwrap();
+        write!(&mut buf, "({escaped}) Tj\n").unwrap();
+        write!(&mut buf, "ET\n").unwrap();
+    }
+    buf
+}
+
+fn generate_checkbox_widget_appearance(field: &FormField) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let w = field.rect.width.max(8.0);
+    let h = field.rect.height.max(8.0);
+
+    write!(&mut buf, "1 1 1 rg\n").unwrap();
+    write!(&mut buf, "0 0 {w:.1} {h:.1} re f\n").unwrap();
+    write!(&mut buf, "0 0 0 RG\n").unwrap();
+    write!(&mut buf, "1 w\n").unwrap();
+    write!(&mut buf, "0 0 {w:.1} {h:.1} re S\n").unwrap();
+
+    let checked = matches!(field.value, FieldValue::Bool(true))
+        || matches!(&field.value, FieldValue::Choice(s) if s != "Off" && !s.is_empty())
+        || matches!(&field.value, FieldValue::Text(s) if s == "Yes" || s == "On" || s == "1");
+
+    if checked {
+        // Simple check mark (two strokes).
+        write!(&mut buf, "0 0 0 RG\n").unwrap();
+        write!(&mut buf, "1.5 w\n").unwrap();
+        write!(&mut buf, "{:.1} {:.1} m\n", w * 0.2, h * 0.5).unwrap();
+        write!(&mut buf, "{:.1} {:.1} l\n", w * 0.4, h * 0.25).unwrap();
+        write!(&mut buf, "{:.1} {:.1} l S\n", w * 0.8, h * 0.8).unwrap();
+    }
+    buf
+}
+
+fn generate_button_widget_appearance(field: &FormField) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let w = field.rect.width;
+    let h = field.rect.height;
+    write!(&mut buf, "0.9 0.9 0.9 rg\n").unwrap();
+    write!(&mut buf, "0 0 {w:.1} {h:.1} re f\n").unwrap();
+    write!(&mut buf, "0 0 0 RG\n").unwrap();
+    write!(&mut buf, "1 w\n").unwrap();
+    write!(&mut buf, "0 0 {w:.1} {h:.1} re S\n").unwrap();
+    let label = if field.value.is_empty() {
+        field.name.clone()
+    } else {
+        field.value.display()
+    };
+    if !label.is_empty() {
+        write!(&mut buf, "BT\n/F1 9 Tf\n0 0 0 rg\n").unwrap();
+        write!(&mut buf, "2.0 {:.1} Td\n", (h - 10.0).max(2.0)).unwrap();
+        write!(&mut buf, "({}) Tj\nET\n", escape_pdf_string(&label)).unwrap();
+    }
+    buf
+}
+
+fn generate_signature_widget_appearance(field: &FormField) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let w = field.rect.width;
+    let h = field.rect.height;
+    write!(&mut buf, "1 1 1 rg\n0 0 {w:.1} {h:.1} re f\n").unwrap();
+    write!(&mut buf, "0.5 0.5 0.5 RG\n0.5 w\n0 0 {w:.1} {h:.1} re S\n").unwrap();
+    let label = if field.value.is_empty() {
+        "Sign".to_string()
+    } else {
+        field.value.display()
+    };
+    write!(&mut buf, "BT\n/F1 9 Tf\n0.3 0.3 0.3 rg\n").unwrap();
+    write!(&mut buf, "4.0 {:.1} Td\n", (h - 12.0).max(2.0)).unwrap();
+    write!(&mut buf, "({}) Tj\nET\n", escape_pdf_string(&label)).unwrap();
+    buf
+}
+
+fn serialize_widget_dict_object(field: &FormField, widget_obj_num: u32, ap_obj_num: u32) -> Vec<u8> {
+    let ft = field.pdf_type_str();
+    let name = escape_pdf_string(&field.fully_qualified_name);
+    let value = match &field.value {
+        FieldValue::None => None,
+        FieldValue::Bool(true) => Some("Yes".to_string()),
+        FieldValue::Bool(false) => Some("Off".to_string()),
+        other => Some(other.display()),
+    };
+    let r = &field.rect;
+
+    let mut out = Vec::new();
+    let _ = writeln!(out, "{widget_obj_num} 0 obj");
+    let _ = write!(out, "<< /Type /Annot /Subtype /Widget /FT /{ft} ");
+    let _ = write!(
+        out,
+        "/Rect [{} {} {} {}] ",
+        r.x,
+        r.y,
+        r.x + r.width,
+        r.y + r.height
+    );
+    let _ = write!(out, "/T ({name}) ");
+    if let Some(ref v) = value {
+        let escaped = escape_pdf_string(v);
+        // Name values for buttons use /Yes style; text uses strings.
+        if matches!(field.field_type, FieldType::Checkbox | FieldType::RadioButton) {
+            let _ = write!(out, "/V /{} ", escaped.replace(' ', "_"));
+            let _ = write!(out, "/AS /{} ", escaped.replace(' ', "_"));
+        } else {
+            let _ = write!(out, "/V ({escaped}) ");
+        }
+    }
+    // Always-written appearance: never emit appearance-less widgets. [FR-FORM-1]
+    let _ = write!(out, "/AP << /N {ap_obj_num} 0 R >> ");
+    let _ = writeln!(out, "/F 4 >>");
+    let _ = writeln!(out, "endobj");
+    out
+}
+
 /// Escape special characters for a PDF literal string.
 fn escape_pdf_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -665,6 +870,58 @@ mod tests {
         assert_eq!(escape_pdf_string("a(b)c"), "a\\(b\\)c");
         assert_eq!(escape_pdf_string("back\\slash"), "back\\\\slash");
         assert_eq!(escape_pdf_string("new\nline"), "new\\nline");
+    }
+
+    #[test]
+    fn widget_text_appearance_contains_value() {
+        // [FR-FORM-1] filled text fields get an always-written appearance.
+        use crate::form::{FieldRect, FieldType, FieldValue, FormField};
+        let mut field =
+            FormField::new("amount", FieldType::Text, 0, FieldRect::new(10.0, 20.0, 100.0, 18.0));
+        field.set_value(FieldValue::Text("42.50".into()));
+        let ap = generate_widget_appearance(&field);
+        let text = String::from_utf8_lossy(&ap);
+        assert!(text.contains("42.50"), "missing value in AP: {text}");
+        assert!(text.contains("BT"), "expected text operators");
+    }
+
+    #[test]
+    fn widget_checkbox_checked_draws_mark() {
+        use crate::form::{FieldRect, FieldType, FieldValue, FormField};
+        let mut field =
+            FormField::new("agree", FieldType::Checkbox, 0, FieldRect::new(0.0, 0.0, 14.0, 14.0));
+        field.set_value(FieldValue::Bool(true));
+        let ap = generate_widget_appearance(&field);
+        let text = String::from_utf8_lossy(&ap);
+        assert!(
+            text.contains(" l ") || text.contains(" l\n") || text.contains("l S"),
+            "expected check path: {text}"
+        );
+    }
+
+    #[test]
+    fn build_widget_pdf_objects_always_writes_ap() {
+        // [FR-FORM-1] widget dict always references /AP.
+        use crate::form::{FieldRect, FieldType, FieldValue, FormField};
+        let mut field =
+            FormField::new("name", FieldType::Text, 0, FieldRect::new(50.0, 700.0, 120.0, 16.0));
+        field.set_value(FieldValue::Text("Ada".into()));
+        assert!(field.appearance.is_none());
+        let objs = build_widget_pdf_objects(&mut field, 40, 41);
+        assert!(field.appearance.is_some());
+        assert_eq!(objs.widget_obj_num, 40);
+        assert_eq!(objs.ap_obj_num, 41);
+        let widget_text = String::from_utf8_lossy(&objs.widget_bytes);
+        assert!(
+            widget_text.contains("/AP << /N 41 0 R >>"),
+            "widget missing /AP: {widget_text}"
+        );
+        assert!(widget_text.contains("/T (name)"));
+        assert!(widget_text.contains("/V (Ada)"));
+        let ap_text = String::from_utf8_lossy(&objs.ap_bytes);
+        assert!(ap_text.contains("41 0 obj"));
+        assert!(ap_text.contains("/Subtype /Form"));
+        assert!(ap_text.contains("Ada"));
     }
 
     #[test]

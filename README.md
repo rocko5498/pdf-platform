@@ -30,7 +30,7 @@ Precedence on conflict: ADR → SDS → PRD → UI/UX Design System → Implemen
 | **M2** Text / search | **Mostly complete** | Text cache, geometry IPC, find/copy, UTF-8-safe ligature/CJK find, `extraction_correctness` suite. Multi-engine corpus still expands. |
 | **M3** Mutation core | **Gate passed** | CoW, journal, incremental save, autosave recovery, fault-injection suite. |
 | **M4** Annotations | **Mostly complete** | Appearance streams, QuadPoints, tools, XFDF + interop unit matrix, incremental save with `/Annots` patch + XFDF sidecar. External Acrobat/Foxit lab still open. |
-| **M5** Forms JS | **Subset + Z1 wire** | `forms_js` AFSimple_Calculate subset, kill switch, honesty log, `CMD:FORMS_CALC` over worker. Full AcroForm product exit not claimed. |
+| **M5** Forms JS | **Subset + Z1 wire + AP** | `forms_js` subset, kill switch, honesty log, `CMD:FORMS_CALC`, widget `/AP` regen, shell Forms panel (`Ctrl+G`). COS field import not claimed. |
 | **M6** Assembly | **CLI (qpdf)** | merge / split / extract-pages / optimize + preflight honesty. Pure-Rust assembly deferred. |
 | **M7–M12** | Models ahead | Redaction/sign/OCR crates exist; product exits not claimed. |
 
@@ -79,7 +79,8 @@ The Qt shell requires Qt 6 (Widgets + OpenGLWidgets) and CMake. The Rust core bu
 | Ctrl+F | Find in document |
 | Ctrl+C | Copy current page text |
 | Ctrl+E | Export session annotations as XFDF |
-| Ctrl+S | Save PDF (incremental annots + XFDF sidecar) |
+| Ctrl+G | Run forms calculations + regenerate widget appearances |
+| Ctrl+S | Save PDF (incremental annots/forms + XFDF sidecar) |
 | PageUp/Down, wheel | Previous/next page |
 | Ctrl+wheel / Ctrl± | Zoom |
 | Enter (with tool) | Place annotation |

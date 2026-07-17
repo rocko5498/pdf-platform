@@ -14,7 +14,11 @@ use std::os::windows::io::AsRawHandle;
 use pdf_model::annotation::{
     Annotation, AnnotationStore, AnnotationType, Color, Rect, TextMarkupKind,
 };
-use pdf_model::appearance::{build_annotation_pdf_objects, generate_appearance};
+use pdf_model::appearance::{
+    build_annotation_pdf_objects, build_widget_pdf_objects, generate_appearance,
+};
+use pdf_model::form::{AcroForm, FieldCalculation, FieldRect, FieldType, FieldValue, FormField};
+use pdf_model::forms_js::run_form_calculations;
 use pdf_model::overlay::CowOverlay;
 use pdf_model::page_patch::inject_annot_refs;
 use pdf_write::IncrementalWriter;
@@ -39,6 +43,11 @@ struct DocSession {
     summary: StructuralSummary,
     /// Local annotation store for shell-authored markups. [FR-ANNOT, M4]
     annotations: AnnotationStore,
+    /// Session AcroForm fill model (widget AP regen). [FR-FORM, FR-JS, M5]
+    ///
+    /// COS field import from the open document is not yet wired; the shell
+    /// seeds a demo fill set so calc + appearance can be exercised honestly.
+    form: AcroForm,
     /// Cached page text for find/copy (page_index → full text + reliable).
     text_cache: std::collections::HashMap<u32, CachedPageText>,
     path: String,
@@ -145,6 +154,7 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
             original_offsets: std::collections::HashMap::new(),
         },
         annotations: AnnotationStore::new(),
+        form: AcroForm::new(),
         text_cache: std::collections::HashMap::new(),
         path: path.to_string(),
     };
@@ -269,6 +279,14 @@ fn diagnostics_impl() -> Result<String, String> {
         out.push_str(&format!(
             "Annotations (session): {}\n",
             session.annotations.all_annotations().len()
+        ));
+        out.push_str(&format!(
+            "Form fields (session): {}\n",
+            session.form.field_count()
+        ));
+        out.push_str(&format!(
+            "Forms JS enabled: {}\n",
+            session.form.javascript_enabled
         ));
         out.push_str(&format!("Text cache pages: {}\n", session.text_cache.len()));
         Ok(out)
@@ -552,12 +570,12 @@ fn save_document_impl(out_path: &str) -> Result<String, String> {
         let xfdf_path = std::path::Path::new(out_path).with_extension("xfdf");
         std::fs::write(&xfdf_path, xfdf.as_bytes()).map_err(|e| format!("xfdf write: {e}"))?;
 
-        if session.annotations.all_annotations().is_empty() {
+        if session.annotations.all_annotations().is_empty() && session.form.field_count() == 0 {
             if out_path != session.path {
                 std::fs::write(out_path, &original).map_err(|e| format!("copy: {e}"))?;
             }
             return Ok(format!(
-                "saved without annots; xfdf={}",
+                "saved without annots/forms; xfdf={}",
                 xfdf_path.display()
             ));
         }
@@ -630,6 +648,55 @@ fn save_document_impl(out_path: &str) -> Result<String, String> {
             overlay.set_object(page_obj_num, patched);
         }
 
+        // Form widgets with always-written /AP. [FR-FORM-1, M5]
+        let mut form_widget_count = 0u32;
+        if session.form.field_count() > 0 {
+            if session.form.needs_appearance_regen {
+                session.form.regenerate_appearances();
+            }
+            use std::collections::HashMap as HMap;
+            let mut form_by_page: HMap<u32, Vec<String>> = HMap::new();
+            for f in session.form.fields_in_tab_order() {
+                form_by_page
+                    .entry(f.page_index)
+                    .or_default()
+                    .push(f.fully_qualified_name.clone());
+            }
+            for (page_index, names) in form_by_page {
+                let page_obj_num = *page_objs.get(page_index as usize).ok_or_else(|| {
+                    format!("no page object for form page {page_index}")
+                })?;
+                let original_page = overlay
+                    .get_object(page_obj_num)
+                    .map(|s| s.to_vec())
+                    .or_else(|| get_object_bytes(session, page_obj_num).ok())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{page_obj_num} 0 obj\n<< /Type /Page /MediaBox [0 0 {} {}] >>\nendobj\n",
+                            session.page_width, session.page_height
+                        )
+                        .into_bytes()
+                    });
+                let mut widget_nums = Vec::new();
+                for name in names {
+                    if let Some(field) = session.form.field_mut(&name) {
+                        let objs =
+                            build_widget_pdf_objects(field, next_obj, next_obj + 1);
+                        overlay.set_object(objs.widget_obj_num, objs.widget_bytes);
+                        overlay.set_object(objs.ap_obj_num, objs.ap_bytes);
+                        widget_nums.push(objs.widget_obj_num);
+                        next_obj += 2;
+                        form_widget_count += 1;
+                    }
+                }
+                if !widget_nums.is_empty() {
+                    let patched = inject_annot_refs(&original_page, &widget_nums)
+                        .map_err(|e| format!("form page patch: {e}"))?;
+                    overlay.set_object(page_obj_num, patched);
+                }
+            }
+        }
+
         let prev_xref = {
             let text = String::from_utf8_lossy(&original);
             text.rfind("startxref")
@@ -656,14 +723,183 @@ fn save_document_impl(out_path: &str) -> Result<String, String> {
 
         std::fs::write(out_path, &out).map_err(|e| format!("write out: {e}"))?;
         Ok(format!(
-            "saved {} annots, {} objects, xfdf={}",
+            "saved {} annots, {} form widgets, {} objects, xfdf={}",
             session.annotations.all_annotations().len(),
+            form_widget_count,
             result.objects_written,
             xfdf_path.display()
         ))
     })
 }
 
+
+/// Seed a session form with a simple SUM calc demo. [FR-FORM-1, FR-JS-1, M5]
+fn seed_demo_form(form: &mut AcroForm, page_height: f32) {
+    *form = AcroForm::new();
+    form.has_javascript = true;
+    form.javascript_enabled = true;
+
+    let y0 = (page_height - 120.0).max(72.0);
+    let mut a = FormField::new("a", FieldType::Text, 0, FieldRect::new(72.0, y0, 80.0, 18.0));
+    a.tab_order = 1;
+    a.tooltip = "Addend a".into();
+    a.set_value(FieldValue::Text("10".into()));
+    form.add_field(a);
+
+    let mut b = FormField::new("b", FieldType::Text, 0, FieldRect::new(72.0, y0 - 28.0, 80.0, 18.0));
+    b.tab_order = 2;
+    b.tooltip = "Addend b".into();
+    b.set_value(FieldValue::Text("5".into()));
+    form.add_field(b);
+
+    let mut total =
+        FormField::new("total", FieldType::Text, 0, FieldRect::new(72.0, y0 - 56.0, 80.0, 18.0));
+    total.tab_order = 3;
+    total.tooltip = "Sum (calculated)".into();
+    total.read_only = true;
+    total.calculation = Some(FieldCalculation {
+        expression: r#"AFSimple_Calculate("SUM", ["a","b"])"#.into(),
+        dependencies: vec!["a".into(), "b".into()],
+        enabled: true,
+    });
+    form.add_field(total);
+    form.calculation_order = vec!["total".into()];
+    form.regenerate_appearances();
+}
+
+/// List session form fields (tab order). [FR-FORM, M5]
+fn list_form_fields_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        if session.form.field_count() == 0 {
+            return Ok(
+                "count=0\nnote=session form empty; use seed_form_demo for fill model (COS import deferred)\n"
+                    .into(),
+            );
+        }
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "count={}\nhas_js={}\njs_enabled={}\nneeds_ap={}\nnote=session fill model (COS field import deferred)\n",
+            session.form.field_count(),
+            session.form.has_javascript || session.form.detect_javascript(),
+            session.form.javascript_enabled,
+            session.form.needs_appearance_regen,
+        ));
+        for f in session.form.fields_in_tab_order() {
+            let ap = if f.appearance.is_some() { "yes" } else { "no" };
+            let ro = if f.read_only { "ro" } else { "rw" };
+            let calc = if f.calculation.is_some() { "calc" } else { "-" };
+            lines.push(format!(
+                "{}\t{}\t{}\t{}\t{}\tap={}",
+                f.fully_qualified_name,
+                f.pdf_type_str(),
+                f.value.display(),
+                ro,
+                calc,
+                ap
+            ));
+        }
+        Ok(lines.join("\n"))
+    })
+}
+
+/// Seed the session form with the demo calc set. [FR-FORM, FR-JS, M5]
+fn seed_form_demo_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        seed_demo_form(&mut session.form, session.page_height);
+        Ok(format!(
+            "seeded {} fields (a,b,total SUM); appearances regenerated",
+            session.form.field_count()
+        ))
+    })
+}
+
+/// Set a session form field value and regenerate its appearance. [FR-FORM-1]
+fn set_form_field_impl(name: &str, value: &str) -> Result<String, String> {
+    with_session_mut(|session| {
+        if session.form.field_count() == 0 {
+            seed_demo_form(&mut session.form, session.page_height);
+        }
+        let Some(field) = session.form.field(name) else {
+            return Err(format!("unknown field: {name}"));
+        };
+        if field.read_only && field.calculation.is_some() {
+            return Err(format!(
+                "field {name} is calculation-driven; edit dependencies and run_forms_calc"
+            ));
+        }
+        let new_value = match field.field_type {
+            FieldType::Checkbox => FieldValue::Bool(
+                value.eq_ignore_ascii_case("yes")
+                    || value.eq_ignore_ascii_case("true")
+                    || value == "1"
+                    || value.eq_ignore_ascii_case("on"),
+            ),
+            FieldType::RadioButton | FieldType::ComboBox | FieldType::ListBox => {
+                FieldValue::Choice(value.to_string())
+            }
+            _ => FieldValue::Text(value.to_string()),
+        };
+        let changed = session.form.set_field_value(name, new_value);
+        if changed {
+            session.form.regenerate_appearances();
+        }
+        let ap = session
+            .form
+            .field(name)
+            .and_then(|f| f.appearance.as_ref())
+            .map(|b| b.len())
+            .unwrap_or(0);
+        Ok(format!(
+            "field={name} changed={changed} ap_bytes={ap} value={}",
+            session
+                .form
+                .field(name)
+                .map(|f| f.value.display())
+                .unwrap_or_default()
+        ))
+    })
+}
+
+/// Run forms JS subset calculations and regenerate appearances. [FR-JS-1, FR-FORM-1]
+fn run_forms_calc_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        if session.form.field_count() == 0 {
+            seed_demo_form(&mut session.form, session.page_height);
+        }
+        let result = run_form_calculations(&mut session.form);
+        // Always regen AP after calc path (values may have changed).
+        let ap_n = session.form.regenerate_appearances();
+        let mut out = format!(
+            "updated={:?}\nap_fields={ap_n}\njs_enabled={}\n",
+            result.updated_fields, session.form.javascript_enabled
+        );
+        for name in &result.updated_fields {
+            if let Some(f) = session.form.field(name) {
+                out.push_str(&format!(
+                    "  {name}={} ap={}\n",
+                    f.value.display(),
+                    f.appearance.is_some()
+                ));
+            }
+        }
+        for e in &result.log {
+            out.push_str(&format!(
+                "log: [{}] {}\n",
+                if e.unsupported { "unsupported" } else { "info" },
+                e.detail
+            ));
+        }
+        Ok(out)
+    })
+}
+
+/// Toggle or query forms JS kill switch. [FR-JS-4]
+fn set_forms_js_enabled_impl(enabled: bool) -> Result<String, String> {
+    with_session_mut(|session| {
+        session.form.javascript_enabled = enabled;
+        Ok(format!("forms_js_enabled={enabled}"))
+    })
+}
 
 fn page_count_impl() -> Result<u32, String> {
     with_session_mut(|session| Ok(session.page_count))
@@ -725,5 +961,15 @@ mod ffi {
         fn import_xfdf_impl(xml: &str) -> Result<u32>;
         fn annotation_count_impl() -> Result<u32>;
         fn save_document_impl(out_path: &str) -> Result<String>;
+        /// List session form fields (tab order). [FR-FORM, M5]
+        fn list_form_fields_impl() -> Result<String>;
+        /// Seed demo form (a,b,total SUM) for fill/calc/AP. [FR-FORM, FR-JS]
+        fn seed_form_demo_impl() -> Result<String>;
+        /// Set field value; regenerates widget /AP. [FR-FORM-1]
+        fn set_form_field_impl(name: &str, value: &str) -> Result<String>;
+        /// Run forms JS subset + regenerate appearances. [FR-JS-1, FR-FORM-1]
+        fn run_forms_calc_impl() -> Result<String>;
+        /// Forms JS kill switch. [FR-JS-4]
+        fn set_forms_js_enabled_impl(enabled: bool) -> Result<String>;
     }
 }
