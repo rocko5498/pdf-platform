@@ -24,6 +24,9 @@ GATES = [
     ("**/outline_panel.cc", r"setAccessibleName", "outline panel name"),
     ("**/diagnostics_panel.cc", r"setAccessibleName", "diagnostics panel name"),
     ("**/annotation_tools.cc", r"setAccessibleName", "annotation toolbar name"),
+    ("**/forms_panel.cc", r"setAccessibleName", "forms panel name"),
+    ("**/forms_panel.cc", r"setAccessibleDescription", "forms panel description"),
+    ("**/canvas.cc", r"documentStatus|announceDocumentStatus|ValueChanged", "page status a11y announce"),
     ("**/ui-registry.toml", r"open_document|focus_canvas", "shortcut registry stability"),
     ("**/main.cc", r"installAccessibility", "app installs a11y at startup"),
 ]

@@ -3,6 +3,7 @@
 
 #include <QAccessible>
 #include <QWidget>
+#include <QVariant>
 
 namespace pdf_platform {
 
@@ -53,12 +54,21 @@ CanvasAccessible::CanvasAccessible(QWidget* widget)
       document_status_(QStringLiteral("No document open")) {}
 
 QString CanvasAccessible::text(QAccessible::Text t) const {
+    // Live status on canvas property so MainWindow can update without holding
+    // a CanvasAccessible* (factory-created). [NFR-A11Y, AQA-10, SDS §14 M1]
+    QString live = document_status_;
+    if (QObject* o = object()) {
+        const QVariant v = o->property("documentStatus");
+        if (v.isValid() && !v.toString().isEmpty()) {
+            live = v.toString();
+        }
+    }
     switch (t) {
     case QAccessible::Name:
         return QStringLiteral("Document canvas");
     case QAccessible::Description:
     case QAccessible::Value:
-        return document_status_;
+        return live;
     default:
         return QAccessibleWidget::text(t);
     }

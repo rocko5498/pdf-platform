@@ -9,6 +9,7 @@
 #include "forms_panel.h"
 #include "outline_panel.h"
 
+#include <QAccessible>
 #include <QApplication>
 #include <QClipboard>
 #include <QDockWidget>
@@ -373,6 +374,7 @@ bool MainWindow::openDocumentWithPassword(const QString& path, const QString& pa
 
     setWindowTitle(QStringLiteral("PDF Platform - %1 (%2 pages)").arg(path_).arg(page_count_));
     refreshPanels();
+    announceDocumentStatus();
     canvas_->setFocus(Qt::OtherFocusReason);
     statusBar()->showMessage(
         QStringLiteral("Opened %1 pages | leniency %2 | GPU %3")
@@ -586,6 +588,22 @@ void MainWindow::setFormsJsEnabled(bool enabled) {
     }
 }
 
+
+void MainWindow::announceDocumentStatus() {
+    if (!canvas_) {
+        return;
+    }
+    QString status;
+    if (page_count_ == 0) {
+        status = QStringLiteral("No document open");
+    } else {
+        status = QStringLiteral("Page %1 of %2").arg(current_page_ + 1).arg(page_count_);
+    }
+    canvas_->setProperty("documentStatus", status);
+    QAccessibleEvent ev(canvas_, QAccessible::ValueChanged);
+    QAccessible::updateAccessibility(&ev);
+}
+
 void MainWindow::goToPage(int page) {
     if (page_count_ == 0) return;
     if (page < 0) page = 0;
@@ -593,6 +611,7 @@ void MainWindow::goToPage(int page) {
     current_page_ = uint32_t(page);
     canvas_->clearSelectionOverlay();
     renderCurrentPage();
+    announceDocumentStatus();
 }
 
 void MainWindow::zoomBy(int steps) {

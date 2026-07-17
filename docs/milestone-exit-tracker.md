@@ -10,10 +10,10 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M0** | Corpus-diff + CI | **Met** | GitHub Actions |
 | **M0** | Cold-start / first-page budgets | **Met** | ~11ms / ~13ms recorded |
 | **M0** | Sandbox confinement | **Advisory + review package** | `docs/security/confinement-review-package.md`; `confinement_report()`; no silent enforce |
-| **M0/M1** | Shell open→shmem→tile (Windows) | **Hardened (code)** | Path rejoin for spaces; shmem **pointer** not file HANDLE; password dialog only on encrypt; absolute paths. **Human smoke still required** |
+| **M0/M1** | Shell open→shmem→tile (Windows) | **Met (smoke)** | Human open+view; path/shmem/password hardened; single PDFium engine; resilient panels |
 | **M1** | Multi-page + zoom + scroll | **Mostly** | Continuous multi-tile composite + wheel scroll |
-| **M1** | Outline / layers / attachments | **Mostly** | Live worker queries + dock panels |
-| **M1** | Diagnostics / leniency | **Mostly** | Panel + CLI + FFI |
+| **M1** | Outline / layers / attachments | **Mostly** | Single engine serves Structure; empty outline OK when doc has none |
+| **M1** | Diagnostics / leniency | **Mostly** | Panel isolated refresh; shows path/pages/flags after open |
 | **M1** | Accessible chrome | **Mostly** | QAccessible + focus/keyboard |
 | **M1** | Encrypted open | **Mostly** | Password prompt + env password to worker |
 | **M1** | Formal a11y audit | **Partial** | `tools/a11y_audit.py` CI + `docs/a11y-audit-checklist.md` manual |
@@ -38,4 +38,4 @@ Update when a criterion is proven by test, bench, or audited demo.
 1. No M4+ *shipping* without M3 fault gate — **satisfied**.  
 2. Corpus/interop/bench updates with milestones — **in progress**.  
 3. GUI/CLI parity where meaningful — **CLI ahead on structure/find; GUI catching up**.  
-4. Releasable builds per milestone — **M0 yes; M1–M4 approaching**. Substrate open path code-hardened; **human shell smoke still required before claim**.
+4. Releasable builds per milestone — **M0 yes; M1–M4 approaching**. Open→view human-smoked; M1 a11y/p95 manual/hardware gates still open.
