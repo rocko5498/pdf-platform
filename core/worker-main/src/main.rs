@@ -54,22 +54,27 @@ fn main() -> ExitCode {
     // Read password for encrypted documents (passed as env var by coordinator).
     let password: Option<String> = adopt_password();
 
-    // Load the rendering engine from the inherited document handle.
-    // Falls back to stub if PDFium is unavailable or no document is attached.
-    let engine: Option<Box<dyn Rasterize>> = doc_file.as_ref().and_then(|f| {
-        create_engine(f, password.as_deref())
+        // ONE engine instance per document. Re-opening the same inherited handle for
+    // Structure/Extract after Rasterize already loaded PDFium fails, which made
+    // outline/layers report "no engine loaded" while tiles still rendered. [ADR-005]
+    #[cfg(feature = "pdfium")]
+    let pdfium: Option<engine_pdfium::PdfiumEngine> = doc_file.as_ref().and_then(|f| {
+        match engine_pdfium::PdfiumEngine::from_file_handle_with_password(f, password.as_deref()) {
+            Ok(engine) => {
+                eprintln!(
+                    "worker: loaded PDFium engine ({} pages)",
+                    Rasterize::page_count(&engine)
+                );
+                Some(engine)
+            }
+            Err(e) => {
+                eprintln!("worker: PDFium load failed (tiles may use stub): {e}");
+                None
+            }
+        }
     });
-
-    // Also get a Structure reference for outline/layers/attachments queries.
-    // SAFETY: PdfiumEngine is the only concrete type and implements both traits.
-    let structure_engine: Option<Box<dyn engine_api::structure::Structure>> = doc_file.as_ref().and_then(|f| {
-        create_structure_engine(f, password.as_deref())
-    });
-
-    // Extract engine for text extraction. [ADR-019, M2]
-    let extract_engine: Option<Box<dyn Extract>> = doc_file.as_ref().and_then(|f| {
-        create_extract_engine(f, password.as_deref())
-    });
+    #[cfg(not(feature = "pdfium"))]
+    let pdfium: Option<()> = None;
 
     loop {
         match transport.recv_timeout(Duration::from_secs(1)) {
@@ -95,7 +100,7 @@ fn main() -> ExitCode {
                             row,
                         } => {
                             handle_render_tile_typed(
-                                &engine,
+                                pdfium.as_ref().map(|e| e as &dyn Rasterize),
                                 &shmem_file,
                                 correlation_id,
                                 page,
@@ -112,16 +117,33 @@ fn main() -> ExitCode {
                             );
                         }
                         Command::ExtractPage { correlation_id, page_index } => {
-                            handle_extract_page(&extract_engine, correlation_id, page_index, &mut transport);
+                            handle_extract_page(
+                                pdfium.as_ref().map(|e| e as &dyn Extract),
+                                correlation_id,
+                                page_index,
+                                &mut transport,
+                            );
                         }
                         Command::GetOutline { correlation_id } => {
-                            handle_get_outline(&structure_engine, correlation_id, &mut transport);
+                            handle_get_outline(
+                                pdfium.as_ref().map(|e| e as &dyn engine_api::structure::Structure),
+                                correlation_id,
+                                &mut transport,
+                            );
                         }
                         Command::GetLayers { correlation_id } => {
-                            handle_get_layers(&structure_engine, correlation_id, &mut transport);
+                            handle_get_layers(
+                                pdfium.as_ref().map(|e| e as &dyn engine_api::structure::Structure),
+                                correlation_id,
+                                &mut transport,
+                            );
                         }
                         Command::GetAttachments { correlation_id } => {
-                            handle_get_attachments(&structure_engine, correlation_id, &mut transport);
+                            handle_get_attachments(
+                                pdfium.as_ref().map(|e| e as &dyn engine_api::structure::Structure),
+                                correlation_id,
+                                &mut transport,
+                            );
                         }
                         Command::GetObject { correlation_id, obj_num } => {
                             handle_get_object(&doc_file, correlation_id, obj_num, &mut transport);
@@ -191,7 +213,7 @@ fn handle_inspect(doc_file: &Option<File>, correlation_id: u64, transport: &mut 
 }
 
 fn handle_render_tile_typed(
-    engine: &Option<Box<dyn Rasterize>>,
+    engine: Option<&dyn Rasterize>,
     shmem_file: &Option<File>,
     correlation_id: u64,
     page: u32,
@@ -269,12 +291,12 @@ fn handle_render_tile_typed(
 }
 
 fn handle_extract_page(
-    extract_engine: &Option<Box<dyn engine_api::extract::Extract>>,
+    extract_engine: Option<&dyn Extract>,
     correlation_id: u64,
     page_index: u32,
     transport: &mut Box<dyn protocol::transport::WorkerTransport>,
 ) {
-    let Some(engine) = extract_engine.as_ref() else {
+    let Some(engine) = extract_engine else {
         send_error(transport, correlation_id, "no extract engine loaded");
         return;
     };
@@ -318,11 +340,11 @@ fn handle_extract_page(
 }
 
 fn handle_get_outline(
-    structure_engine: &Option<Box<dyn engine_api::structure::Structure>>,
+    structure_engine: Option<&dyn engine_api::structure::Structure>,
     correlation_id: u64,
     transport: &mut Box<dyn protocol::transport::WorkerTransport>,
 ) {
-    let Some(structure) = structure_engine.as_ref() else {
+    let Some(structure) = structure_engine else {
         send_error(transport, correlation_id, "no engine loaded");
         return;
     };
@@ -348,11 +370,11 @@ fn handle_get_outline(
 }
 
 fn handle_get_layers(
-    structure_engine: &Option<Box<dyn engine_api::structure::Structure>>,
+    structure_engine: Option<&dyn engine_api::structure::Structure>,
     correlation_id: u64,
     transport: &mut Box<dyn protocol::transport::WorkerTransport>,
 ) {
-    let Some(structure) = structure_engine.as_ref() else {
+    let Some(structure) = structure_engine else {
         send_error(transport, correlation_id, "no engine loaded");
         return;
     };
@@ -377,11 +399,11 @@ fn handle_get_layers(
 }
 
 fn handle_get_attachments(
-    structure_engine: &Option<Box<dyn engine_api::structure::Structure>>,
+    structure_engine: Option<&dyn engine_api::structure::Structure>,
     correlation_id: u64,
     transport: &mut Box<dyn protocol::transport::WorkerTransport>,
 ) {
-    let Some(structure) = structure_engine.as_ref() else {
+    let Some(structure) = structure_engine else {
         send_error(transport, correlation_id, "no engine loaded");
         return;
     };

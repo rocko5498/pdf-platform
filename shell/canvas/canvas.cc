@@ -479,36 +479,58 @@ bool MainWindow::renderVisibleTiles() {
 
 
 void MainWindow::refreshPanels() {
-    try {
-        if (outline_) {
+    // Each panel independently — one worker query must not blank diagnostics. [FR-DIAG, PRIN-6]
+    QStringList panel_notes;
+
+    if (outline_) {
+        try {
             QString data = QString::fromStdString(get_outline());
-            // Parse entries= from first line if present
             int entries = 0, total = 0;
-            for (const QString& line : data.split('\n')) {
-                if (line.startsWith("entries=")) entries = line.mid(8).toInt();
-                if (line.startsWith("total=")) total = line.mid(6).toInt();
+            for (const QString& line : data.split(QLatin1Char('\n'))) {
+                if (line.startsWith(QLatin1String("entries="))) entries = line.mid(8).toInt();
+                if (line.startsWith(QLatin1String("total="))) total = line.mid(6).toInt();
             }
             outline_->setOutlineData(data, entries, total > 0 ? total : entries);
-        }
-        if (diagnostics_) {
-            QString report = QString::fromStdString(diagnostics());
-            QString len = QString::fromStdString(leniency_events());
-            QStringList events = len.isEmpty() ? QStringList{} : len.split('\n', Qt::SkipEmptyParts);
-            // Also surface layers/attachments summary
-            try {
-                report += QStringLiteral("\n\nLayers:\n") + QString::fromStdString(get_layers());
-                report += QStringLiteral("\n\nAttachments:\n") + QString::fromStdString(get_attachments());
-                report += QStringLiteral("\nAnnotations: ") + QString::number(annotation_count());
-            } catch (...) {
-            }
-            diagnostics_->setReport(report, events);
-        }
-        refreshFormsPanel();
-    } catch (const std::exception& e) {
-        if (diagnostics_) {
-            diagnostics_->setReport(QString("Panel refresh: %1").arg(e.what()), {});
+        } catch (const std::exception& e) {
+            outline_->setOutlineData(QStringLiteral("outline_error=%1").arg(e.what()), 0, 0);
+            panel_notes << QStringLiteral("outline: %1").arg(e.what());
         }
     }
+
+    if (diagnostics_) {
+        QString report;
+        QStringList events;
+        try {
+            report = QString::fromStdString(diagnostics());
+            QString len = QString::fromStdString(leniency_events());
+            events = len.isEmpty() ? QStringList{} : len.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        } catch (const std::exception& e) {
+            report = QStringLiteral("diagnostics: %1").arg(e.what());
+            panel_notes << report;
+        }
+        try {
+            report += QStringLiteral("\n\nLayers:\n") + QString::fromStdString(get_layers());
+        } catch (const std::exception& e) {
+            report += QStringLiteral("\n\nLayers: %1").arg(e.what());
+            panel_notes << QStringLiteral("layers: %1").arg(e.what());
+        }
+        try {
+            report += QStringLiteral("\n\nAttachments:\n") + QString::fromStdString(get_attachments());
+        } catch (const std::exception& e) {
+            report += QStringLiteral("\n\nAttachments: %1").arg(e.what());
+            panel_notes << QStringLiteral("attachments: %1").arg(e.what());
+        }
+        try {
+            report += QStringLiteral("\nAnnotations: ") + QString::number(annotation_count());
+        } catch (...) {
+        }
+        if (!panel_notes.isEmpty()) {
+            report += QStringLiteral("\n\nPanel notes:\n- ") + panel_notes.join(QStringLiteral("\n- "));
+        }
+        diagnostics_->setReport(report, events);
+    }
+
+    refreshFormsPanel();
 }
 
 void MainWindow::refreshFormsPanel() {
