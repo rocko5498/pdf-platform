@@ -39,3 +39,19 @@ Update when a criterion is proven by test, bench, or audited demo.
 2. Corpus/interop/bench updates with milestones — **in progress**.  
 3. GUI/CLI parity where meaningful — **CLI ahead on structure/find; GUI catching up**.  
 4. Releasable builds per milestone — **M0 yes; M1–M4 approaching**. Open→view human-smoked; M1 a11y/p95 manual/hardware gates still open.
+
+### Local release-gates automated (agent run, no invented numbers)
+
+| Gate | Result |
+|---|---|
+| coordinator pipeline_e2e | 12 passed |
+| pdf-model lib | 89 passed |
+| sandbox confinement | 4 passed |
+| text-extract extraction_correctness | 8 passed |
+| pdf-model interop_matrix | 2 passed |
+| coordinator fault_injection | 7 passed |
+| a11y_audit.py | 12 gates OK |
+| check_p95_gates.py | OK (definition) |
+| corpus-diff | 2 fixtures PASS |
+| Hard p95 on ref hardware | Not run (lab) |
+| Manual SR audit | Not run (lab) |
