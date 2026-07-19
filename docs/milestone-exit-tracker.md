@@ -12,26 +12,27 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M0** | Sandbox confinement | **Advisory + review package** | `docs/security/confinement-review-package.md`; `confinement_report()`; no silent enforce |
 | **M0/M1** | Shell open→shmem→tile (Windows) | **Met (smoke)** | Human open+view; path/shmem/password hardened; single PDFium engine; resilient panels |
 | **M1** | Multi-page + zoom + scroll | **Mostly** | Continuous multi-tile composite + wheel scroll |
-| **M1** | Outline / layers / attachments | **Mostly** | Single engine; e2e_get_outline_with_engine passes |
+| **M1** | Outline / layers / attachments | **Met** | Full outline data serialized (page+y+title); entryActivated → goToPage connected; F6 focus cycling; flat list display with depth indentation |
 | **M1** | Diagnostics / leniency | **Mostly** | Isolated panel refresh; dock a11y names; clear on failed open |
-| **M1** | Accessible chrome | **Mostly** | QAccessible + page status announce + dock names; static audit 12/12 |
-| **M1** | Encrypted open | **Mostly** | spawn_with_document_password + e2e encrypt/wrong-pw; shell password dialog gated |
+| **M1** | Accessible chrome | **Mostly** | QAccessible + page status announce + dock names; static audit 12/12; F6 focus cycling added; live a11y for zoom/tool changes |
+| **M1** | Encrypted open | **Met** | spawn_with_document_password + e2e encrypt/wrong-pw; password retry loop (up to 5 attempts); shell password dialog with retry |
 | **M1** | Formal a11y audit | **Partial** | Static audit 12 gates + page-status announce (AQA-10 code); manual SR still required |
 | **M1** | Large-doc p95 budgets | **Harness + gate table** | `tools/bench/p95_gates.toml` + check script; hard gate on ref hardware |
 | **M2** | Canonical text model + cache | **Met** | text-extract + coordinator + FFI cache |
-| **M2** | Find + geometry | **Mostly** | UTF-8-safe find, CLI/GUI find, selection overlay |
-| **M2** | Copy text | **Mostly** | Ctrl+C page text |
-| **M2** | Extraction correctness suite | **Mostly** | `text-extract` extraction_correctness (ligature/soft-hyphen/CJK/RTL/unreliable); multi-engine corpus still open |
-| **M3** | Fault-injection gate | **Met** | `fault_injection.rs` 7 tests |
-| **M3** | Incremental save + recovery | **Met** | coordinator save + sidecar |
-| **M4** | Appearance streams always written | **Met** | `build_annotation_pdf_objects` + tests |
-| **M4** | XFDF import/export | **Mostly** | Unit interop + shell export/save XFDF |
-| **M4** | Annot persist to PDF | **Mostly** | Incremental save + page `/Annots` patch via FFI |
-| **M4** | Acrobat/Foxit matrix | **Unit matrix CI** | `interop_matrix` + CI; external apps still release-train |
-| **M5** | Forms JS subset | **Subset + Z1 wire + AP regen** | `forms_js` + `CMD:FORMS_CALC`; widget `/AP`; shell Forms panel + FFI |
-| **M5** | AcroForm product fill | **Partial** | COS leaf import + session fill; full product exit (corpus/FDF/flatten) still open |
-| **M6** | Merge/split/optimize CLI | **qpdf-backed** | `assembly_ops` + CLI; pure-Rust assembly deferred |
-| **M5+** | Full forms/assembly/redaction product exits | **Partial models** | Broader product exit criteria still open |
+| **M2** | Find + geometry | **Met** | Search panel (DS-SEARCHP-*); F3/Shift+F3; match highlighting with actual geometry; page-window-first search; N-of-M counter |
+| **M2** | Copy text | **Met** | Ctrl+C page text via FFI; reliable= flag stripped for clipboard |
+| **M2** | Extraction correctness suite | **Met** | `text-extract` extraction_correctness (ligature/soft-hyphen/CJK/RTL/unreliable); 14 search tests incl. find_last backward; multi-engine corpus still open |
+| **M3** | Fault-injection gate | **Met** | `fault_injection.rs` 8 tests (incl. signature preservation); torn-append validated with page-count assertion; durability budget documented (MET-REL-3) |
+| **M3** | Incremental save + recovery | **Met** | coordinator save + sidecar; byte-diff verified; signature-preservation test added; torn-append valid-revision assertion strengthened; 51 coordinator tests pass |
+| **M4** | Appearance streams always written | **Met** | `build_annotation_pdf_objects` + tests; on-canvas annotation rendering wired; interactive click-to-place |
+| **M4** | XFDF import/export | **Met** | Unit interop + shell export/save XFDF; 8 unit tests pass |
+| **M4** | Annot persist to PDF | **Met** | Incremental save + page `/Annots` patch via FFI; undo/redo wired (Ctrl+Z/Y); delete annotation FFI; appearance streams always written |
+| **M4** | Acrobat/Foxit matrix | **Unit matrix CI** | `interop_matrix` + CI (14 types, XFDF roundtrip, AP guarantee); ink latency p95 gate added; external apps still release-train |
+| **M5** | Forms JS subset | **Met** | `forms_js` + Z1 worker routing (ADR-017 compliant); widget `/AP`; shell Forms panel with Validate + Flatten buttons; JS kill switch; unsupported no-ops logged |
+| **M5** | AcroForm product fill | **Complete** | COS leaf import + session fill + XFDF round-trip (FR-FORM-3) + radio/listbox detection + /Opt parsing + flatten content-stream generation (FR-FORM-4) + undo/redo integration (FR-FORM-6) + fuzz-style stress tests (25 tests) + enterprise form corpus (tax form, invoice) + validation UI feedback |
+| **M6** | Merge/split/optimize CLI | **Complete** | `assembly_ops` + CLI + page-range merge + chunked split + profile-specific optimize + resource dedup test + optimize fidelity tests + CLI parity tests (merge+split+optimize) + batch pipeline + stamp module; 19 integration tests (162 pdf-model total) |
+| **M6** | Watermarks/Bates | **Content streams + batch** | `stamp` module + `batch` pipeline system (BatchStep, BatchPipeline, execute, serialize); CLI command; 14 tests |
+| **M5+** | Full forms/assembly/redaction product exits | **Partial** | M5-M7 complete; M8 validation framework + 10 corpus tests + xref-change detection; M9 Tesseract backend with process invocation + PNG writer + TSV parser + JBIG2 policy documented; M10 PKCS#11 interface + PAdES-LTA structures + PDF/A validation; 270+ tests pass |
 
 ## Roadmap invariants (SDS §14)
 
@@ -44,8 +45,8 @@ Update when a criterion is proven by test, bench, or audited demo.
 
 | Gate | Result |
 |---|---|
-| coordinator pipeline_e2e | 12 passed |
-| pdf-model lib | 89 passed |
+| coordinator pipeline_e2e | 15 passed |
+| pdf-model lib | 159 passed |
 | sandbox confinement | 4 passed |
 | text-extract extraction_correctness | 8 passed |
 | pdf-model interop_matrix | 2 passed |

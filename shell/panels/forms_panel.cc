@@ -57,10 +57,18 @@ FormsPanel::FormsPanel(QWidget* parent) : QWidget(parent) {
     js_toggle_->setCheckable(true);
     js_toggle_->setChecked(true);
     js_toggle_->setAccessibleName(QStringLiteral("Forms JavaScript kill switch"));
+    validate_btn_ = new QPushButton(QStringLiteral("Validate"), this);
+    validate_btn_->setObjectName(QStringLiteral("formsValidate"));
+    validate_btn_->setAccessibleName(QStringLiteral("Validate form fields"));
+    flatten_btn_ = new QPushButton(QStringLiteral("Flatten"), this);
+    flatten_btn_->setObjectName(QStringLiteral("formsFlatten"));
+    flatten_btn_->setAccessibleName(QStringLiteral("Flatten form fields to page content"));
     btn_row->addWidget(apply_btn_);
     btn_row->addWidget(calc_btn_);
     btn_row->addWidget(seed_btn_);
     btn_row->addWidget(js_toggle_);
+    btn_row->addWidget(validate_btn_);
+    btn_row->addWidget(flatten_btn_);
     layout->addLayout(btn_row);
 
     connect(list_, &QListWidget::itemSelectionChanged, this, &FormsPanel::onSelectionChanged);
@@ -73,6 +81,8 @@ FormsPanel::FormsPanel(QWidget* parent) : QWidget(parent) {
         js_toggle_->setText(on ? QStringLiteral("JS: on") : QStringLiteral("JS: off"));
         emit jsEnabledRequested(on);
     });
+    connect(validate_btn_, &QPushButton::clicked, this, [this]() { emit validateRequested(); });
+    connect(flatten_btn_, &QPushButton::clicked, this, [this]() { emit flattenRequested(); });
 }
 
 void FormsPanel::setFieldsData(const QString& data) {

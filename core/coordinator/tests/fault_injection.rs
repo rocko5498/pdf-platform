@@ -201,19 +201,22 @@ fn fault_inject_torn_append_truncates_to_valid() {
 
     let path = temp_pdf(&torn, "torn-append");
 
-    // The scanner should either:
-    // a) Find the ORIGINAL xref (via startxref in original bytes) — valid
-    // b) Find the torn xref and fail — leniency event recorded
-    // Either way: no crash, no panic.
+    // The scanner MUST either:
+    // a) Find the ORIGINAL xref (via startxref in original bytes) → valid revision (3 pages)
+    // b) Find the torn xref and detect it's incomplete → fail gracefully with leniency
+    // NEVER: crash, panic, or silently use the torn revision.
     let result = scan_structure(&path);
     match result {
         Ok(ds) => {
-            // If scan succeeded, it found the original xref.
-            assert_eq!(ds.page_count, 3, "original page count preserved");
+            // Scanner found the original xref — valid-revision guarantee [SDS §10.5].
+            assert_eq!(ds.page_count, 3,
+                "torn-append must resolve to original valid revision (3 pages), not the torn one");
         }
         Err(e) => {
-            // If scan failed, it's a leniency event, not a crash.
-            eprintln!("torn append detected: {e} — expected behavior");
+            // Scanner detected torn xref and failed gracefully — acceptable.
+            // The key assertion: it did NOT crash or produce a valid result
+            // with wrong page count.
+            eprintln!("torn append detected and rejected: {e} — expected behavior");
         }
     }
 
@@ -390,5 +393,87 @@ fn fault_inject_save_clears_sidecar() {
 
     coord2.close().expect("close");
     std::fs::remove_file(&save_path).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// FI-8: Incremental save preserves signature objects [ADR-012, SDS §3.4]
+//
+// By construction, IncrementalWriter only appends dirty objects from the
+// overlay. Signature dictionaries (/ByteRange, /Contents) are never dirty
+// at M3, so their original bytes are preserved. This test verifies that
+// claim explicitly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fault_inject_incremental_save_preserves_signatures() {
+    // Build a PDF with a signature dictionary (obj 4).
+    let mut buf = Vec::with_capacity(512);
+    let mut offsets = Vec::new();
+
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    // obj 1: Catalog
+    offsets.push(buf.len() as u32);
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    // obj 2: Pages
+    offsets.push(buf.len() as u32);
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // obj 3: Page
+    offsets.push(buf.len() as u32);
+    buf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n");
+
+    // obj 4: Signature dictionary (the bytes we must preserve)
+    let sig_content = b"4 0 obj\n<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 100 200 50] /Contents (FAKE_SIG_DATA_HERE_1234567890) >>\nendobj\n";
+    offsets.push(buf.len() as u32);
+    let sig_offset_in_original = buf.len() as u32;
+    buf.extend_from_slice(sig_content);
+
+    let original_sig_bytes = sig_content.to_vec();
+
+    // xref
+    let xref_offset = buf.len() as u32;
+    write!(&mut buf, "xref\n0 5\n").unwrap();
+    buf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        write!(&mut buf, "{:010} 00000 n \n", offset).unwrap();
+    }
+    write!(buf, "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_offset).unwrap();
+
+    let original_bytes = buf.clone();
+    let original_offsets: HashMap<u32, u32> = offsets.iter().enumerate()
+        .map(|(i, &off)| ((i + 1) as u32, off)).collect();
+
+    // Modify object 3 (a page) — NOT the signature.
+    let mut overlay = CowOverlay::new();
+    overlay.set_object(3, b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Modified true >>\nendobj\n".to_vec());
+    overlay.bump_revision();
+
+    let mut output = original_bytes.clone();
+    IncrementalWriter::write_incremental(
+        &mut output,
+        &overlay,
+        0,
+        5,
+        &original_offsets,
+        original_bytes.len() as u32,
+    ).expect("incremental write");
+
+    // The signature object bytes must appear in the output at their
+    // original location (untouched region before the append point).
+    let output_sig_region = &output[sig_offset_in_original as usize..][..original_sig_bytes.len()];
+    assert_eq!(
+        output_sig_region,
+        &original_sig_bytes,
+        "signature object bytes must be preserved byte-for-byte after incremental save"
+    );
+
+    // Verify the saved PDF scans valid.
+    let path = temp_pdf(&output, "sig-preserve");
+    let ds = scan_structure(&path).expect("saved PDF with signature should be valid");
+    assert_eq!(ds.page_count, 1, "page count preserved");
+
     std::fs::remove_file(&path).ok();
 }

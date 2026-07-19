@@ -24,6 +24,7 @@ class OutlinePanel;
 class DiagnosticsPanel;
 class AnnotationToolBar;
 class FormsPanel;
+class SearchPanel;
 
 class CanvasWidget : public PDF_CANVAS_BASE
 #if defined(PDF_PLATFORM_USE_OPENGL) && PDF_PLATFORM_USE_OPENGL
@@ -41,12 +42,16 @@ public:
     void setAccessibleStatus(const QString& status);
     void setSelectionOverlay(const QRectF& rect);
     void clearSelectionOverlay();
+    /// Set annotation overlays for the current page. [FR-ANNOT, M4]
+    void setAnnotationOverlays(const std::vector<std::pair<QRectF, QColor>>& overlays);
     bool usingGpu() const { return using_gpu_; }
 
 signals:
     void pageStepRequested(int delta);
     void zoomStepRequested(int delta);
     void scrollDeltaRequested(int dy);
+    /// Canvas clicked at PDF coordinates. [FR-ANNOT, M4]
+    void canvasClicked(float pdf_x, float pdf_y);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -72,6 +77,7 @@ private:
     bool texture_dirty_ = false;
     QString accessible_status_;
     std::optional<QRectF> selection_;
+    std::vector<std::pair<QRectF, QColor>> annot_overlays_;
 #if defined(PDF_PLATFORM_USE_OPENGL) && PDF_PLATFORM_USE_OPENGL
     GLuint texture_id_ = 0;
 #endif
@@ -90,6 +96,8 @@ public slots:
     void goToPage(int page);
     void zoomBy(int steps);
     void findNext();
+    void findPrevious();
+    void performSearch(const QString& query);
     void copyPageText();
     void exportAnnotationsXfdf();
     void refreshFormsPanel();
@@ -119,6 +127,7 @@ private:
     DiagnosticsPanel* diagnostics_ = nullptr;
     AnnotationToolBar* annot_tools_ = nullptr;
     FormsPanel* forms_ = nullptr;
+    SearchPanel* search_ = nullptr;
 
     void* shmem_mapping_ = nullptr;
     void* shmem_section_ = nullptr;  // CreateFileMapping handle (Windows); not the file handle
@@ -132,6 +141,11 @@ private:
     static constexpr int kTile = 256;
     QString path_;
     QString last_find_query_;
+    int find_cursor_page_ = 0;
+    int find_cursor_line_ = 0;
+    int find_cursor_char_ = 0;
+    int find_current_index_ = -1;
+    int find_total_matches_ = 0;
     int annot_tool_ = 0;  // AnnotationTool as int
 };
 

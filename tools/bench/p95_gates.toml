@@ -11,3 +11,5 @@ cold_start_ms = { budget = 1000, percentile = 95, cite = "MET-PERF-1" }
 first_page_ms = { budget = 300, percentile = 95, cite = "MET-PERF-2" }
 # Viewport decompose for 2000p scroll scheduling (CPU micro, not full raster)
 viewport_scroll_2000p_us = { budget = 5000, percentile = 95, cite = "MET-PERF-3" }
+# Ink appearance generation (200-point stroke, single generation). [FR-ANNOT-7, M4]
+ink_appearance_us = { budget = 10000, percentile = 95, cite = "FR-ANNOT-7" }

@@ -32,6 +32,10 @@ signals:
     void runCalcRequested();
     /// Toggle forms JS kill switch.
     void jsEnabledRequested(bool enabled);
+    /// Validate all form fields. [FR-FORM-2, M5]
+    void validateRequested();
+    /// Flatten all form fields. [FR-FORM-4, M5]
+    void flattenRequested();
 
 private:
     void onSelectionChanged();
@@ -45,6 +49,8 @@ private:
     QPushButton* calc_btn_ = nullptr;
     QPushButton* seed_btn_ = nullptr;
     QPushButton* js_toggle_ = nullptr;
+    QPushButton* validate_btn_ = nullptr;
+    QPushButton* flatten_btn_ = nullptr;
     bool js_enabled_ = true;
 };
 

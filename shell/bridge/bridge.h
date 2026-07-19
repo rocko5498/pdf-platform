@@ -56,6 +56,28 @@ inline uint32_t import_xfdf(const std::string& xml) { return import_xfdf_impl(xm
 
 inline uint32_t annotation_count() { return annotation_count_impl(); }
 
+/// Get annotations for a page as renderable data. [FR-ANNOT, M4]
+inline std::string get_page_annotations(uint32_t page_index) {
+    return std::string(get_page_annotations_impl(page_index));
+}
+
+/// Delete an annotation by ID. [FR-ANNOT-4, M4]
+inline std::string delete_annotation(uint64_t id) {
+    return std::string(delete_annotation_impl(id));
+}
+
+/// Undo the last annotation or form operation. [FR-ANNOT-4, FR-FORM-6, M4]
+inline std::string undo() { return std::string(undo_impl()); }
+
+/// Redo the last undone operation. [FR-ANNOT-4, FR-FORM-6, M4]
+inline std::string redo() { return std::string(redo_impl()); }
+
+/// Whether undo is available. [FR-ANNOT-4, FR-FORM-6, M4]
+inline bool can_undo() { return can_undo_impl(); }
+
+/// Whether redo is available. [FR-ANNOT-4, FR-FORM-6, M4]
+inline bool can_redo() { return can_redo_impl(); }
+
 inline std::string save_document(const std::string& out_path) {
     return std::string(save_document_impl(out_path));
 }
@@ -79,5 +101,11 @@ inline std::string run_forms_calc() { return std::string(run_forms_calc_impl());
 inline std::string set_forms_js_enabled(bool enabled) {
     return std::string(set_forms_js_enabled_impl(enabled));
 }
+
+/// Validate all form fields. [FR-FORM-2, M5]
+inline std::string validate_form() { return std::string(validate_form_impl()); }
+
+/// Flatten all form fields into page content. [FR-FORM-4, M5]
+inline std::string flatten_form() { return std::string(flatten_form_impl()); }
 
 }  // namespace pdf_platform

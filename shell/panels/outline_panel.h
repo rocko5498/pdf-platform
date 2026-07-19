@@ -4,8 +4,16 @@
 #include <QListWidget>
 #include <QString>
 #include <QWidget>
+#include <vector>
 
 namespace pdf_platform {
+
+/// Parsed outline entry with destination data for navigation.
+struct OutlineDest {
+    int page;       /// 0-based page index
+    float y;        /// Vertical offset in PDF points
+    int depth;      /// Nesting depth (0 = top-level)
+};
 
 /// Read-only outline / bookmarks list. Populated from coordinator structure events.
 class OutlinePanel : public QWidget {
@@ -20,11 +28,12 @@ public:
     void clear();
 
 signals:
-    /// User activated an outline entry (0-based index in the list).
-    void entryActivated(int index);
+    /// User activated an outline entry with its navigation destination.
+    void entryActivated(int page, float y);
 
 private:
     QListWidget* list_;
+    std::vector<OutlineDest> dests_;
 };
 
 }  // namespace pdf_platform

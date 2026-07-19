@@ -240,6 +240,98 @@ pub fn find_first(
     None
 }
 
+/// Find the last occurrence of `query` in a page's text model before
+/// the given cursor position (backward search). [FR-SRCH-2, M2]
+///
+/// Returns the match location if found.
+pub fn find_last(
+    model: &PageTextModel,
+    query: &str,
+    options: &FindOptions,
+    cursor_page: u32,
+    cursor_line: u32,
+    cursor_char: u32,
+) -> Option<FindMatch> {
+    if query.is_empty() || model.page_index != cursor_page {
+        return None;
+    }
+
+    let query_norm = if options.case_sensitive {
+        query.to_string()
+    } else {
+        normalize_for_search(query)
+    };
+
+    let mut best: Option<FindMatch> = None;
+
+    for line in &model.lines {
+        // Only consider lines at or before the cursor line
+        if line.index > cursor_line {
+            break;
+        }
+
+        let search_text = if options.case_sensitive {
+            line.text.clone()
+        } else {
+            normalize_for_search(&line.text)
+        };
+
+        // On the cursor line, only search before cursor_char
+        let end_offset = if line.index == cursor_line {
+            cursor_char as usize
+        } else {
+            search_text.len()
+        };
+
+        let mut search_start = 0;
+        while search_start < end_offset {
+            if let Some(pos) = search_text[search_start..end_offset].find(&query_norm) {
+                let absolute = search_start + pos;
+                let match_len = query_norm.len();
+
+                // Whole-word check
+                if options.whole_word {
+                    let before_ok = absolute == 0
+                        || search_text[..absolute]
+                            .chars()
+                            .next_back()
+                            .map_or(true, is_word_boundary);
+                    let after_ok = absolute + match_len >= search_text.len()
+                        || search_text[absolute + match_len..]
+                            .chars()
+                            .next()
+                            .map_or(true, is_word_boundary);
+                    if !before_ok || !after_ok {
+                        search_start = advance_char_boundary(&search_text, absolute + 1);
+                        continue;
+                    }
+                }
+
+                let (x, y, w, h) =
+                    compute_match_bounds(model, line.index, absolute, match_len);
+
+                best = Some(FindMatch {
+                    page_index: model.page_index,
+                    line_index: line.index,
+                    char_offset: absolute as u32,
+                    char_len: match_len as u32,
+                    matched_text: char_safe_slice(&search_text, absolute, match_len).to_string(),
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                });
+                // Continue searching for a later match on this line
+                search_start = advance_char_boundary(&search_text, absolute + 1);
+            } else {
+                break;
+            }
+        }
+    }
+
+    best
+}
+
 /// Find all occurrences of `query` in a page's text model.
 pub fn find_all(
     model: &PageTextModel,
@@ -563,5 +655,34 @@ mod tests {
         assert_eq!(state.current_page, 0);
         assert_eq!(state.current_line, 0);
         assert_eq!(state.current_char, 6);
+    }
+
+    #[test]
+    fn find_last_backward_search() {
+        use engine_api::extract::{PageTextModel, TextLine};
+        let model = PageTextModel {
+            page_index: 0,
+            lines: vec![
+                TextLine { index: 0, text: "the cat sat on the mat".into(), x: 0.0, y: 0.0, width: 200.0, height: 12.0, spans: vec![] },
+                TextLine { index: 1, text: "the dog sat on the log".into(), x: 0.0, y: 20.0, width: 200.0, height: 12.0, spans: vec![] },
+                TextLine { index: 2, text: "the bird sat on the fern".into(), x: 0.0, y: 40.0, width: 200.0, height: 12.0, spans: vec![] },
+            ],
+            reliable: true,
+            char_count: 66,
+            has_structure: false,
+        };
+        let opts = FindOptions::default();
+        // Search backward from end of line 2 — should find "the" on line 2
+        let m = find_last(&model, "the", &opts, 0, 2, 24).unwrap();
+        assert_eq!(m.line_index, 2);
+        assert_eq!(m.char_offset, 16); // last "the" on line 2
+
+        // Search backward from start of line 1 — should find on line 0
+        let m = find_last(&model, "sat", &opts, 0, 1, 0).unwrap();
+        assert_eq!(m.line_index, 0);
+
+        // Search backward from very start — nothing before cursor
+        let m = find_last(&model, "the", &opts, 0, 0, 0);
+        assert!(m.is_none());
     }
 }

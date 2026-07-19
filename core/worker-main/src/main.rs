@@ -174,6 +174,12 @@ fn main() -> ExitCode {
                         Command::DeleteAnnotation { correlation_id, .. } => {
                             send_error(&mut transport, correlation_id, "organize/annotation commands are coordinator-level");
                         }
+                        // M11 plugin commands — handled by coordinator, not document worker.
+                        Command::LoadPlugin { correlation_id, .. } |
+                        Command::UnloadPlugin { correlation_id, .. } |
+                        Command::InvokePluginAction { correlation_id, .. } => {
+                            send_error(&mut transport, correlation_id, "plugin commands are coordinator-level");
+                        }
                     },
                     Err(_) => {
                         // Legacy raw-byte fallback for M0 backward compatibility.
@@ -362,7 +368,20 @@ fn handle_get_outline(
     match structure.outline() {
         Ok(outline) => {
             let total = outline.total_count() as u32;
-            let data = format!("entries={}", outline.entries.len());
+            // Serialize each entry as "page|y|title" lines for shell navigation.
+            // Nesting indicated by leading pipe count: 0 pipes = top-level, 1 pipe = child, etc.
+            // [FR-BOOK, M1 exit: bookmark navigation]
+            let mut lines = Vec::new();
+            fn serialize_entries(entries: &[engine_api::structure::OutlineEntry], depth: u32, lines: &mut Vec<String>) {
+                for entry in entries {
+                    let prefix = "|".repeat(depth as usize);
+                    let title_escaped = entry.title.replace('|', "\\p").replace('\n', "\\n");
+                    lines.push(format!("{}{}|{}|{}", prefix, entry.page, entry.y, title_escaped));
+                    serialize_entries(&entry.children, depth + 1, lines);
+                }
+            }
+            serialize_entries(&outline.entries, 0, &mut lines);
+            let data = format!("entries={}\n{}", outline.entries.len(), lines.join("\n"));
             let event = WorkerEvent::OutlineResult {
                 correlation_id,
                 entry_count: outline.entries.len() as u32,

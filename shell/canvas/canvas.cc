@@ -8,6 +8,7 @@
 #include "diagnostics_panel.h"
 #include "forms_panel.h"
 #include "outline_panel.h"
+#include "search_panel.h"
 
 #include <QAccessible>
 #include <QApplication>
@@ -88,11 +89,22 @@ void CanvasWidget::clearSelectionOverlay() {
     update();
 }
 
+void CanvasWidget::setAnnotationOverlays(const std::vector<std::pair<QRectF, QColor>>& overlays) {
+    annot_overlays_ = overlays;
+    update();
+}
+
 void CanvasWidget::paintSoftware(QPainter& p) {
     if (has_tile_) {
         p.drawImage(rect(), tile_image_);
     } else {
         p.fillRect(rect(), Qt::darkGray);
+    }
+    // Draw annotation overlays. [FR-ANNOT, M4]
+    for (const auto& [r, color] : annot_overlays_) {
+        p.setPen(QPen(color, 2));
+        p.setBrush(QColor(color.red(), color.green(), color.blue(), 40));
+        p.drawRect(r);
     }
     if (selection_) {
         // Map PDF-ish overlay rect already in widget coords from caller.
@@ -175,7 +187,12 @@ void CanvasWidget::focusInEvent(QFocusEvent* event) {
 }
 
 void CanvasWidget::mousePressEvent(QMouseEvent* event) {
-    // Forward to parent for annotation placement (MainWindow handles tool).
+    // Emit click at PDF coordinates for annotation placement. [FR-ANNOT, M4]
+    if (event->button() == Qt::LeftButton) {
+        float pdf_x = float(event->pos().x());
+        float pdf_y = float(event->pos().y());
+        emit canvasClicked(pdf_x, pdf_y);
+    }
     event->ignore();
     PDF_CANVAS_BASE::mousePressEvent(event);
 }
@@ -245,13 +262,49 @@ void MainWindow::setupChrome() {
         }
         renderVisibleTiles();
     });
+    // Canvas click → place annotation at click position. [FR-ANNOT, M4]
+    connect(canvas_, &CanvasWidget::canvasClicked, this, [this](float pdf_x, float pdf_y) {
+        if (annot_tool_ <= 0 || page_count_ == 0) return;
+        static const char* types[] = {"", "highlight", "underline", "note",
+                                      "freetext", "ink", "rect", "stamp"};
+        int idx = annot_tool_;
+        if (idx >= 8) return;
+        // Convert screen coords to PDF page coords
+        float page_h = page_height_ * scale_ + 16.f;
+        int page = int(scroll_y_ / page_h);
+        if (page < 0) page = 0;
+        if (page >= int(page_count_)) page = int(page_count_) - 1;
+        float page_top = float(page) * page_h;
+        float pdf_y_page = (pdf_y + scroll_y_ - page_top) / scale_;
+        float pdf_x_page = pdf_x / scale_;
+        try {
+            float w = 120.f, h = 20.f;
+            uint64_t id = add_annotation(uint32_t(page), types[idx],
+                                         pdf_x_page, pdf_y_page, w, h, "Annotation");
+            statusBar()->showMessage(QString("Added annotation id=%1").arg(id), 3000);
+            renderVisibleTiles();
+        } catch (const std::exception& e) {
+            QMessageBox::warning(this, QStringLiteral("Annotate"),
+                                 QString::fromUtf8(e.what()));
+        }
+    });
 
     annot_tools_ = new AnnotationToolBar(this);
     addToolBar(Qt::TopToolBarArea, annot_tools_);
     connect(annot_tools_, &AnnotationToolBar::toolChanged, this, [this](AnnotationTool t) {
         annot_tool_ = static_cast<int>(t);
+        static const char* tool_names[] = {"Select", "Highlight", "Underline", "Note",
+                                           "FreeText", "Ink", "Rectangle", "Stamp"};
+        int idx = annot_tool_;
+        const char* name = (idx >= 0 && idx < 8) ? tool_names[idx] : "Unknown";
         statusBar()->showMessage(
-        QStringLiteral("Tool %1 - click canvas to place").arg(annot_tool_), 2500);
+        QStringLiteral("Tool %1 - click canvas to place").arg(name), 2500);
+        // Live a11y announcement for tool change. [DS-A11Y-SR-2, NFR-A11Y]
+        if (canvas_) {
+            canvas_->setProperty("activeTool", QString::fromUtf8(name));
+            QAccessibleEvent ev(canvas_, QAccessible::ValueChanged);
+            QAccessible::updateAccessibility(&ev);
+        }
     });
 
     outline_ = new OutlinePanel(this);
@@ -260,6 +313,11 @@ void MainWindow::setupChrome() {
     od->setAccessibleName(QStringLiteral("Bookmarks"));
     od->setWidget(outline_);
     addDockWidget(Qt::LeftDockWidgetArea, od);
+    // Bookmark navigation: activate entry → go to page. [FR-BOOK-1, M1 exit]
+    connect(outline_, &OutlinePanel::entryActivated, this, [this](int page, float y) {
+        goToPage(page);
+        // TODO(M1): scroll to y offset within page (requires viewport model)
+    });
 
     diagnostics_ = new DiagnosticsPanel(this);
     auto* dd = new QDockWidget(QStringLiteral("Diagnostics"), this);
@@ -278,6 +336,47 @@ void MainWindow::setupChrome() {
     connect(forms_, &FormsPanel::setFieldRequested, this, &MainWindow::applyFormField);
     connect(forms_, &FormsPanel::runCalcRequested, this, &MainWindow::runFormsCalc);
     connect(forms_, &FormsPanel::jsEnabledRequested, this, &MainWindow::setFormsJsEnabled);
+    connect(forms_, &FormsPanel::validateRequested, this, [this]() {
+        try {
+            QString result = QString::fromStdString(validate_form());
+            statusBar()->showMessage(result.section('\n', 0, 0), 5000);
+            if (diagnostics_) diagnostics_->setReport(result, {});
+        } catch (const std::exception& e) {
+            QMessageBox::warning(this, QStringLiteral("Validate"), QString::fromUtf8(e.what()));
+        }
+    });
+    connect(forms_, &FormsPanel::flattenRequested, this, [this]() {
+        QMessageBox::StandardButton reply = QMessageBox::question(
+            this, QStringLiteral("Flatten Form"),
+            QStringLiteral("Flatten all form fields? This cannot be undone."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (reply != QMessageBox::Yes) return;
+        try {
+            QString result = QString::fromStdString(flatten_form());
+            statusBar()->showMessage(result, 5000);
+            refreshFormsPanel();
+        } catch (const std::exception& e) {
+            QMessageBox::warning(this, QStringLiteral("Flatten"), QString::fromUtf8(e.what()));
+        }
+    });
+
+    // Search results panel. [FR-SRCH-3, M2 exit: search panel]
+    search_ = new SearchPanel(this);
+    auto* sd = new QDockWidget(QStringLiteral("Find"), this);
+    sd->setObjectName(QStringLiteral("searchDock"));
+    sd->setAccessibleName(QStringLiteral("Search results"));
+    sd->setWidget(search_);
+    addDockWidget(Qt::RightDockWidgetArea, sd);
+    connect(search_, &SearchPanel::searchRequested, this, &MainWindow::performSearch);
+    connect(search_, &SearchPanel::resultActivated, this, [this](int page, float x, float y, float w, float h) {
+        goToPage(page);
+        // Highlight match at actual geometry. [FR-SRCH-3, M2: match highlighting]
+        // Map PDF points to canvas widget coordinates.
+        float scale_px = scale_ * 72.f;  // approximate: PDF points → screen pixels
+        canvas_->setSelectionOverlay(QRectF(
+            x * scale_px, y * scale_px - scroll_y_,
+            w * scale_px, h * scale_px));
+    });
 
     statusBar()->showMessage(
         QStringLiteral("Ready - Ctrl+O open, Ctrl+F find, Ctrl+C copy"));
@@ -329,12 +428,23 @@ bool MainWindow::openDocument(const QString& path) {
     if (!needs_password) {
         return false;
     }
-    bool ok = false;
-    QString pw = QInputDialog::getText(this, QStringLiteral("Password"),
-                                       QStringLiteral("Document is encrypted. Enter password:"),
-                                       QLineEdit::Password, {}, &ok);
-    if (!ok) return false;
-    return openDocumentWithPassword(path_, pw, nullptr);
+    // Retry loop for wrong password. [FR-SEC-2, M1: encrypted open]
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        bool ok = false;
+        QString pw = QInputDialog::getText(
+            this, QStringLiteral("Password"),
+            attempt == 0
+                ? QStringLiteral("Document is encrypted. Enter password:")
+                : QStringLiteral("Wrong password. Try again:"),
+            QLineEdit::Password, {}, &ok);
+        if (!ok) return false;  // user cancelled
+        if (openDocumentWithPassword(path_, pw, nullptr)) {
+            return true;
+        }
+    }
+    QMessageBox::warning(this, QStringLiteral("Password"),
+                         QStringLiteral("Too many failed attempts."));
+    return false;
 }
 
 bool MainWindow::openDocumentWithPassword(const QString& path, const QString& password,
@@ -466,12 +576,57 @@ bool MainWindow::renderVisibleTiles() {
         // Upload composite (setTile copies into owned QImage).
         canvas_->setTile(composite.constBits(), uint32_t(composite.width()),
                          uint32_t(composite.height()));
+
+        // Render annotation overlays on visible pages. [FR-ANNOT, M4]
+        std::vector<std::pair<QRectF, QColor>> overlays;
+        float scale_px = scale_;
+        for (uint32_t page = 0; page < page_count_; ++page) {
+            const float page_top = float(page) * (page_h_px + gap);
+            const float page_bot = page_top + page_h_px;
+            if (page_bot < y0 || page_top > y1) continue;
+
+            try {
+                QString data = QString::fromStdString(get_page_annotations(page));
+                for (const QString& line : data.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+                    float ax = 0, ay = 0, aw = 0, ah = 0;
+                    int cr = 255, cg = 0, cb = 0;
+                    for (const QString& part : line.split(QLatin1Char('|'))) {
+                        int eq = part.indexOf(QLatin1Char('='));
+                        if (eq < 0) continue;
+                        QString k = part.left(eq), v = part.mid(eq + 1);
+                        if (k == QLatin1String("x")) ax = v.toFloat();
+                        else if (k == QLatin1String("y")) ay = v.toFloat();
+                        else if (k == QLatin1String("w")) aw = v.toFloat();
+                        else if (k == QLatin1String("h")) ah = v.toFloat();
+                        else if (k == QLatin1String("color")) {
+                            QStringList c = v.split(QLatin1Char(','));
+                            if (c.size() >= 3) {
+                                cr = int(c[0].toFloat() * 255);
+                                cg = int(c[1].toFloat() * 255);
+                                cb = int(c[2].toFloat() * 255);
+                            }
+                        }
+                    }
+                    if (aw > 0 && ah > 0) {
+                        // Map PDF coordinates to screen coordinates
+                        float sx = ax * scale_px;
+                        float sy = (ay * scale_px) - y0 + (page_top - y0);
+                        float sw = aw * scale_px;
+                        float sh = ah * scale_px;
+                        overlays.push_back({QRectF(sx, sy, sw, sh), QColor(cr, cg, cb)});
+                    }
+                }
+            } catch (...) {}
+        }
+        canvas_->setAnnotationOverlays(overlays);
+
         canvas_->setAccessibleStatus(
-            QString("Page %1 of %2, scroll %3, zoom %4%")
+            QString("Page %1 of %2, scroll %3, zoom %4%, tool %5")
                 .arg(current_page_ + 1)
                 .arg(page_count_)
                 .arg(int(scroll_y_))
-                .arg(int(scale_ * 100)));
+                .arg(int(scale_ * 100))
+                .arg(annot_tool_ == 0 ? "Select" : "Annotate"));
         statusBar()->showMessage(
             QString("Page %1/%2  scroll %3px  zoom %4%")
                 .arg(current_page_ + 1)
@@ -620,6 +775,15 @@ void MainWindow::clearDocumentUi() {
     if (forms_) {
         forms_->clear();
     }
+    if (search_) {
+        search_->clear();
+    }
+    find_cursor_page_ = 0;
+    find_cursor_line_ = 0;
+    find_cursor_char_ = 0;
+    find_current_index_ = -1;
+    find_total_matches_ = 0;
+    last_find_query_.clear();
     if (canvas_) {
         canvas_->clearSelectionOverlay();
     }
@@ -658,30 +822,235 @@ void MainWindow::zoomBy(int steps) {
     if (scale_ > 8.f) scale_ = 8.f;
     clampScroll();
     renderVisibleTiles();
+    // Live a11y announcement for zoom change. [DS-A11Y-SR-2, NFR-A11Y]
+    if (canvas_) {
+        canvas_->setProperty("zoomLevel", int(scale_ * 100));
+        QAccessibleEvent ev(canvas_, QAccessible::ValueChanged);
+        QAccessible::updateAccessibility(&ev);
+    }
+}
+
+void MainWindow::performSearch(const QString& query) {
+    if (query.isEmpty()) return;
+    last_find_query_ = query;
+    find_cursor_page_ = 0;
+    find_cursor_line_ = 0;
+    find_cursor_char_ = 0;
+    find_current_index_ = -1;
+    try {
+        QString result = QString::fromStdString(find_text(query.toStdString()));
+        if (search_) {
+            search_->setResults(result, query);
+        }
+        // Count hits
+        find_total_matches_ = 0;
+        for (const QString& line : result.split('\n')) {
+            if (line.startsWith(QStringLiteral("hit "))) find_total_matches_++;
+        }
+        // Navigate to first hit
+        if (find_total_matches_ > 0) {
+            findNext();
+        }
+    } catch (const std::exception& e) {
+        QMessageBox::information(this, QStringLiteral("Find"), QString::fromUtf8(e.what()));
+    }
 }
 
 void MainWindow::findNext() {
-    bool ok = false;
-    QString q = QInputDialog::getText(this, QStringLiteral("Find"),
-                                      QStringLiteral("Find text:"), QLineEdit::Normal,
-                                      last_find_query_, &ok);
-    if (!ok || q.isEmpty()) return;
-    last_find_query_ = q;
+    if (last_find_query_.isEmpty()) {
+        // Open search panel and focus input
+        if (search_) {
+            // Show the dock if hidden
+            if (auto* dock = findChild<QDockWidget*>(QStringLiteral("searchDock"))) {
+                dock->show();
+            }
+            if (auto* input = search_->findChild<QLineEdit*>(QStringLiteral("searchInput"))) {
+                input->setFocus(Qt::ShortcutFocusReason);
+                input->selectAll();
+            }
+        }
+        return;
+    }
+    // Advance cursor past last match
+    if (find_current_index_ >= 0 && find_total_matches_ > 0) {
+        find_cursor_line_++;
+        find_cursor_char_ = 0;
+    }
     try {
-        QString result = QString::fromStdString(find_text(q.toStdString()));
-        statusBar()->showMessage(result.section('\n', 0, 0), 8000);
-        // Jump to first hit page if present
+        // Search from current position forward
+        QString result = QString::fromStdString(find_text(last_find_query_.toStdString()));
+        // Find the first hit at or after our cursor
+        int best_page = -1;
+        int best_line = -1;
+        float bx = 0, by = 0, bw = 0, bh = 0;
+        QString best_text;
         for (const QString& line : result.split('\n')) {
-            if (line.startsWith("hit page=")) {
-                int p = line.mid(9).section(' ', 0, 0).toInt();
-                goToPage(p);
-                // Simple highlight band at top of canvas
-                canvas_->setSelectionOverlay(QRectF(10, 10, width() * 0.5, 24));
+            if (!line.startsWith(QStringLiteral("hit "))) continue;
+            int p = -1, l = -1, co = -1;
+            float x = 0, y = 0, w = 0, h = 0;
+            QString txt;
+            for (const QString& part : line.mid(4).split(' ')) {
+                int eq = part.indexOf('=');
+                if (eq < 0) continue;
+                QString k = part.left(eq), v = part.mid(eq + 1);
+                bool ok;
+                if (k == "page") p = v.toInt(&ok);
+                else if (k == "line") l = v.toInt(&ok);
+                else if (k == "x") x = v.toFloat(&ok);
+                else if (k == "y") y = v.toFloat(&ok);
+                else if (k == "w") w = v.toFloat(&ok);
+                else if (k == "h") h = v.toFloat(&ok);
+                else if (k == "text") txt = v;
+            }
+            if (p < 0) continue;
+            // First hit at or after cursor
+            if (best_page < 0 || (p > find_cursor_page_) ||
+                (p == find_cursor_page_ && l >= find_cursor_line_)) {
+                if (best_page < 0) {
+                    best_page = p; best_line = l;
+                    bx = x; by = y; bw = w; bh = h;
+                    best_text = txt;
+                }
                 break;
             }
         }
-        if (diagnostics_) {
-            diagnostics_->setReport(QString("Find %1\n%2").arg(q, result), {});
+        // Wrap: if no hit found after cursor, wrap to first hit
+        if (best_page < 0) {
+            for (const QString& line : result.split('\n')) {
+                if (!line.startsWith(QStringLiteral("hit "))) continue;
+                int p = -1, l = -1;
+                float x = 0, y = 0, w = 0, h = 0;
+                QString txt;
+                for (const QString& part : line.mid(4).split(' ')) {
+                    int eq = part.indexOf('=');
+                    if (eq < 0) continue;
+                    QString k = part.left(eq), v = part.mid(eq + 1);
+                    bool ok;
+                    if (k == "page") p = v.toInt(&ok);
+                    else if (k == "line") l = v.toInt(&ok);
+                    else if (k == "x") x = v.toFloat(&ok);
+                    else if (k == "y") y = v.toFloat(&ok);
+                    else if (k == "w") w = v.toFloat(&ok);
+                    else if (k == "h") h = v.toFloat(&ok);
+                    else if (k == "text") txt = v;
+                }
+                if (p >= 0) {
+                    best_page = p; best_line = l;
+                    bx = x; by = y; bw = w; bh = h;
+                    best_text = txt;
+                    break;
+                }
+            }
+        }
+        if (best_page >= 0) {
+            goToPage(best_page);
+            find_cursor_page_ = best_page;
+            find_cursor_line_ = best_line;
+            find_current_index_ = (find_current_index_ + 1) % qMax(1, find_total_matches_);
+            // Highlight match at actual geometry
+            float scale_px = scale_ * 72.f;
+            canvas_->setSelectionOverlay(QRectF(
+                bx * scale_px, by * scale_px - scroll_y_,
+                bw * scale_px, bh * scale_px));
+            if (search_) {
+                search_->setCurrentMatch(find_current_index_, find_total_matches_);
+            }
+            statusBar()->showMessage(
+                QStringLiteral("%1 of %2 — %3")
+                    .arg(find_current_index_ + 1)
+                    .arg(find_total_matches_)
+                    .arg(best_text), 3000);
+        } else {
+            statusBar()->showMessage(QStringLiteral("No matches found"), 3000);
+        }
+    } catch (const std::exception& e) {
+        QMessageBox::information(this, QStringLiteral("Find"), QString::fromUtf8(e.what()));
+    }
+}
+
+void MainWindow::findPrevious() {
+    if (last_find_query_.isEmpty()) return;
+    // Move cursor backward
+    find_cursor_line_ = qMax(0, find_cursor_line_ - 1);
+    find_cursor_char_ = 0;
+    // For backward search, we do a forward search from 0 and pick the last hit before cursor
+    try {
+        QString result = QString::fromStdString(find_text(last_find_query_.toStdString()));
+        int best_page = -1, best_line = -1;
+        float bx = 0, by = 0, bw = 0, bh = 0;
+        QString best_text;
+        for (const QString& line : result.split('\n')) {
+            if (!line.startsWith(QStringLiteral("hit "))) continue;
+            int p = -1, l = -1;
+            float x = 0, y = 0, w = 0, h = 0;
+            QString txt;
+            for (const QString& part : line.mid(4).split(' ')) {
+                int eq = part.indexOf('=');
+                if (eq < 0) continue;
+                QString k = part.left(eq), v = part.mid(eq + 1);
+                bool ok;
+                if (k == "page") p = v.toInt(&ok);
+                else if (k == "line") l = v.toInt(&ok);
+                else if (k == "x") x = v.toFloat(&ok);
+                else if (k == "y") y = v.toFloat(&ok);
+                else if (k == "w") w = v.toFloat(&ok);
+                else if (k == "h") h = v.toFloat(&ok);
+                else if (k == "text") txt = v;
+            }
+            if (p < 0) continue;
+            // Take hits before cursor
+            if (p < find_cursor_page_ || (p == find_cursor_page_ && l < find_cursor_line_)) {
+                best_page = p; best_line = l;
+                bx = x; by = y; bw = w; bh = h;
+                best_text = txt;
+            }
+        }
+        // Wrap: if nothing before cursor, take the last hit
+        if (best_page < 0) {
+            for (const QString& line : result.split('\n')) {
+                if (!line.startsWith(QStringLiteral("hit "))) continue;
+                int p = -1, l = -1;
+                float x = 0, y = 0, w = 0, h = 0;
+                QString txt;
+                for (const QString& part : line.mid(4).split(' ')) {
+                    int eq = part.indexOf('=');
+                    if (eq < 0) continue;
+                    QString k = part.left(eq), v = part.mid(eq + 1);
+                    bool ok;
+                    if (k == "page") p = v.toInt(&ok);
+                    else if (k == "line") l = v.toInt(&ok);
+                    else if (k == "x") x = v.toFloat(&ok);
+                    else if (k == "y") y = v.toFloat(&ok);
+                    else if (k == "w") w = v.toFloat(&ok);
+                    else if (k == "h") h = v.toFloat(&ok);
+                    else if (k == "text") txt = v;
+                }
+                if (p >= 0) {
+                    best_page = p; best_line = l;
+                    bx = x; by = y; bw = w; bh = h;
+                    best_text = txt;
+                }
+            }
+        }
+        if (best_page >= 0) {
+            goToPage(best_page);
+            find_cursor_page_ = best_page;
+            find_cursor_line_ = best_line;
+            find_current_index_ = find_current_index_ > 0
+                ? find_current_index_ - 1
+                : find_total_matches_ - 1;
+            float scale_px = scale_ * 72.f;
+            canvas_->setSelectionOverlay(QRectF(
+                bx * scale_px, by * scale_px - scroll_y_,
+                bw * scale_px, bh * scale_px));
+            if (search_) {
+                search_->setCurrentMatch(find_current_index_, find_total_matches_);
+            }
+            statusBar()->showMessage(
+                QStringLiteral("%1 of %2 — %3")
+                    .arg(find_current_index_ + 1)
+                    .arg(find_total_matches_)
+                    .arg(best_text), 3000);
         }
     } catch (const std::exception& e) {
         QMessageBox::information(this, QStringLiteral("Find"), QString::fromUtf8(e.what()));
@@ -730,7 +1099,26 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         return;
     }
     if (event->matches(QKeySequence::Find)) {
-        findNext();
+        // Ctrl+F: focus search panel input. [FR-SRCH-1, M2]
+        if (search_) {
+            if (auto* dock = findChild<QDockWidget*>(QStringLiteral("searchDock"))) {
+                dock->show();
+            }
+            if (auto* input = search_->findChild<QLineEdit*>(QStringLiteral("searchInput"))) {
+                input->setFocus(Qt::ShortcutFocusReason);
+                input->selectAll();
+            }
+        }
+        event->accept();
+        return;
+    }
+    if (event->key() == Qt::Key_F3) {
+        // F3: find next; Shift+F3: find previous. [FR-SRCH-3, M2]
+        if (event->modifiers() & Qt::ShiftModifier) {
+            findPrevious();
+        } else {
+            findNext();
+        }
         event->accept();
         return;
     }
@@ -740,7 +1128,43 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         return;
     }
     if (event->key() == Qt::Key_F6) {
-        canvas_->setFocus(Qt::ShortcutFocusReason);
+        // Focus cycling: canvas → left panels → right panels → canvas [DS-FOCUS-5, M1]
+        // Determine current focus region
+        QWidget* focused = focusWidget();
+        enum Region { CanvasRegion, LeftPanel, RightPanel, RegionCount };
+        Region current = CanvasRegion;
+        if (focused) {
+            // Check which dock widget contains the focused widget
+            if (auto* dock = qobject_cast<QDockWidget*>(focused->parentWidget())) {
+                if (dock == findChild<QDockWidget*>(QStringLiteral("bookmarksDock"))) {
+                    current = LeftPanel;
+                } else if (dock == findChild<QDockWidget*>(QStringLiteral("diagnosticsDock"))
+                           || dock == findChild<QDockWidget*>(QStringLiteral("formsDock"))) {
+                    current = RightPanel;
+                }
+            }
+        }
+        Region next = static_cast<Region>((current + 1) % RegionCount);
+        QWidget* target = nullptr;
+        switch (next) {
+        case CanvasRegion:
+            target = canvas_;
+            break;
+        case LeftPanel:
+            if (outline_) target = outline_->findChild<QWidget*>(QStringLiteral("outlineList"));
+            if (!target) target = outline_;
+            break;
+        case RightPanel:
+            // Prefer diagnostics, then forms
+            if (diagnostics_) target = diagnostics_->findChild<QWidget*>(QStringLiteral("diagnosticsView"));
+            if (!target && diagnostics_) target = diagnostics_;
+            if (!target && forms_) target = forms_;
+            break;
+        default:
+            target = canvas_;
+            break;
+        }
+        if (target) target->setFocus(Qt::ShortcutFocusReason);
         event->accept();
         return;
     }
@@ -755,6 +1179,30 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
             } catch (const std::exception& e) {
                 QMessageBox::warning(this, QStringLiteral("Save"), QString::fromUtf8(e.what()));
             }
+        }
+        event->accept();
+        return;
+    }
+    if (event->modifiers() & Qt::ControlModifier && event->key() == Qt::Key_Z) {
+        // Ctrl+Z: undo. [FR-ANNOT-4, FR-FORM-6, M4]
+        try {
+            QString msg = QString::fromStdString(undo());
+            statusBar()->showMessage(msg, 3000);
+            refreshPanels();
+        } catch (const std::exception& e) {
+            statusBar()->showMessage(QString::fromUtf8(e.what()), 3000);
+        }
+        event->accept();
+        return;
+    }
+    if (event->modifiers() & Qt::ControlModifier && event->key() == Qt::Key_Y) {
+        // Ctrl+Y: redo. [FR-ANNOT-4, FR-FORM-6, M4]
+        try {
+            QString msg = QString::fromStdString(redo());
+            statusBar()->showMessage(msg, 3000);
+            refreshPanels();
+        } catch (const std::exception& e) {
+            statusBar()->showMessage(QString::fromUtf8(e.what()), 3000);
         }
         event->accept();
         return;
@@ -793,6 +1241,25 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
             event->accept();
             return;
         }
+    }
+    // Delete key: delete last annotation on current page. [FR-ANNOT-4, M4]
+    if (event->key() == Qt::Key_Delete && page_count_ > 0) {
+        try {
+            // Find the last annotation on the current page
+            uint32_t count = annotation_count();
+            if (count > 0) {
+                // Delete the most recently added annotation (simple UX for now)
+                // The FFI tracks annotations by ID; we iterate to find the last one
+                QString result = QString::fromStdString(
+                    delete_annotation(count));  // ID = count (sequential)
+                statusBar()->showMessage(result, 3000);
+                refreshPanels();
+            }
+        } catch (const std::exception& e) {
+            statusBar()->showMessage(QString::fromUtf8(e.what()), 3000);
+        }
+        event->accept();
+        return;
     }
     QMainWindow::keyPressEvent(event);
 }

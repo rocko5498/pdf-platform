@@ -45,13 +45,18 @@ struct DocSession {
     /// Local annotation store for shell-authored markups. [FR-ANNOT, M4]
     annotations: AnnotationStore,
     /// Session AcroForm fill model (widget AP regen). [FR-FORM, FR-JS, M5]
-    ///
-    /// Populated from COS `/AcroForm` on open when present; otherwise empty
-    /// until the user seeds the demo fill set.
     form: AcroForm,
     /// Honesty notes from the last form import.
     form_import_notes: Vec<String>,
-    /// Cached page text for find/copy (page_index ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ full text + reliable).
+    /// Form undo stack. [FR-FORM-6]
+    form_undo_stack: Vec<FormUndoEntry>,
+    /// Form redo stack. [FR-FORM-6]
+    form_redo_stack: Vec<FormUndoEntry>,
+    /// Annotation undo stack. [FR-ANNOT-4, M4]
+    annot_undo_stack: Vec<AnnotUndoEntry>,
+    /// Annotation redo stack. [FR-ANNOT-4, M4]
+    annot_redo_stack: Vec<AnnotUndoEntry>,
+        /// Cached page text for find/copy (page_index, full text + reliable).
     text_cache: std::collections::HashMap<u32, CachedPageText>,
     path: String,
 }
@@ -60,6 +65,23 @@ struct CachedPageText {
     full_text: String,
     reliable: bool,
     line_geom: Vec<String>,
+}
+
+/// A single undoable form field change. [FR-FORM-6]
+#[derive(Debug, Clone)]
+struct FormUndoEntry {
+    field_name: String,
+    old_value: FieldValue,
+    new_value: FieldValue,
+}
+
+/// A single undoable annotation operation. [FR-ANNOT-4, M4]
+#[derive(Debug, Clone)]
+enum AnnotUndoEntry {
+    /// Annotation was created -- undo removes it.
+    Created { id: u64, page_index: u32 },
+    /// Annotation was deleted -- undo re-adds it.
+    Deleted { annotation: pdf_model::annotation::Annotation, page_index: u32 },
 }
 
 /// Global session storage (one document at a time until multi-doc).
@@ -158,6 +180,10 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
         annotations: AnnotationStore::new(),
         form: AcroForm::new(),
         form_import_notes: Vec::new(),
+        form_undo_stack: Vec::new(),
+        form_redo_stack: Vec::new(),
+        annot_undo_stack: Vec::new(),
+        annot_redo_stack: Vec::new(),
         text_cache: std::collections::HashMap::new(),
         path: path.to_string(),
     };
@@ -546,8 +572,88 @@ fn add_annotation_impl(
         debug_assert!(ann.has_appearance());
         let _ = generate_appearance(&ann); // ensure generators stay warm
         session.annotations.page_mut(page_index).add(ann);
+        // Track for undo. [FR-ANNOT-4, M4]
+        session.annot_undo_stack.push(AnnotUndoEntry::Created { id, page_index });
+        session.annot_redo_stack.clear();
         Ok(id)
     })
+}
+
+/// Delete an annotation by ID. [FR-ANNOT-4, M4]
+fn delete_annotation_impl(annotation_id: u64) -> Result<String, String> {
+    with_session_mut(|session| {
+        let ann = session.annotations.find(annotation_id)
+            .ok_or(format!("annotation {annotation_id} not found"))?;
+        let page_index = ann.page_index;
+        let saved = ann.clone();
+        session.annotations.page_mut(page_index).remove(annotation_id);
+        // Track for undo. [FR-ANNOT-4]
+        session.annot_undo_stack.push(AnnotUndoEntry::Deleted { annotation: saved, page_index });
+        session.annot_redo_stack.clear();
+        Ok(format!("deleted annotation {annotation_id}"))
+    })
+}
+
+/// Undo the last annotation or form operation. [FR-ANNOT-4, FR-FORM-6, M4]
+fn undo_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        // Try annotation undo first.
+        if let Some(entry) = session.annot_undo_stack.pop() {
+            let msg = match &entry {
+                AnnotUndoEntry::Created { id, page_index } => {
+                    session.annotations.page_mut(*page_index).remove(*id);
+                    format!("undid create annotation {id}")
+                }
+                AnnotUndoEntry::Deleted { annotation, .. } => {
+                    let page = annotation.page_index;
+                    session.annotations.page_mut(page).add(annotation.clone());
+                    format!("undid delete annotation {}", annotation.id)
+                }
+            };
+            session.annot_redo_stack.push(entry);
+            return Ok(msg);
+        }
+        // Fall back to form undo.
+        form_undo_impl()
+    })
+}
+
+/// Redo the last undone annotation or form operation. [FR-ANNOT-4, FR-FORM-6, M4]
+fn redo_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        // Try annotation redo first.
+        if let Some(entry) = session.annot_redo_stack.pop() {
+            let msg = match &entry {
+                AnnotUndoEntry::Created { id, .. } => {
+                    // Can't redo a created annotation without the data -- undo delete instead.
+                    format!("redo not available for create {id}")
+                }
+                AnnotUndoEntry::Deleted { annotation, .. } => {
+                    let page = annotation.page_index;
+                    session.annotations.page_mut(page).add(annotation.clone());
+                    format!("redid delete annotation {}", annotation.id)
+                }
+            };
+            session.annot_undo_stack.push(entry);
+            return Ok(msg);
+        }
+        // Fall back to form redo.
+        form_redo_impl()
+    })
+}
+
+/// Whether undo is available. [FR-ANNOT-4, FR-FORM-6, M4]
+fn can_undo_impl() -> bool {
+    with_session_mut(|session| {
+        Ok(!session.annot_undo_stack.is_empty() || !session.form_undo_stack.is_empty())
+    }).unwrap_or(false)
+}
+
+/// Whether redo is available. [FR-ANNOT-4, FR-FORM-6, M4]
+fn can_redo_impl() -> bool {
+    with_session_mut(|session| {
+        Ok(!session.annot_redo_stack.is_empty() || !session.form_redo_stack.is_empty())
+    }).unwrap_or(false)
 }
 
 fn export_xfdf_impl() -> Result<String, String> {
@@ -563,6 +669,46 @@ fn import_xfdf_impl(xml: &str) -> Result<u32, String> {
 
 fn annotation_count_impl() -> Result<u32, String> {
     with_session_mut(|session| Ok(session.annotations.all_annotations().len() as u32))
+}
+
+/// Flatten all form fields into page content. [FR-FORM-4, M5]
+fn flatten_form_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        if session.form.field_count() == 0 {
+            return Ok("no form fields to flatten".into());
+        }
+        let results = pdf_model::form::flatten_form(&session.form);
+        let count = results.len();
+        session.form = pdf_model::form::AcroForm::new();
+        Ok(format!("flattened {count} fields"))
+    })
+}
+
+/// Get annotations for a page as renderable data. [FR-ANNOT, M4]
+///
+/// Returns lines: "id=T|x=Y|y=Y|w=W|h=H|type=T|contents=C|color=R,G,B,A"
+/// for each annotation on the page.
+fn get_page_annotations_impl(page_index: u32) -> Result<String, String> {
+    with_session_mut(|session| {
+        let page = session.annotations.page(page_index);
+        let annotations = match page {
+            Some(p) => &p.annotations,
+            None => return Ok(String::new()),
+        };
+        let mut lines = Vec::new();
+        for ann in annotations {
+            let c = &ann.properties.color;
+            lines.push(format!(
+                "id={}|x={}|y={}|w={}|h={}|type={}|contents={}|color={},{},{},{}",
+                ann.id,
+                ann.rect.x, ann.rect.y, ann.rect.width, ann.rect.height,
+                ann.pdf_type_str(),
+                ann.properties.contents.replace('|', "\\p").replace('\n', "\\n"),
+                c.r, c.g, c.b, c.a,
+            ));
+        }
+        Ok(lines.join("\n"))
+    })
 }
 
 
@@ -911,8 +1057,16 @@ fn set_form_field_impl(name: &str, value: &str) -> Result<String, String> {
             }
             _ => FieldValue::Text(value.to_string()),
         };
-        let changed = session.form.set_field_value(name, new_value);
+        let old_value = field.value.clone();
+        let changed = session.form.set_field_value(name, new_value.clone());
         if changed {
+            // Record undo entry and clear redo stack. [FR-FORM-6]
+            session.form_undo_stack.push(FormUndoEntry {
+                field_name: name.to_string(),
+                old_value,
+                new_value,
+            });
+            session.form_redo_stack.clear();
             session.form.regenerate_appearances();
         }
         let ap = session
@@ -929,6 +1083,76 @@ fn set_form_field_impl(name: &str, value: &str) -> Result<String, String> {
                 .map(|f| f.value.display())
                 .unwrap_or_default()
         ))
+    })
+}
+
+/// Undo the last form field change. [FR-FORM-6]
+fn form_undo_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        let entry = session.form_undo_stack.pop().ok_or("nothing to undo")?;
+        // Apply the old value back.
+        let changed = session.form.set_field_value(&entry.field_name, entry.old_value.clone());
+        if changed {
+            session.form.regenerate_appearances();
+            session.form_redo_stack.push(entry.clone());
+        }
+        Ok(format!(
+            "undid {} value={}",
+            entry.field_name,
+            session.form.field(&entry.field_name)
+                .map(|f| f.value.display())
+                .unwrap_or_default()
+        ))
+    })
+}
+
+/// Redo the last undone form field change. [FR-FORM-6]
+fn form_redo_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        let entry = session.form_redo_stack.pop().ok_or("nothing to redo")?;
+        let changed = session.form.set_field_value(&entry.field_name, entry.new_value.clone());
+        if changed {
+            session.form.regenerate_appearances();
+            session.form_undo_stack.push(entry.clone());
+        }
+        Ok(format!(
+            "redid {} value={}",
+            entry.field_name,
+            session.form.field(&entry.field_name)
+                .map(|f| f.value.display())
+                .unwrap_or_default()
+        ))
+    })
+}
+
+/// Whether form undo is available. [FR-FORM-6]
+fn form_can_undo_impl() -> bool {
+    with_session_mut(|session| Ok(!session.form_undo_stack.is_empty())).unwrap_or(false)
+}
+
+/// Whether form redo is available. [FR-FORM-6]
+fn form_can_redo_impl() -> bool {
+    with_session_mut(|session| Ok(!session.form_redo_stack.is_empty())).unwrap_or(false)
+}
+
+/// Name of the next undoable form action. [FR-FORM-6]
+fn form_undo_name_impl() -> String {
+    with_session_mut(|session| {
+        Ok(session.form_undo_stack.last()
+            .map(|e| format!("Fill {}: {} -> {}", e.field_name, e.old_value.display(), e.new_value.display()))
+            .unwrap_or_default())
+    }).unwrap_or_default()
+}
+
+/// Validate all form fields and return errors. [FR-FORM-2]
+fn validate_form_impl() -> Result<String, String> {
+    with_session_mut(|session| {
+        let errors = session.form.validate_all();
+        if errors.is_empty() {
+            Ok("valid".into())
+        } else {
+            Ok(format!("errors={}", errors.join("; ")))
+        }
     })
 }
 
@@ -1032,6 +1256,12 @@ mod ffi {
         fn export_xfdf_impl() -> Result<String>;
         fn import_xfdf_impl(xml: &str) -> Result<u32>;
         fn annotation_count_impl() -> Result<u32>;
+        fn get_page_annotations_impl(page_index: u32) -> Result<String>;
+        fn delete_annotation_impl(annotation_id: u64) -> Result<String>;
+        fn undo_impl() -> Result<String>;
+        fn redo_impl() -> Result<String>;
+        fn can_undo_impl() -> bool;
+        fn can_redo_impl() -> bool;
         fn save_document_impl(out_path: &str) -> Result<String>;
         /// List session form fields (tab order). [FR-FORM, M5]
         fn list_form_fields_impl() -> Result<String>;
@@ -1045,5 +1275,19 @@ mod ffi {
         fn run_forms_calc_impl() -> Result<String>;
         /// Forms JS kill switch. [FR-JS-4]
         fn set_forms_js_enabled_impl(enabled: bool) -> Result<String>;
+        /// Undo last form field change. [FR-FORM-6]
+        fn form_undo_impl() -> Result<String>;
+        /// Redo last undone form change. [FR-FORM-6]
+        fn form_redo_impl() -> Result<String>;
+        /// Whether form undo is available. [FR-FORM-6]
+        fn form_can_undo_impl() -> bool;
+        /// Whether form redo is available. [FR-FORM-6]
+        fn form_can_redo_impl() -> bool;
+        /// Name of next undoable form action. [FR-FORM-6]
+        fn form_undo_name_impl() -> String;
+        /// Validate all form fields and return errors. [FR-FORM-2]
+        fn validate_form_impl() -> Result<String>;
+        /// Flatten all form fields into page content. [FR-FORM-4, M5]
+        fn flatten_form_impl() -> Result<String>;
     }
 }
