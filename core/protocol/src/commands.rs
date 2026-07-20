@@ -144,8 +144,66 @@ pub enum Command {
         /// When false, evaluation is blocked (kill switch). [FR-JS]
         enabled: bool,
     },
+    /// Render a full page as a raster for OCR processing. [FR-OCR, M9]
+    ///
+    /// Returns the raster data directly (not via shared memory) so the
+    /// coordinator can run OCR on it. The page is rendered at the specified
+    /// DPI scale and returned as RGBA8 pixels.
+    RenderPageForOcr {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// 0-based page index.
+        page_index: u32,
+        /// Scale factor (1.0 = 72 DPI; 300 DPI = 300/72 ≈ 4.17).
+        scale: f32,
+    },
+    /// Redact text by search term across pages. [FR-RED-5, FR-RED-6, M7]
+    ///
+    /// Searches for `search_term` across specified pages (or all pages),
+    /// marks matching regions, applies content removal, scrubs metadata,
+    /// removes overlapping annotations, and verifies the result. The
+    /// worker returns a `RedactResult` event with the verification report.
+    RedactByTerm {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// The text to search for and redact.
+        search_term: String,
+        /// Case-sensitive matching.
+        case_sensitive: bool,
+        /// Whole-word matching.
+        whole_word: bool,
+        /// Pages to search (None = all pages).
+        page_filter: Option<Vec<u32>>,
+    },
     /// Clean shutdown — worker exits its main loop. [SDS §10.1]
     Quit,
+    /// Load and initialize a plugin in the worker. [FR-PLUG-1, ADR-014, M11]
+    LoadPlugin {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// Unique plugin identifier.
+        plugin_id: String,
+        /// Plugin manifest as JSON string.
+        manifest_json: String,
+    },
+    /// Disable/unload a plugin. [FR-PLUG-3, ADR-014, M11]
+    UnloadPlugin {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// Unique plugin identifier.
+        plugin_id: String,
+    },
+    /// Invoke a plugin-registered tool action. [FR-PLUG-4, M11]
+    InvokePluginAction {
+        /// Correlation ID for response matching.
+        correlation_id: CorrelationId,
+        /// Plugin identifier.
+        plugin_id: String,
+        /// Action identifier within the plugin.
+        action_id: String,
+        /// Action arguments as JSON string.
+        args_json: String,
+    },
 }
 
 impl Command {
@@ -164,6 +222,11 @@ impl Command {
             Self::AddAnnotation { correlation_id, .. } => Some(*correlation_id),
             Self::DeleteAnnotation { correlation_id, .. } => Some(*correlation_id),
             Self::FormsCalc { correlation_id, .. } => Some(*correlation_id),
+            Self::LoadPlugin { correlation_id, .. } => Some(*correlation_id),
+            Self::UnloadPlugin { correlation_id, .. } => Some(*correlation_id),
+            Self::InvokePluginAction { correlation_id, .. } => Some(*correlation_id),
+            Self::RenderPageForOcr { correlation_id, .. } => Some(*correlation_id),
+            Self::RedactByTerm { correlation_id, .. } => Some(*correlation_id),
             Self::Quit => None,
         }
     }
@@ -271,7 +334,79 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
             }
             out.into_bytes()
         }
+        Command::RenderPageForOcr {
+            correlation_id,
+            page_index,
+            scale,
+        } => {
+            format!(
+                "CMD:RENDER_PAGE_FOR_OCR:{correlation_id}\n\
+                 page_index={page_index}\nscale={scale}\n"
+            )
+            .into_bytes()
+        }
+        Command::RedactByTerm {
+            correlation_id,
+            search_term,
+            case_sensitive,
+            whole_word,
+            page_filter,
+        } => {
+            let mut out = format!(
+                "CMD:REDACT_BY_TERM:{correlation_id}\n\
+                 search_term={}\ncase_sensitive={}\nwhole_word={}\n",
+                search_term.replace('\n', "\\n"),
+                u8::from(*case_sensitive),
+                u8::from(*whole_word),
+            );
+            if let Some(pages) = page_filter {
+                let pages_str = pages.iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push_str(&format!("page_filter={pages_str}\n"));
+            }
+            out.into_bytes()
+        }
         Command::Quit => b"CMD:QUIT\n".to_vec(),
+        Command::LoadPlugin {
+            correlation_id,
+            plugin_id,
+            manifest_json,
+        } => {
+            format!(
+                "CMD:LOAD_PLUGIN:{correlation_id}\n\
+                 plugin_id={}\nmanifest={}\n",
+                plugin_id,
+                manifest_json.replace('\n', "\\n")
+            )
+            .into_bytes()
+        }
+        Command::UnloadPlugin {
+            correlation_id,
+            plugin_id,
+        } => {
+            format!(
+                "CMD:UNLOAD_PLUGIN:{correlation_id}\n\
+                 plugin_id={plugin_id}\n"
+            )
+            .into_bytes()
+        }
+        Command::InvokePluginAction {
+            correlation_id,
+            plugin_id,
+            action_id,
+            args_json,
+        } => {
+            format!(
+                "CMD:INVOKE_PLUGIN_ACTION:{correlation_id}\n\
+                 plugin_id={}\naction_id={}\nargs={}\n",
+                plugin_id,
+                action_id,
+                args_json.replace('\n', "\\n")
+            )
+            .into_bytes()
+        }
     }
 }
 
@@ -593,6 +728,116 @@ fn try_decode_typed(text: &str) -> Result<Option<Command>, CommandDecodeError> {
                 enabled,
             }))
         }
+        "LOAD_PLUGIN" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut plugin_id = None;
+            let mut manifest = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "plugin_id" => plugin_id = Some(v.to_string()),
+                        "manifest" => manifest = Some(v.replace("\\n", "\n")),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Command::LoadPlugin {
+                correlation_id: cid,
+                plugin_id: plugin_id.ok_or(CommandDecodeError::BadField("plugin_id"))?,
+                manifest_json: manifest.unwrap_or_default(),
+            }))
+        }
+        "UNLOAD_PLUGIN" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut plugin_id = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    if k == "plugin_id" {
+                        plugin_id = Some(v.to_string());
+                    }
+                }
+            }
+            Ok(Some(Command::UnloadPlugin {
+                correlation_id: cid,
+                plugin_id: plugin_id.ok_or(CommandDecodeError::BadField("plugin_id"))?,
+            }))
+        }
+        "INVOKE_PLUGIN_ACTION" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut plugin_id = None;
+            let mut action_id = None;
+            let mut args = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "plugin_id" => plugin_id = Some(v.to_string()),
+                        "action_id" => action_id = Some(v.to_string()),
+                        "args" => args = Some(v.replace("\\n", "\n")),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Command::InvokePluginAction {
+                correlation_id: cid,
+                plugin_id: plugin_id.ok_or(CommandDecodeError::BadField("plugin_id"))?,
+                action_id: action_id.ok_or(CommandDecodeError::BadField("action_id"))?,
+                args_json: args.unwrap_or_default(),
+            }))
+        }
+        "RENDER_PAGE_FOR_OCR" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut page_index = None;
+            let mut scale = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "page_index" => page_index = Some(v.parse().map_err(|_| CommandDecodeError::BadField("page_index"))?),
+                        "scale" => scale = Some(v.parse().map_err(|_| CommandDecodeError::BadField("scale"))?),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Command::RenderPageForOcr {
+                correlation_id: cid,
+                page_index: page_index.ok_or(CommandDecodeError::BadField("page_index"))?,
+                scale: scale.ok_or(CommandDecodeError::BadField("scale"))?,
+            }))
+        }
+        "REDACT_BY_TERM" => {
+            let cid = correlation_id.unwrap_or(0);
+            let mut search_term = None;
+            let mut case_sensitive = false;
+            let mut whole_word = false;
+            let mut page_filter = None;
+            for line in text.lines().skip(1) {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "search_term" => search_term = Some(v.replace("\\n", "\n")),
+                        "case_sensitive" => {
+                            case_sensitive = v == "1" || v.eq_ignore_ascii_case("true");
+                        }
+                        "whole_word" => {
+                            whole_word = v == "1" || v.eq_ignore_ascii_case("true");
+                        }
+                        "page_filter" => {
+                            let pages: Vec<u32> = v.split(',')
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.parse().map_err(|_| CommandDecodeError::BadField("page_filter")))
+                                .collect::<Result<_, _>>()?;
+                            page_filter = Some(pages);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Command::RedactByTerm {
+                correlation_id: cid,
+                search_term: search_term.ok_or(CommandDecodeError::BadField("search_term"))?,
+                case_sensitive,
+                whole_word,
+                page_filter,
+            }))
+        }
         "QUIT" => Ok(Some(Command::Quit)),
         _ => Err(CommandDecodeError::UnknownCommand),
     }
@@ -895,6 +1140,88 @@ mod tests {
             expression: r#"AFSimple_Calculate("SUM", ["a","b"])"#.into(),
             fields: vec![("a".into(), 10.0), ("b".into(), 5.0)],
             enabled: true,
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    // --- M11 plugin commands ---
+
+    #[test]
+    fn typed_load_plugin_roundtrip() {
+        let cmd = Command::LoadPlugin {
+            correlation_id: 100,
+            plugin_id: "com.example.test".into(),
+            manifest_json: r#"{"id":"com.example.test","name":"Test"}"#.into(),
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn typed_unload_plugin_roundtrip() {
+        let cmd = Command::UnloadPlugin {
+            correlation_id: 101,
+            plugin_id: "com.example.test".into(),
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn typed_invoke_plugin_action_roundtrip() {
+        let cmd = Command::InvokePluginAction {
+            correlation_id: 102,
+            plugin_id: "com.example.test".into(),
+            action_id: "count_words".into(),
+            args_json: r#"{"page":1}"#.into(),
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    // --- M9 OCR command ---
+
+    #[test]
+    fn typed_render_page_for_ocr_roundtrip() {
+        let cmd = Command::RenderPageForOcr {
+            correlation_id: 200,
+            page_index: 3,
+            scale: 4.1667,
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    // --- M7 Redaction command ---
+
+    #[test]
+    fn typed_redact_by_term_roundtrip() {
+        let cmd = Command::RedactByTerm {
+            correlation_id: 300,
+            search_term: "SECRET".into(),
+            case_sensitive: true,
+            whole_word: false,
+            page_filter: Some(vec![0, 2, 4]),
+        };
+        let bytes = encode_command(&cmd);
+        let decoded = decode_command(&bytes).unwrap();
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn typed_redact_by_term_no_page_filter() {
+        let cmd = Command::RedactByTerm {
+            correlation_id: 301,
+            search_term: "confidential".into(),
+            case_sensitive: false,
+            whole_word: true,
+            page_filter: None,
         };
         let bytes = encode_command(&cmd);
         let decoded = decode_command(&bytes).unwrap();

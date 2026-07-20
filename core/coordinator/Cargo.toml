@@ -15,7 +15,9 @@ text-extract    = { path = "../text-extract" }
 search          = { path = "../search" }
 jobs            = { path = "../jobs" }
 sign            = { path = "../sign" }
+ocr-bridge      = { path = "../ocr-bridge" }
 plugin-host     = { path = "../plugin-host" }
 sandbox         = { path = "../sandbox" }
 protocol        = { path = "../protocol" }
 diagnostics     = { path = "../diagnostics" }
+base64          = "0.22"

@@ -13,10 +13,11 @@
 
 pub mod annotation;
 pub mod appearance;
-pub mod page_patch;
 pub mod assembly;
 pub mod assembly_ops;
+pub mod batch;
 pub mod command;
+pub mod page_patch;
 pub mod fdf;
 pub mod form;
 pub mod form_import;
@@ -26,3 +27,4 @@ pub mod overlay;
 pub mod organize;
 pub mod redaction;
 pub mod review;
+pub mod stamp;

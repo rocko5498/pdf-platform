@@ -1,0 +1,21 @@
+{
+    "id": "com.example.page-stamper",
+    "name": "Page Stamper",
+    "version": "1.0.0",
+    "author": "PDF Platform Team",
+    "description": "Adds page numbers as annotations to each page.",
+    "wit_world": "pdf-platform:plugin@1",
+    "capabilities": [
+        {"type": "ReadText"},
+        {"type": "Annotate"}
+    ],
+    "panels": [],
+    "tools": [
+        {
+            "id": "stamp-page-numbers",
+            "label": "Stamp Page Numbers",
+            "menu_path": "Plugins > Page Stamper > Add Page Numbers"
+        }
+    ],
+    "job_types": []
+}

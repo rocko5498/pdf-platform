@@ -6,6 +6,7 @@
 //! All mutations go through Commands (FR-FORM-6, ADR-013).
 
 use std::collections::HashMap;
+use std::io::Write;
 
 /// AcroForm field type. [FR-FORM-1]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -444,6 +445,133 @@ impl Default for AcroForm {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Form flattening [FR-FORM-4, PRIN-2, PRIN-6]
+// ---------------------------------------------------------------------------
+
+/// Result of flattening a form field into page content.
+#[derive(Debug, Clone)]
+pub struct FlattenFieldResult {
+    /// Page index this field belongs to.
+    pub page_index: u32,
+    /// Content stream bytes to append to the page's content stream.
+    pub content_stream: Vec<u8>,
+    /// Widget object number to remove from the page's /Annots.
+    pub widget_obj_num: Option<u32>,
+}
+
+/// Generate flatten content streams for all fields in the form. [FR-FORM-4]
+///
+/// Returns a vector of `FlattenFieldResult` — one per field with a value.
+/// The caller (coordinator/FFI) is responsible for:
+/// 1. Appending each page's content streams to the page's `/Contents`
+/// 2. Removing widget annotations from page `/Annots` arrays
+/// 3. Removing or emptying the `/AcroForm` dictionary
+/// 4. Creating a Command for undo
+///
+/// This is a **destructive** operation — the user MUST be warned (PRIN-6, DS-CONFIRM-1).
+pub fn flatten_form(form: &AcroForm) -> Vec<FlattenFieldResult> {
+    let mut results = Vec::new();
+    for field in form.fields.values() {
+        if field.value.is_empty() {
+            continue;
+        }
+        if matches!(field.field_type, FieldType::Button | FieldType::Signature) {
+            continue;
+        }
+        let content = generate_flatten_stream(field);
+        results.push(FlattenFieldResult {
+            page_index: field.page_index,
+            content_stream: content,
+            widget_obj_num: field.widget_obj_num,
+        });
+    }
+    results
+}
+
+/// Generate a PDF content stream that renders a field's value in page coordinates. [FR-FORM-4]
+fn generate_flatten_stream(field: &FormField) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let x = field.rect.x;
+    let y = field.rect.y;
+    let h = field.rect.height;
+    let font_size = field.font_size.unwrap_or(10.0).clamp(6.0, 24.0);
+
+    match field.field_type {
+        FieldType::Checkbox | FieldType::RadioButton => {
+            let label = match &field.value {
+                FieldValue::Bool(true) => "\u{2713}".to_string(), // checkmark
+                FieldValue::Bool(false) => String::new(),
+                FieldValue::Choice(s) => s.clone(),
+                _ => String::new(),
+            };
+            if label.is_empty() {
+                return buf;
+            }
+            write!(&mut buf, "q\n").unwrap();
+            write!(&mut buf, "0 0 0 rg\n").unwrap();
+            write!(&mut buf, "BT\n").unwrap();
+            write!(&mut buf, "/F1 {font_size:.1} Tf\n").unwrap();
+            write!(&mut buf, "{x:.1} {y:.1} Td\n").unwrap();
+            let escaped = escape_pdf_str(&label);
+            write!(&mut buf, "({escaped}) Tj\n").unwrap();
+            write!(&mut buf, "ET\n").unwrap();
+            write!(&mut buf, "Q\n").unwrap();
+        }
+        FieldType::ComboBox | FieldType::ListBox => {
+            let display = field.value.display();
+            if display.is_empty() {
+                return buf;
+            }
+            write!(&mut buf, "q\n").unwrap();
+            write!(&mut buf, "0 0 0 rg\n").unwrap();
+            write!(&mut buf, "BT\n").unwrap();
+            write!(&mut buf, "/F1 {font_size:.1} Tf\n").unwrap();
+            write!(&mut buf, "{x:.1} {y:.1} Td\n").unwrap();
+            let escaped = escape_pdf_str(&display);
+            write!(&mut buf, "({escaped}) Tj\n").unwrap();
+            write!(&mut buf, "ET\n").unwrap();
+            write!(&mut buf, "Q\n").unwrap();
+        }
+        FieldType::Text => {
+            let display = match &field.value {
+                FieldValue::None => return buf,
+                other => other.display(),
+            };
+            write!(&mut buf, "q\n").unwrap();
+            write!(&mut buf, "0 0 0 rg\n").unwrap();
+            write!(&mut buf, "BT\n").unwrap();
+            write!(&mut buf, "/F1 {font_size:.1} Tf\n").unwrap();
+            let baseline = (h - font_size).max(2.0);
+            let text_y = y + baseline;
+            write!(&mut buf, "{x:.1} {text_y:.1} Td\n").unwrap();
+            let escaped = escape_pdf_str(&display);
+            write!(&mut buf, "({escaped}) Tj\n").unwrap();
+            write!(&mut buf, "ET\n").unwrap();
+            write!(&mut buf, "Q\n").unwrap();
+        }
+        _ => {}
+    }
+    buf
+}
+
+/// Escape a string for PDF literal string syntax `(...)`.
+fn escape_pdf_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '(' => out.push_str("\\("),
+            ')' => out.push_str("\\)"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +758,67 @@ mod tests {
             form.fields().get("total").unwrap().value,
             FieldValue::Text("15".into())
         );
+    }
+
+    #[test]
+    fn flatten_text_field_produces_content_stream() {
+        let mut form = AcroForm::new();
+        let mut f = text_field("name");
+        f.set_value(FieldValue::Text("Alice".into()));
+        f.widget_obj_num = Some(10);
+        form.add_field(f);
+
+        let results = flatten_form(&form);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].page_index, 0);
+        assert_eq!(results[0].widget_obj_num, Some(10));
+        let stream = String::from_utf8_lossy(&results[0].content_stream);
+        assert!(stream.contains("Alice"), "flatten stream should contain field value");
+        assert!(stream.contains("BT"), "flatten stream should have text object");
+        assert!(stream.contains("ET"), "flatten stream should close text object");
+    }
+
+    #[test]
+    fn flatten_checkbox_produces_checkmark() {
+        let mut form = AcroForm::new();
+        let mut f = FormField::new("agree", FieldType::Checkbox, 0,
+            FieldRect::new(10.0, 20.0, 20.0, 20.0));
+        f.set_value(FieldValue::Bool(true));
+        f.widget_obj_num = Some(11);
+        form.add_field(f);
+
+        let results = flatten_form(&form);
+        assert_eq!(results.len(), 1);
+        let stream = String::from_utf8_lossy(&results[0].content_stream);
+        assert!(stream.contains("Tj"), "should have text rendering");
+    }
+
+    #[test]
+    fn flatten_empty_fields_produce_nothing() {
+        let mut form = AcroForm::new();
+        form.add_field(text_field("empty"));
+
+        let results = flatten_form(&form);
+        assert!(results.is_empty(), "empty fields should not produce flatten streams");
+    }
+
+    #[test]
+    fn flatten_button_skipped() {
+        let mut form = AcroForm::new();
+        let mut f = FormField::new("submit", FieldType::Button, 0,
+            FieldRect::new(0.0, 0.0, 80.0, 20.0));
+        f.value = FieldValue::Text("Submit".into());
+        form.add_field(f);
+
+        let results = flatten_form(&form);
+        assert!(results.is_empty(), "buttons should be skipped during flatten");
+    }
+
+    #[test]
+    fn escape_pdf_str_handles_specials() {
+        assert_eq!(escape_pdf_str("hello"), "hello");
+        assert_eq!(escape_pdf_str("a(b)"), "a\\(b\\)");
+        assert_eq!(escape_pdf_str("a\\b"), "a\\\\b");
+        assert_eq!(escape_pdf_str("line\nbreak"), "line\\nbreak");
     }
 }

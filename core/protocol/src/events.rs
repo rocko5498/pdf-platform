@@ -115,6 +115,61 @@ pub enum WorkerEvent {
         /// Error or honesty-log detail (unsupported surfaces, kill switch).
         message: String,
     },
+    /// Plugin loaded successfully. [FR-PLUG-1, ADR-014, M11]
+    PluginLoaded {
+        /// Correlation ID from the originating `LoadPlugin` command.
+        correlation_id: CorrelationId,
+        /// Plugin identifier.
+        plugin_id: String,
+    },
+    /// Plugin failed to load or crashed. [FR-PLUG-3, GR-8, M11]
+    PluginError {
+        /// Correlation ID from the originating command.
+        correlation_id: CorrelationId,
+        /// Plugin identifier.
+        plugin_id: String,
+        /// Human-readable error description.
+        message: String,
+    },
+    /// Plugin contributed UI elements (declarative schemas). [FR-PLUG-1, SDS §4.5, M11]
+    PluginUIContributed {
+        /// Correlation ID from the originating command.
+        correlation_id: CorrelationId,
+        /// Plugin identifier.
+        plugin_id: String,
+        /// Serialized panel contributions (JSON).
+        panels_json: String,
+        /// Serialized tool contributions (JSON).
+        tools_json: String,
+    },
+    /// Page raster for OCR processing. [FR-OCR, M9]
+    PageRasterReady {
+        /// Correlation ID from the originating `RenderPageForOcr` command.
+        correlation_id: CorrelationId,
+        /// 0-based page index.
+        page_index: u32,
+        /// Output width in pixels.
+        width: u32,
+        /// Output height in pixels.
+        height: u32,
+        /// RGBA8 pixel data (base64-encoded for wire transport).
+        pixels_b64: String,
+    },
+    /// Redaction result with verification report. [FR-RED-3, M7]
+    RedactResult {
+        /// Correlation ID from the originating `RedactByTerm` command.
+        correlation_id: CorrelationId,
+        /// Whether verification passed.
+        passed: bool,
+        /// Number of regions redacted.
+        regions_redacted: u32,
+        /// Number of content items confirmed removed.
+        items_removed: u32,
+        /// The full verification report text.
+        report: String,
+        /// Any remaining risks (empty on success).
+        risks: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +306,80 @@ has_structure={has_structure}\nfull_text={}\n",
                 u8::from(*ok),
             )
             .into_bytes()
+        }
+        WorkerEvent::PluginLoaded {
+            correlation_id,
+            plugin_id,
+        } => {
+            format!(
+                "EVT:PLUGIN_LOADED:{correlation_id}\n\
+                 plugin_id={plugin_id}\n"
+            )
+            .into_bytes()
+        }
+        WorkerEvent::PluginError {
+            correlation_id,
+            plugin_id,
+            message,
+        } => {
+            let escaped = message.replace('\n', "\\n");
+            format!(
+                "EVT:PLUGIN_ERROR:{correlation_id}\n\
+                 plugin_id={plugin_id}\nmessage={escaped}\n"
+            )
+            .into_bytes()
+        }
+        WorkerEvent::PluginUIContributed {
+            correlation_id,
+            plugin_id,
+            panels_json,
+            tools_json,
+        } => {
+            format!(
+                "EVT:PLUGIN_UI_CONTRIBUTED:{correlation_id}\n\
+                 plugin_id={plugin_id}\n\
+                 panels={}\ntools={}\n",
+                panels_json.replace('\n', "\\n"),
+                tools_json.replace('\n', "\\n")
+            )
+            .into_bytes()
+        }
+        WorkerEvent::PageRasterReady {
+            correlation_id,
+            page_index,
+            width,
+            height,
+            pixels_b64,
+        } => {
+            format!(
+                "EVT:PAGE_RASTER_READY:{correlation_id}\n\
+                 page_index={page_index}\nwidth={width}\nheight={height}\n\
+                 pixels={}\n",
+                pixels_b64.replace('\n', "\\n")
+            )
+            .into_bytes()
+        }
+        WorkerEvent::RedactResult {
+            correlation_id,
+            passed,
+            regions_redacted,
+            items_removed,
+            report,
+            risks,
+        } => {
+            let mut out = format!(
+                "EVT:REDACT_RESULT:{correlation_id}\n\
+                 passed={}\nregions_redacted={}\nitems_removed={}\n\
+                 report={}\n",
+                u8::from(*passed),
+                regions_redacted,
+                items_removed,
+                report.replace('\n', "\\n")
+            );
+            for risk in risks {
+                out.push_str(&format!("risk={}\n", risk.replace('\n', "\\n")));
+            }
+            out.into_bytes()
         }
     }
 }
@@ -626,6 +755,116 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
                 message: message.unwrap_or_default(),
             })
         }
+        "PLUGIN_LOADED" => {
+            let mut plugin_id = None;
+            for line in lines {
+                if let Some((k, v)) = line.split_once('=') {
+                    if k == "plugin_id" {
+                        plugin_id = Some(v.to_string());
+                    }
+                }
+            }
+            Ok(WorkerEvent::PluginLoaded {
+                correlation_id,
+                plugin_id: plugin_id.ok_or(EventDecodeError::BadField("plugin_id"))?,
+            })
+        }
+        "PLUGIN_ERROR" => {
+            let mut plugin_id = None;
+            let mut message = None;
+            for line in lines {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "plugin_id" => plugin_id = Some(v.to_string()),
+                        "message" => message = Some(v.replace("\\n", "\n")),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(WorkerEvent::PluginError {
+                correlation_id,
+                plugin_id: plugin_id.ok_or(EventDecodeError::BadField("plugin_id"))?,
+                message: message.unwrap_or_default(),
+            })
+        }
+        "PLUGIN_UI_CONTRIBUTED" => {
+            let mut plugin_id = None;
+            let mut panels = None;
+            let mut tools = None;
+            for line in lines {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "plugin_id" => plugin_id = Some(v.to_string()),
+                        "panels" => panels = Some(v.replace("\\n", "\n")),
+                        "tools" => tools = Some(v.replace("\\n", "\n")),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(WorkerEvent::PluginUIContributed {
+                correlation_id,
+                plugin_id: plugin_id.ok_or(EventDecodeError::BadField("plugin_id"))?,
+                panels_json: panels.unwrap_or_default(),
+                tools_json: tools.unwrap_or_default(),
+            })
+        }
+        "PAGE_RASTER_READY" => {
+            let mut page_index = None;
+            let mut width = None;
+            let mut height = None;
+            let mut pixels = None;
+            for line in lines {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "page_index" => page_index = Some(v.parse().map_err(|_| EventDecodeError::BadField("page_index"))?),
+                        "width" => width = Some(v.parse().map_err(|_| EventDecodeError::BadField("width"))?),
+                        "height" => height = Some(v.parse().map_err(|_| EventDecodeError::BadField("height"))?),
+                        "pixels" => pixels = Some(v.replace("\\n", "\n")),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(WorkerEvent::PageRasterReady {
+                correlation_id,
+                page_index: page_index.ok_or(EventDecodeError::BadField("page_index"))?,
+                width: width.ok_or(EventDecodeError::BadField("width"))?,
+                height: height.ok_or(EventDecodeError::BadField("height"))?,
+                pixels_b64: pixels.unwrap_or_default(),
+            })
+        }
+        "REDACT_RESULT" => {
+            let mut passed = false;
+            let mut regions_redacted = None;
+            let mut items_removed = None;
+            let mut report = None;
+            let mut risks = Vec::new();
+            for line in lines {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k {
+                        "passed" => {
+                            passed = v == "1" || v.eq_ignore_ascii_case("true");
+                        }
+                        "regions_redacted" => {
+                            regions_redacted = Some(v.parse().map_err(|_| EventDecodeError::BadField("regions_redacted"))?);
+                        }
+                        "items_removed" => {
+                            items_removed = Some(v.parse().map_err(|_| EventDecodeError::BadField("items_removed"))?);
+                        }
+                        "report" => report = Some(v.replace("\\n", "\n")),
+                        "risk" => risks.push(v.replace("\\n", "\n")),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(WorkerEvent::RedactResult {
+                correlation_id,
+                passed,
+                regions_redacted: regions_redacted.ok_or(EventDecodeError::BadField("regions_redacted"))?,
+                items_removed: items_removed.ok_or(EventDecodeError::BadField("items_removed"))?,
+                report: report.unwrap_or_default(),
+                risks,
+            })
+        }
         _ => Err(EventDecodeError::UnknownEvent),
     }
 }
@@ -684,6 +923,34 @@ pub enum CoordinatorEvent {
         /// Whether the document has unsaved changes.
         dirty: bool,
     },
+    /// Plugin state changed (loaded/unloaded/error). [FR-PLUG-1, ADR-014, M11]
+    PluginStateChanged {
+        /// Plugin identifier.
+        plugin_id: String,
+        /// New state of the plugin.
+        state: PluginState,
+    },
+}
+
+/// Plugin lifecycle state for the wire/event type. [SDS §11]
+///
+/// This mirrors `plugin_host::PluginState` but lives in the protocol crate
+/// to avoid a circular dependency (protocol must not depend on plugin-host).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginState {
+    /// Manifest discovered and validated.
+    Discovered,
+    /// Plugin enabled by user/admin; grants recorded.
+    Enabled,
+    /// WASM instance loaded and running.
+    Running,
+    /// Plugin failed to load or crashed.
+    Failed {
+        /// Human-readable failure reason. [GR-8]
+        reason: String,
+    },
+    /// Plugin disabled by user/admin.
+    Disabled,
 }
 
 // ---------------------------------------------------------------------------
@@ -816,6 +1083,93 @@ mod tests {
             ok: true,
             value: 15.0,
             message: String::new(),
+        };
+        let bytes = encode_worker_event(&event);
+        let decoded = decode_worker_event(&bytes).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    // --- M11 plugin events ---
+
+    #[test]
+    fn plugin_loaded_roundtrip() {
+        let event = WorkerEvent::PluginLoaded {
+            correlation_id: 100,
+            plugin_id: "com.example.test".into(),
+        };
+        let bytes = encode_worker_event(&event);
+        let decoded = decode_worker_event(&bytes).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn plugin_error_roundtrip() {
+        let event = WorkerEvent::PluginError {
+            correlation_id: 101,
+            plugin_id: "com.example.test".into(),
+            message: "quota breach\ninstance killed".into(),
+        };
+        let bytes = encode_worker_event(&event);
+        let decoded = decode_worker_event(&bytes).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn plugin_ui_contributed_roundtrip() {
+        let event = WorkerEvent::PluginUIContributed {
+            correlation_id: 102,
+            plugin_id: "com.example.test".into(),
+            panels_json: r#"[{"id":"info","label":"Info"}]"#.into(),
+            tools_json: r#"[{"id":"count","label":"Count"}]"#.into(),
+        };
+        let bytes = encode_worker_event(&event);
+        let decoded = decode_worker_event(&bytes).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    // --- M9 OCR event ---
+
+    #[test]
+    fn page_raster_ready_roundtrip() {
+        // Test with a small base64 payload.
+        let event = WorkerEvent::PageRasterReady {
+            correlation_id: 200,
+            page_index: 3,
+            width: 100,
+            height: 200,
+            pixels_b64: "AAABBB".into(),
+        };
+        let bytes = encode_worker_event(&event);
+        let decoded = decode_worker_event(&bytes).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    // --- M7 Redaction event ---
+
+    #[test]
+    fn redact_result_roundtrip() {
+        let event = WorkerEvent::RedactResult {
+            correlation_id: 300,
+            passed: true,
+            regions_redacted: 5,
+            items_removed: 12,
+            report: "PASSED\nAll content removed".into(),
+            risks: vec!["minor risk".into()],
+        };
+        let bytes = encode_worker_event(&event);
+        let decoded = decode_worker_event(&bytes).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn redact_result_failure_roundtrip() {
+        let event = WorkerEvent::RedactResult {
+            correlation_id: 301,
+            passed: false,
+            regions_redacted: 2,
+            items_removed: 3,
+            report: "FAILED".into(),
+            risks: vec!["risk1".into(), "risk2".into()],
         };
         let bytes = encode_worker_event(&event);
         let decoded = decode_worker_event(&bytes).unwrap();

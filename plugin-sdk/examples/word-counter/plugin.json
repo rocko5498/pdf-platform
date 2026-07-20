@@ -1,0 +1,20 @@
+{
+    "id": "com.example.word-counter",
+    "name": "Word Counter",
+    "version": "1.0.0",
+    "author": "PDF Platform Team",
+    "description": "Counts words in the document and displays the result in a panel.",
+    "wit_world": "pdf-platform:plugin@1",
+    "capabilities": [
+        {"type": "ReadText"}
+    ],
+    "panels": [
+        {
+            "id": "word-count",
+            "label": "Word Count",
+            "position": "Right"
+        }
+    ],
+    "tools": [],
+    "job_types": []
+}

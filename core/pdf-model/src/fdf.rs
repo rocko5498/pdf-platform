@@ -382,6 +382,17 @@ pub fn import_xfdf_to_store(content: &str, store: &mut AnnotationStore) -> usize
     added
 }
 
+/// Import XFDF form field data into an `AcroForm`. [FR-FORM-3]
+///
+/// Parses the XFDF content and applies matching field values to the form.
+/// Returns the number of fields whose values were changed.
+/// Unknown field names in the XFDF are silently skipped (honest interop:
+/// another tool may have exported extra fields we don't have).
+pub fn import_xfdf_form_data(content: &str, form: &mut AcroForm) -> u32 {
+    let (_annots, fields) = parse_xfdf(content);
+    form.import_values(&fields)
+}
+
 /// Interop helper: export then re-import must preserve count and types. [FR-REV-4]
 pub fn xfdf_roundtrip_count(store: &AnnotationStore) -> (usize, usize) {
     let xml = export_xfdf(store, None);
@@ -413,6 +424,65 @@ mod tests {
         assert!(xfdf.contains("<Highlight"));
         assert!(xfdf.contains("Alice"));
         assert!(xfdf.contains("Important note"));
+    }
+
+    #[test]
+    fn xfdf_form_data_roundtrip() {
+        // [FR-FORM-3] export form values → import into fresh form → values match.
+        let mut store = AnnotationStore::new();
+        let mut form = AcroForm::new();
+        form.add_field(crate::form::FormField::new("name", FieldType::Text, 0,
+            FieldRect::new(0.0, 0.0, 200.0, 20.0)));
+        form.set_field_value("name", FieldValue::Text("Alice".into()));
+        form.add_field(crate::form::FormField::new("agree", FieldType::Checkbox, 0,
+            FieldRect::new(0.0, 20.0, 20.0, 20.0)));
+        form.set_field_value("agree", FieldValue::Bool(true));
+        form.add_field(crate::form::FormField::new("color", FieldType::ComboBox, 0,
+            FieldRect::new(0.0, 40.0, 100.0, 20.0)));
+        form.set_field_value("color", FieldValue::Choice("red".into()));
+
+        // Export to XFDF.
+        let xfdf = export_xfdf(&store, Some(&form));
+        assert!(xfdf.contains("Alice"));
+        assert!(xfdf.contains("Yes")); // checkbox true
+        assert!(xfdf.contains("red"));
+
+        // Import into a fresh form with the same fields.
+        let mut fresh_form = AcroForm::new();
+        fresh_form.add_field(crate::form::FormField::new("name", FieldType::Text, 0,
+            FieldRect::new(0.0, 0.0, 200.0, 20.0)));
+        fresh_form.add_field(crate::form::FormField::new("agree", FieldType::Checkbox, 0,
+            FieldRect::new(0.0, 20.0, 20.0, 20.0)));
+        fresh_form.add_field(crate::form::FormField::new("color", FieldType::ComboBox, 0,
+            FieldRect::new(0.0, 40.0, 100.0, 20.0)));
+
+        let changed = import_xfdf_form_data(&xfdf, &mut fresh_form);
+        assert!(changed >= 3, "expected at least 3 fields changed, got {changed}");
+
+        // Verify values round-tripped.
+        assert_eq!(fresh_form.field("name").unwrap().value, FieldValue::Text("Alice".into()));
+        assert_eq!(fresh_form.field("agree").unwrap().value, FieldValue::Bool(true));
+        assert_eq!(fresh_form.field("color").unwrap().value, FieldValue::Choice("red".into()));
+    }
+
+    #[test]
+    fn xfdf_form_data_unknown_fields_skipped() {
+        // [FR-FORM-3] XFDF with a field name not in the form is silently skipped.
+        let xfdf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xfdf xmlns="http://ns.adobe.com/xfdf/" xml:space="preserve">
+  <f>
+    <field name="existing" value="hello"/>
+    <field name="unknown_field" value="world"/>
+  </f>
+</xfdf>"#;
+
+        let mut form = AcroForm::new();
+        form.add_field(crate::form::FormField::new("existing", FieldType::Text, 0,
+            FieldRect::new(0.0, 0.0, 100.0, 20.0)));
+
+        let changed = import_xfdf_form_data(xfdf, &mut form);
+        assert_eq!(changed, 1);
+        assert_eq!(form.field("existing").unwrap().value, FieldValue::Text("hello".into()));
     }
 
     #[test]

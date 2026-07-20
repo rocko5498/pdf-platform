@@ -53,6 +53,11 @@ pub struct ScannedFormField {
     pub read_only: bool,
     /// Required flag from `/Ff` bit 2 when present.
     pub required: bool,
+    /// Raw `/Ff` flags value (for radio-button detection, bit 16 = radio). [FR-FORM-1]
+    pub flags: u32,
+    /// Options for combo/list fields (`/Opt` array). Each is (export_value, display_label).
+    /// [FR-FORM-1]
+    pub options: Vec<(String, String)>,
     /// Widget / field object number when known.
     pub widget_obj_num: Option<u32>,
     /// Tab order (document order among leaves, then override if `/TabOrder` later).
@@ -269,6 +274,7 @@ fn walk_field(
     let ff = parse_int_after_pdf_key(body, b"/Ff").unwrap_or(0) as u32;
     let read_only = (ff & 1) != 0;
     let required = (ff & 2) != 0;
+    let options = parse_opt_array(body);
 
     *tab += 1;
     out.push(ScannedFormField {
@@ -280,6 +286,8 @@ fn walk_field(
         calculation,
         read_only,
         required,
+        flags: ff,
+        options,
         widget_obj_num: Some(obj_num),
         tab_order: *tab,
     });
@@ -366,6 +374,61 @@ fn parse_int_after_pdf_key(data: &[u8], key: &[u8]) -> Option<i64> {
     }
     let n: i64 = std::str::from_utf8(&after[start..i]).ok()?.parse().ok()?;
     Some(if neg { -n } else { n })
+}
+
+fn parse_opt_array(body: &[u8]) -> Vec<(String, String)> {
+    let Some(pos) = find_pdf_key(body, b"/Opt") else {
+        return Vec::new();
+    };
+    let after = &body[pos + 4..];
+    let mut i = 0;
+    skip_ws(after, &mut i);
+    if after.get(i) != Some(&b'[') {
+        return Vec::new();
+    }
+    i += 1;
+    let mut opts = Vec::new();
+    while i < after.len() && after[i] != b']' {
+        skip_ws(after, &mut i);
+        if after.get(i) == Some(&b'(') {
+            // Simple string option: (label)
+            if let Some((label, next)) = parse_pdf_string_at(after, i) {
+                opts.push((label.clone(), label));
+                i = next;
+                continue;
+            }
+        }
+        if after.get(i) == Some(&b'[') {
+            // Two-element array: [export display]
+            i += 1;
+            skip_ws(after, &mut i);
+            let export = if let Some((s, next)) = parse_pdf_string_at(after, i) {
+                i = next;
+                s
+            } else {
+                // Skip non-string tokens.
+                while i < after.len() && after[i] != b']' && after[i] != b' ' {
+                    i += 1;
+                }
+                continue;
+            };
+            skip_ws(after, &mut i);
+            let display = if let Some((s, next)) = parse_pdf_string_at(after, i) {
+                i = next;
+                s
+            } else {
+                export.clone()
+            };
+            skip_ws(after, &mut i);
+            if after.get(i) == Some(&b']') {
+                i += 1;
+            }
+            opts.push((export, display));
+            continue;
+        }
+        i += 1;
+    }
+    opts
 }
 
 fn parse_rect(body: &[u8]) -> Option<[f32; 4]> {

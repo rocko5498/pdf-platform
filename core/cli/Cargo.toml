@@ -14,3 +14,8 @@ protocol    = { path = "../protocol" }
 diagnostics = { path = "../diagnostics" }
 sandbox     = { path = "../sandbox" }
 pdf-model   = { path = "../pdf-model" }
+sign        = { path = "../sign" }
+ocr-bridge  = { path = "../ocr-bridge" }
+plugin-host = { path = "../plugin-host" }
+plugin-sdk  = { path = "../../plugin-sdk", package = "pdf-platform-plugin-sdk" }
+serde_json  = "1"

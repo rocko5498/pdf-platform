@@ -32,7 +32,12 @@ Precedence on conflict: ADR → SDS → PRD → UI/UX Design System → Implemen
 | **M4** Annotations | **Mostly complete** | Appearance streams, QuadPoints, tools, XFDF + interop unit matrix, incremental save with `/Annots` patch + XFDF sidecar. External Acrobat/Foxit lab still open. |
 | **M5** Forms JS | **Subset + wire + AP + COS import** | `forms_js`, kill switch, `CMD:FORMS_CALC`, widget `/AP`, shell Forms panel, **AcroForm leaf import on open**. Flatten/FDF full product still open. |
 | **M6** Assembly | **CLI (qpdf)** | merge / split / extract-pages / optimize + preflight honesty. Pure-Rust assembly deferred. |
-| **M7–M12** | Models ahead | Redaction/sign/OCR crates exist; product exits not claimed. |
+| **M7** Redaction | **CLI complete** | `redact-by-term` command with text search, content removal, verification pass, signed report. |
+| **M8** Signatures | **CLI complete** | `validate-signatures` command with ByteRange validation, DocMDP analysis, plain-language reporting. |
+| **M9** OCR | **CLI + coordinator wired** | `ocr` command with Tesseract backend, text layer generation, coordinator `ocr_page` method, `RenderPageForOcr` protocol. |
+| **M10** Compliance | **CLI complete** | `validate-pdf-a` command with level selection (1a–4), errors/warnings reporting. |
+| **M11** Plugins | **CLI complete** | `plugin-list` + `plugin-validate` commands, plugin-host with Wasmtime runtime, capability grants, circuit breaker. |
+| **M12** Compare | **CLI complete** | `compare` command with text-based document comparison, line-by-line diff. |
 
 Criterion-level status: [docs/milestone-exit-tracker.md](docs/milestone-exit-tracker.md).  
 Release checklist: [docs/release-gates.md](docs/release-gates.md).
@@ -58,6 +63,13 @@ cargo run -p cli --bin pdf-platform -- export-text path/to/file.pdf 0
 cargo run -p cli --bin pdf-platform -- optimize-preflight path/to/file.pdf screen
 cargo run -p cli --bin pdf-platform -- merge a.pdf b.pdf -o out.pdf
 cargo run -p cli --bin pdf-platform -- split in.pdf -o split-out/
+cargo run -p cli --bin pdf-platform -- redact-by-term doc.pdf --term "SECRET"
+cargo run -p cli --bin pdf-platform -- validate-signatures doc.pdf
+cargo run -p cli --bin pdf-platform -- validate-pdf-a doc.pdf --level 2b
+cargo run -p cli --bin pdf-platform -- ocr scanned.pdf --lang eng
+cargo run -p cli --bin pdf-platform -- compare doc_v1.pdf doc_v2.pdf
+cargo run -p cli --bin pdf-platform -- plugin-list
+cargo run -p cli --bin pdf-platform -- plugin-validate plugin.json
 cargo run -p cli --bin pdf-platform -- forms-calc-demo
 cargo run -p cli --bin pdf-platform -- confinement
 cargo test --workspace

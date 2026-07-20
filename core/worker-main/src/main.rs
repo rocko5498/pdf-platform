@@ -153,6 +153,19 @@ fn main() -> ExitCode {
                         Command::GetObject { correlation_id, obj_num } => {
                             handle_get_object(&doc_file, correlation_id, obj_num, &mut transport);
                         }
+                        Command::RenderPageForOcr {
+                            correlation_id,
+                            page_index,
+                            scale,
+                        } => {
+                            handle_render_page_for_ocr(
+                                pdfium.as_ref().map(|e| e as &dyn Rasterize),
+                                correlation_id,
+                                page_index,
+                                scale,
+                                &mut transport,
+                            );
+                        }
                         Command::FormsCalc {
                             correlation_id,
                             expression,
@@ -171,8 +184,9 @@ fn main() -> ExitCode {
                         Command::DeletePages { correlation_id, .. } |
                         Command::RotatePages { correlation_id, .. } |
                         Command::AddAnnotation { correlation_id, .. } |
-                        Command::DeleteAnnotation { correlation_id, .. } => {
-                            send_error(&mut transport, correlation_id, "organize/annotation commands are coordinator-level");
+                        Command::DeleteAnnotation { correlation_id, .. } |
+                        Command::RedactByTerm { correlation_id, .. } => {
+                            send_error(&mut transport, correlation_id, "organize/annotation/redaction commands are coordinator-level");
                         }
                         // M11 plugin commands — handled by coordinator, not document worker.
                         Command::LoadPlugin { correlation_id, .. } |
@@ -352,6 +366,64 @@ fn handle_extract_page(
         }
         Err(e) => {
             send_error(transport, correlation_id, &format!("extract failed: {e}"));
+        }
+    }
+}
+
+/// Render a full page as a raster for OCR processing. [FR-OCR, M9]
+///
+/// Renders the entire page at the specified DPI scale and returns the
+/// RGBA8 pixel data directly (not via shared memory). The coordinator
+/// uses this to run OCR on the raster.
+fn handle_render_page_for_ocr(
+    engine: Option<&dyn Rasterize>,
+    correlation_id: u64,
+    page_index: u32,
+    scale: f32,
+    transport: &mut Box<dyn protocol::transport::WorkerTransport>,
+) {
+    let Some(eng) = engine else {
+        send_error(transport, correlation_id, "no rasterize engine loaded");
+        return;
+    };
+
+    // Get page dimensions by rendering a 1x1 tile to discover the page size.
+    let page_count = eng.page_count();
+    if page_index >= page_count {
+        send_error(transport, correlation_id, &format!(
+            "page {} out of range (document has {} pages)", page_index, page_count
+        ));
+        return;
+    }
+
+    // Render the full page at the requested scale.
+    // We render the entire page as one tile by using a large rect.
+    let output = eng.rasterize(&RasterizeRequest {
+        page_index,
+        rect: TileRect { x: 0, y: 0, w: 8192, h: 8192 },
+        scale,
+    });
+
+    match output {
+        Ok(tile) => {
+            // Encode pixels as base64 for wire transport.
+            use base64::Engine;
+            let pixels_b64 = base64::engine::general_purpose::STANDARD.encode(&tile.rgba_pixels);
+
+            let event = WorkerEvent::PageRasterReady {
+                correlation_id,
+                page_index,
+                width: tile.width,
+                height: tile.height,
+                pixels_b64,
+            };
+            let body = encode_worker_event(&event);
+            if let Err(e) = transport.send(&body) {
+                eprintln!("worker: send PAGE_RASTER_READY failed: {e}");
+            }
+        }
+        Err(e) => {
+            send_error(transport, correlation_id, &format!("render for OCR failed: {e}"));
         }
     }
 }

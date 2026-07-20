@@ -94,6 +94,42 @@ pub struct StructureQueryResult {
     pub flag: bool,
 }
 
+/// Result of a redact-by-term operation. [FR-RED-3, M7]
+#[derive(Debug, Clone)]
+pub struct RedactByTermResult {
+    /// Whether verification passed.
+    pub passed: bool,
+    /// Number of regions redacted.
+    pub regions_redacted: u32,
+    /// Number of content items confirmed removed.
+    pub items_removed: u32,
+    /// The full verification report text.
+    pub report: String,
+    /// Any remaining risks (empty on success).
+    pub risks: Vec<String>,
+}
+
+/// Result of a page raster for OCR. [FR-OCR, M9]
+#[derive(Debug, Clone)]
+pub struct PageRasterResult {
+    /// 0-based page index.
+    pub page_index: u32,
+    /// Output width in pixels.
+    pub width: u32,
+    /// Output height in pixels.
+    pub height: u32,
+    /// RGBA8 pixel data.
+    pub pixels: Vec<u8>,
+}
+
+/// Minimal base64 decoder.
+fn base64_decode(input: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(input.trim_end_matches('='))
+        .unwrap_or_default()
+}
+
 fn parse_line_geom(g: &str) -> Option<engine_api::extract::TextLine> {
     // idx|x|y|w|h|text
     let parts: Vec<&str> = g.splitn(6, '|').collect();
@@ -391,6 +427,98 @@ impl WorkerSession {
                 total: count,
                 data,
                 flag: count > 0,
+            }),
+            Ok(WorkerEvent::RenderError {
+                correlation_id: cid,
+                message,
+            }) if cid == correlation_id => Err(SessionError::Protocol(message)),
+            Ok(other) => Err(SessionError::Protocol(format!("unexpected: {other:?}"))),
+            Err(e) => Err(SessionError::Protocol(format!("decode: {e}"))),
+        }
+    }
+
+    /// Render a full page as a raster for OCR processing. [FR-OCR, M9]
+    ///
+    /// Sends a `RenderPageForOcr` command to the worker, which renders
+    /// the entire page at the specified DPI scale and returns the RGBA8
+    /// pixel data directly.
+    pub fn render_page_for_ocr(
+        &mut self,
+        page_index: u32,
+        scale: f32,
+    ) -> Result<PageRasterResult, SessionError> {
+        let correlation_id = self.next_correlation_id();
+        let cmd = Command::RenderPageForOcr {
+            correlation_id,
+            page_index,
+            scale,
+        };
+        let body = encode_command(&cmd);
+        self.send(&body)?;
+        let reply = self.recv_frame(Duration::from_secs(60))?;
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::PageRasterReady {
+                correlation_id: cid,
+                page_index: pi,
+                width,
+                height,
+                pixels_b64,
+            }) if cid == correlation_id && pi == page_index => {
+                // Decode base64 pixels.
+                let pixels = base64_decode(&pixels_b64);
+                Ok(PageRasterResult {
+                    page_index,
+                    width,
+                    height,
+                    pixels,
+                })
+            }
+            Ok(WorkerEvent::RenderError {
+                correlation_id: cid,
+                message,
+            }) if cid == correlation_id => Err(SessionError::Protocol(message)),
+            Ok(other) => Err(SessionError::Protocol(format!("unexpected: {other:?}"))),
+            Err(e) => Err(SessionError::Protocol(format!("decode: {e}"))),
+        }
+    }
+
+    /// Redact text by search term across pages. [FR-RED-5, FR-RED-6, M7]
+    ///
+    /// Sends a `RedactByTerm` command to the worker, which searches for
+    /// the term, marks matching regions, applies content removal, scrubs
+    /// metadata, removes overlapping annotations, and verifies the result.
+    pub fn redact_by_term(
+        &mut self,
+        search_term: &str,
+        case_sensitive: bool,
+        whole_word: bool,
+        page_filter: Option<Vec<u32>>,
+    ) -> Result<RedactByTermResult, SessionError> {
+        let correlation_id = self.next_correlation_id();
+        let cmd = Command::RedactByTerm {
+            correlation_id,
+            search_term: search_term.to_string(),
+            case_sensitive,
+            whole_word,
+            page_filter,
+        };
+        let body = encode_command(&cmd);
+        self.send(&body)?;
+        let reply = self.recv_frame(Duration::from_secs(60))?;
+        match decode_worker_event(&reply) {
+            Ok(WorkerEvent::RedactResult {
+                correlation_id: cid,
+                passed,
+                regions_redacted,
+                items_removed,
+                report,
+                risks,
+            }) if cid == correlation_id => Ok(RedactByTermResult {
+                passed,
+                regions_redacted,
+                items_removed,
+                report,
+                risks,
             }),
             Ok(WorkerEvent::RenderError {
                 correlation_id: cid,

@@ -11,7 +11,6 @@ members = [
     # Engine seam
     "engine-api",
     "engine-pdfium",
-    "engine-hayro",
     "engine-stub",
     # Services
     "render-pipeline",

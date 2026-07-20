@@ -12,12 +12,10 @@ path = "src/main.rs"
 # Engine backends optional — ping/echo path needs none (M0 slice 2).
 default       = ["pdfium"]
 pdfium        = ["dep:engine-pdfium"]
-hayro         = ["dep:engine-hayro"]
 
 [dependencies]
 engine-api    = { path = "../engine-api" }
 engine-pdfium = { path = "../engine-pdfium", optional = true }
-engine-hayro  = { path = "../engine-hayro", optional = true }
 engine-stub   = { path = "../engine-stub" }
 memmap2       = "0.9"
 pdf-cos       = { path = "../pdf-cos" }
@@ -25,6 +23,7 @@ sandbox       = { path = "../sandbox" }
 protocol      = { path = "../protocol" }
 diagnostics   = { path = "../diagnostics" }
 pdf-model     = { path = "../pdf-model" }
+base64        = "0.22"
 
 [dev-dependencies]
 # Integration tests link spawn + protocol + session types.

@@ -1,0 +1,230 @@
+/// WIT world for the PDF Platform plugin system. [ADR-014, ADR-015, M11]
+///
+/// Version: 1.0.0
+/// This is the semver unit for plugin compatibility. [ADR-015, ADR-030]
+///
+/// Plugins are WASM components that import host functions and export a `run`
+/// entry point. Host functions are capability-gated: ungranted capabilities
+/// are absent from the instance, not merely denied. [ADR-014 §2]
+
+package pdf-platform:plugin@1;
+
+// ---------------------------------------------------------------------------
+// Plugin lifecycle interface
+// ---------------------------------------------------------------------------
+
+/// Information passed to the plugin during initialization.
+record init-info {
+    /// Capabilities granted to this plugin (string identifiers).
+    capabilities: list<string>,
+    /// The plugin API version this host provides.
+    host-version: string,
+    /// The plugin's own version from its manifest.
+    plugin-version: string,
+}
+
+/// Plugin lifecycle interface. The host calls these in order:
+/// init → run (exported) → shutdown.
+interface lifecycle {
+    /// Initialize the plugin. Called once before any other host function.
+    /// The plugin should store the init-info and prepare internal state.
+    init: func(info: init-info);
+
+    /// Shut down the plugin. Called when the plugin is being unloaded.
+    /// The plugin should release resources and flush any pending work.
+    shutdown: func();
+}
+
+// ---------------------------------------------------------------------------
+// Document read access (capability-gated: ReadText, ReadStructure)
+// ---------------------------------------------------------------------------
+
+/// A single text span within a line.
+record text-span {
+    /// The text content.
+    text: string,
+    /// X position in PDF user-space.
+    x: f32,
+    /// Y position in PDF user-space.
+    y: f32,
+    /// Width in PDF user-space.
+    width: f32,
+    /// Height in PDF user-space.
+    height: f32,
+    /// Index of the line containing this span.
+    line-index: u32,
+    /// Index of this span within its line.
+    word-index: u32,
+    /// Whether this span comes from tagged structure.
+    is-structured: bool,
+}
+
+/// A line of extracted text with geometry.
+record text-line {
+    /// Line index within the page.
+    index: u32,
+    /// The full text of this line.
+    text: string,
+    /// X position of the line bounding box.
+    x: f32,
+    /// Y position of the line bounding box.
+    y: f32,
+    /// Width of the line bounding box.
+    width: f32,
+    /// Height of the line bounding box.
+    height: f32,
+    /// Individual spans within this line.
+    spans: list<text-span>,
+}
+
+/// The canonical text model for a single page.
+record page-text {
+    /// 0-based page index.
+    page-index: u32,
+    /// Extracted text lines with geometry.
+    lines: list<text-line>,
+    /// Whether the text extraction is reliable (good ToUnicode, etc.).
+    reliable: bool,
+    /// Total character count.
+    char-count: u32,
+    /// Whether the page has tagged structure.
+    has-structure: bool,
+}
+
+/// An outline (bookmark) entry.
+record outline-entry {
+    /// Display title.
+    title: string,
+    /// Target page index.
+    page: u32,
+    /// Y offset on the target page.
+    y: f32,
+    /// Zoom level for the destination.
+    zoom: f32,
+    /// Nested child entries.
+    children: list<outline-entry>,
+}
+
+/// An optional content group (layer).
+record layer {
+    /// Layer identifier.
+    id: string,
+    /// Display name.
+    name: string,
+    /// Whether the layer is currently visible.
+    visible: bool,
+    /// Whether the layer is locked.
+    locked: bool,
+    /// Whether the layer is on by default.
+    default-on: bool,
+    /// Nested child layers.
+    children: list<layer>,
+}
+
+/// An embedded file attachment.
+record attachment {
+    /// File name.
+    name: string,
+    /// MIME type (if known).
+    mime-type: string,
+    /// File size in bytes.
+    size: u64,
+    /// Description (if any).
+    description: string,
+}
+
+/// Document read interface. Capability-gated: ReadText, ReadStructure.
+interface document-read {
+    /// Get the total number of pages in the document.
+    get-page-count: func() -> u32;
+
+    /// Extract the canonical text model for a page.
+    /// Returns an error if the page index is out of range or extraction fails.
+    get-page-text: func(page-index: u32) -> result<page-text, string>;
+
+    /// Get the document outline (bookmarks).
+    get-outline: func() -> result<list<outline-entry>, string>;
+
+    /// Get optional content groups (layers).
+    get-layers: func() -> result<list<layer>, string>;
+
+    /// Get embedded file attachments.
+    get-attachments: func() -> result<list<attachment>, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Document write via Commands (capability-gated: Annotate)
+// ---------------------------------------------------------------------------
+
+/// Specification for creating an annotation.
+record annotation-spec {
+    /// Annotation type (e.g., "highlight", "sticky_note", "ink").
+    annotation-type: string,
+    /// 0-based page index.
+    page-index: u32,
+    /// Rect in PDF user-space: "x,y,width,height".
+    rect: string,
+    /// Optional content text (for sticky notes, free text).
+    contents: option<string>,
+    /// Optional color as "r,g,b,a" (0.0-1.0 each).
+    color: option<string>,
+}
+
+/// Document write interface. Capability-gated: Annotate.
+///
+/// All mutations go through Commands (ADR-013), making them undoable
+/// and attributable to the plugin. [FR-PLUG-4]
+interface document-write {
+    /// Submit an annotation to the document.
+    /// Returns the annotation ID on success, or an error string.
+    submit-annotation: func(spec: annotation-spec) -> result<u64, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Host logging (always available)
+// ---------------------------------------------------------------------------
+
+/// Log levels matching standard severity.
+enum log-level {
+    trace,
+    debug,
+    info,
+    warn,
+    error,
+}
+
+/// Host logging interface. Always available (no capability required).
+interface host-log {
+    /// Write a log message to the host's diagnostics system. [ADR-020]
+    log: func(level: log-level, message: string);
+}
+
+// ---------------------------------------------------------------------------
+// The plugin world
+// ---------------------------------------------------------------------------
+
+/// The plugin world defines what a plugin can import (host functions)
+/// and must export (the `run` entry point).
+///
+/// A plugin is a WASM component that:
+/// 1. Exports `run: func()` — called by the host after init.
+/// 2. Imports the interfaces above for host functionality.
+/// 3. Declares required capabilities in its manifest.
+/// 4. Has only granted host functions available at link time.
+world plugin {
+    /// Plugin lifecycle (init/shutdown) — always available.
+    import lifecycle;
+
+    /// Document read access — capability-gated.
+    import document-read;
+
+    /// Document mutation via Commands — capability-gated.
+    import document-write;
+
+    /// Host logging — always available.
+    import host-log;
+
+    /// The plugin's entry point. Called by the host after init.
+    /// The plugin should do its work here (register handlers, process data, etc.).
+    export run: func();
+}

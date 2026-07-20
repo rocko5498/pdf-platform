@@ -8,3 +8,4 @@ edition.workspace = true
 pdf-types = { path = "../pdf-types" }
 pdf-cos   = { path = "../pdf-cos" }
 pdf-write = { path = "../pdf-write" }
+sha2      = "0.10"

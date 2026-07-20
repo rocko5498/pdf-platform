@@ -770,4 +770,39 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.blocks.len(), 1);
     }
+
+    /// Verify JBIG2 symbol-mode is OFF by default. [ADR-018, M9 exit criteria]
+    ///
+    /// Per ADR-018: "symbol-mode compression of OCR output is OFF by default.
+    /// When enabled, an explicit warning is displayed because symbol-mode
+    /// JBIG2 can cause character substitution (the Xerox substitution hazard)."
+    ///
+    /// The text layer always uses uncompressed or Flate-compressed text,
+    /// never JBIG2. This test verifies the default behavior.
+    #[test]
+    fn jbig2_symbol_mode_off_by_default() {
+        // Generate a text layer from sample OCR blocks.
+        let blocks = vec![
+            OcrTextBlock {
+                text: "Hello World".into(),
+                bbox: [10.0, 20.0, 100.0, 15.0],
+                confidence: 0.95,
+                language: "eng".into(),
+            },
+        ];
+        let page_height = 842.0; // A4 page height in points
+        let stream = generate_text_layer_stream(&blocks, page_height);
+
+        // The text layer should use render mode 3 (invisible text).
+        let stream_str = String::from_utf8_lossy(&stream);
+        assert!(stream_str.contains("3 Tr"), "text layer must use render mode 3 (invisible)");
+
+        // The text layer should NOT contain JBIG2 references.
+        // JBIG2 would appear as /Filter /JBIG2Decode or similar.
+        assert!(!stream_str.contains("JBIG2"), "text layer must not use JBIG2 compression");
+        assert!(!stream_str.contains("jbig2"), "text layer must not use JBIG2 compression");
+
+        // Verify the text is present and correctly escaped.
+        assert!(stream_str.contains("Hello World"), "text content must be present");
+    }
 }

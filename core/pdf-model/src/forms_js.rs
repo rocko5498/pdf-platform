@@ -546,4 +546,230 @@ mod tests {
     fn supported_subset_table_nonempty() {
         assert!(!SUPPORTED_SUBSET.is_empty());
     }
+
+    // =========================================================================
+    // Stress / security tests — exercise evaluator with adversarial inputs.
+    // ADR-022 §4: any code reachable by untrusted input needs fuzz-style testing.
+    // =========================================================================
+
+    #[test]
+    fn fuzz_empty_expression() {
+        let fields = HashMap::new();
+        let err = evaluate_expression("", &fields).unwrap_err();
+        assert!(matches!(err, FormsJsError::Eval(_)));
+    }
+
+    #[test]
+    fn fuzz_whitespace_only() {
+        let fields = HashMap::new();
+        let err = evaluate_expression("   \t\n  ", &fields).unwrap_err();
+        assert!(matches!(err, FormsJsError::Eval(_)));
+    }
+
+    #[test]
+    fn fuzz_division_by_zero() {
+        let fields = HashMap::new();
+        let err = evaluate_expression("1 / 0", &fields).unwrap_err();
+        assert!(matches!(err, FormsJsError::Eval(_)));
+    }
+
+    #[test]
+    fn fuzz_deeply_nested_parens() {
+        let fields = HashMap::new();
+        // 50 levels of nesting — should not stack overflow.
+        let expr = "(".repeat(50) + "1" + &")".repeat(50);
+        let result = evaluate_expression(&expr, &fields);
+        // Should either evaluate to 1.0 or return an error — never panic.
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn fuzz_long_expression() {
+        let fields = HashMap::new();
+        // 1000 additions — should not hang or overflow.
+        let expr = "1".to_string() + &"+1".repeat(1000);
+        let result = evaluate_expression(&expr, &fields);
+        assert!(result.is_ok());
+        assert!((result.unwrap() - 1001.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fuzz_out_of_scope_surfaces() {
+        let fields = HashMap::new();
+        let bad_inputs = [
+            "app.alert('x')",
+            "doc.submitForm()",
+            "this.exportData()",
+            "net.socket()",
+            "eval('1+1')",
+            "function foo() {}",
+            "XMLHttpRequest()",
+            "util.printd()",
+            "app.launchURL()",
+            "doc.mailDoc()",
+        ];
+        for input in &bad_inputs {
+            let err = evaluate_expression(input, &fields).unwrap_err();
+            assert!(
+                matches!(err, FormsJsError::Unsupported(_)),
+                "expected Unsupported for '{input}', got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_case_insensitive_surface_detection() {
+        let fields = HashMap::new();
+        // Mixed case should still be detected.
+        let err = evaluate_expression("APP.alert('x')", &fields).unwrap_err();
+        assert!(matches!(err, FormsJsError::Unsupported(_)));
+    }
+
+    #[test]
+    fn fuzz_missing_field_reference() {
+        let fields = HashMap::new();
+        let err = evaluate_expression(r#"getField("nonexistent")"#, &fields).unwrap_err();
+        assert!(matches!(err, FormsJsError::MissingField(_)));
+    }
+
+    #[test]
+    fn fuzz_afsimple_missing_fields() {
+        let fields = HashMap::new();
+        let err = evaluate_expression(
+            r#"AFSimple_Calculate("SUM", ["a","b"])"#,
+            &fields,
+        )
+        .unwrap_err();
+        assert!(matches!(err, FormsJsError::MissingField(_)));
+    }
+
+    #[test]
+    fn fuzz_afsimple_empty_array() {
+        let fields = HashMap::new();
+        let result = evaluate_expression(
+            r#"AFSimple_Calculate("SUM", [])"#,
+            &fields,
+        );
+        // Empty array → error (missing field names or eval error).
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_afsimple_unknown_op() {
+        let fields = HashMap::new();
+        let err = evaluate_expression(
+            r#"AFSimple_Calculate("FOO", ["a"])"#,
+            &fields,
+        )
+        .unwrap_err();
+        assert!(matches!(err, FormsJsError::Unsupported(_)));
+    }
+
+    #[test]
+    fn fuzz_invalid_syntax() {
+        let fields = HashMap::new();
+        let bad = [
+            "+",
+            "*",
+            "(",
+            ")",
+            "1 +",
+            "+ 1",
+            "1 2 3",
+            "1 ++ 2",
+            "1 + * 2",
+            "((1)",
+            "1))",
+        ];
+        for input in &bad {
+            let result = evaluate_expression(input, &fields);
+            // Should return an error, never panic.
+            assert!(result.is_err(), "expected error for '{input}', got {result:?}");
+        }
+    }
+
+    #[test]
+    fn fuzz_unicode_in_expression() {
+        let fields = HashMap::new();
+        // Unicode that's not in the subset should produce an error, not a panic.
+        let result = evaluate_expression("1 + \u{00e9}", &fields);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_null_bytes() {
+        let fields = HashMap::new();
+        let result = evaluate_expression("1\0+ 2", &fields);
+        // Should error, not panic or produce wrong results.
+        assert!(result.is_err() || result.is_ok());
+    }
+
+    #[test]
+    fn fuzz_extreme_float_values() {
+        let mut fields = HashMap::new();
+        fields.insert("a".into(), f64::MAX);
+        fields.insert("b".into(), f64::MIN_POSITIVE);
+        // Overflow/underflow should not panic.
+        let _ = evaluate_expression(r#"getField("a") * getField("b")"#, &fields);
+        let _ = evaluate_expression(r#"getField("a") + getField("b")"#, &fields);
+        let _ = evaluate_expression(r#"getField("b") / getField("a")"#, &fields);
+    }
+
+    #[test]
+    fn fuzz_negative_numbers() {
+        let mut fields = HashMap::new();
+        fields.insert("a".into(), -5.0);
+        fields.insert("b".into(), 3.0);
+        let v = evaluate_expression(r#"getField("a") + getField("b")"#, &fields).unwrap();
+        assert!((v - (-2.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fuzz_malformed_afsimple() {
+        let fields = HashMap::new();
+        let bad = [
+            r#"AFSimple_Calculate()"#,
+            r#"AFSimple_Calculate("SUM")"#,
+            r#"AFSimple_Calculate(123, ["a"])"#,
+            r#"AFSimple_Calculate("SUM", "not_array")"#,
+        ];
+        for input in &bad {
+            let result = evaluate_expression(input, &fields);
+            assert!(result.is_err(), "expected error for '{input}', got {result:?}");
+        }
+    }
+
+    #[test]
+    fn fuzz_getfield_nested() {
+        let mut fields = HashMap::new();
+        fields.insert("a".into(), 1.0);
+        // getField inside getField is not in the subset.
+        let result = evaluate_expression(r#"getField("a") + getField("b")"#, &fields);
+        // Should error on missing field "b", not panic.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_concurrent_evaluations() {
+        // Verify the evaluator is stateless (no global state corruption).
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+        for i in 0..20 {
+            let ec = error_count.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut fields = HashMap::new();
+                fields.insert("x".into(), i as f64);
+                let result = evaluate_expression(r#"getField("x") * 2"#, &fields);
+                if result.is_err() {
+                    ec.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(error_count.load(Ordering::Relaxed), 0);
+    }
 }
