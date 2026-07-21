@@ -417,10 +417,232 @@ pub fn create_optimization_candidate(
     ))
 }
 
+/// Run a full-rewrite generator through the candidate/verify/publish safety
+/// net. [ADR-012, ADR-016, ADR-021]
+///
+/// `generate` receives the candidate's path (not the real destination) and
+/// writes the rewritten document there by whatever means it uses internally
+/// (e.g. `assembly_ops::optimize_pdf` shelling out to `qpdf`) — this
+/// function does not care how the bytes get written, only that they get
+/// verified before anything is published. It does *not* add Z1 sandboxing
+/// around `generate` itself: today's `optimize_pdf` already runs directly in
+/// the CLI/Z0 process (unsandboxed) and continues to do so here — this adds
+/// the missing safety net (nothing was verified before overwriting the
+/// destination previously), not new process isolation. A from-scratch
+/// in-process Rust rewriter — matching this codebase's own stated
+/// "qpdf as the correctness reference [for testing], not the production
+/// writer" principle — is a separate, much larger undertaking.
+///
+/// SECURITY: requires human broker review before merge.
+pub fn optimize_with_verification(
+    destination: &Path,
+    generate: impl FnOnce(&Path) -> Result<String, String>,
+) -> Result<String, String> {
+    let mut candidate =
+        create_optimization_candidate(destination).map_err(|e| format!("candidate create failed: {e}"))?;
+    // Release our handle before handing the path to an external generator
+    // (e.g. qpdf): on Windows, a second process opening the same path while
+    // we still hold it can hit a sharing violation even though our handle
+    // requests shared read/write access — verified empirically, not just in
+    // theory, running `optimize` through the real CLI against real qpdf.
+    candidate.file = None;
+    let report = generate(&candidate.path)?;
+
+    // Fsync via our own handle, then fully release it again before spawning
+    // qpdf as a separate process against the same path — same sharing-rule
+    // reason as above; `verify_with`'s built-in fsync-then-verify sequencing
+    // can't be reused here because it keeps our handle open across the
+    // verifier call, which is exactly the case that fails.
+    {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&candidate.path)
+            .map_err(|e| format!("candidate reopen for fsync failed: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("candidate fsync failed: {e}"))?;
+    }
+
+    // Verify with qpdf itself, not our own `pdf_cos` scanner: this project's
+    // own architecture doc says structural ownership is ours "with qpdf as
+    // the correctness reference" — and empirically, `pdf_cos::scan` doesn't
+    // yet parse the xref-stream format qpdf's own `--object-streams=generate`
+    // output uses, which would falsely reject perfectly valid optimizer
+    // output. That's a separate, real `pdf-cos` gap, not something to chase
+    // down mid-verification-layer; qpdf is the more authoritative check here
+    // regardless.
+    let status = std::process::Command::new("qpdf")
+        .arg("--check")
+        .arg(&candidate.path)
+        .status()
+        .map_err(|e| format!("qpdf --check spawn failed: {e}"))?;
+    // qpdf's own exit-code convention: 0 = clean, 3 = usable with warnings
+    // (e.g. a repairable minor issue), anything else = real damage/errors.
+    if !matches!(status.code(), Some(0) | Some(3)) {
+        return Err(format!(
+            "candidate verification failed: qpdf --check reported problems (exit {status})"
+        ));
+    }
+
+    candidate.file = Some(
+        File::options()
+            .read(true)
+            .write(true)
+            .open(&candidate.path)
+            .map_err(|e| format!("candidate reopen for publish failed: {e}"))?,
+    );
+    let verification = VerifiedOptimizationCandidate { id: candidate.id };
+    candidate
+        .publish_verified(verification)
+        .map_err(|e| format!("publish failed: {e}"))?;
+    Ok(report)
+}
+
+#[cfg(test)]
+fn minimal_pdf(page_count: u32) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(bytes.len());
+    if page_count == 0 {
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    } else {
+        let kids: String = (0..page_count)
+            .map(|i| format!("{} 0 R", i + 3))
+            .collect::<Vec<_>>()
+            .join(" ");
+        bytes.extend_from_slice(
+            format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {page_count} >>\nendobj\n")
+                .as_bytes(),
+        );
+        for i in 0..page_count {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(
+                format!("{} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n", i + 3)
+                    .as_bytes(),
+            );
+        }
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn optimize_with_verification_publishes_valid_generated_output() {
+        if !pdf_model::assembly_ops::qpdf_available() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!(
+            "pdf-platform-optimize-verify-ok-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let destination = base.join("optimized.pdf");
+
+        let report = optimize_with_verification(&destination, |candidate_path| {
+            std::fs::write(candidate_path, minimal_pdf(2)).map_err(|e| e.to_string())?;
+            Ok("optimized: 2 pages".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(report, "optimized: 2 pages");
+        assert!(destination.exists(), "verified output must be published");
+        assert_eq!(&std::fs::read(&destination).unwrap()[..5], b"%PDF-");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn optimize_with_verification_never_publishes_when_generation_fails() {
+        let base = std::env::temp_dir().join(format!(
+            "pdf-platform-optimize-verify-genfail-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let destination = base.join("optimized.pdf");
+
+        let result = optimize_with_verification(&destination, |_candidate_path| {
+            Err("simulated qpdf crash".to_string())
+        });
+
+        assert_eq!(result, Err("simulated qpdf crash".to_string()));
+        assert!(!destination.exists());
+        let leftover = std::fs::read_dir(&base).unwrap().count();
+        assert_eq!(leftover, 0, "failed-generation candidate must self-delete");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn optimize_with_verification_never_publishes_a_structurally_invalid_candidate() {
+        if !pdf_model::assembly_ops::qpdf_available() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!(
+            "pdf-platform-optimize-verify-badstruct-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let destination = base.join("optimized.pdf");
+
+        let result = optimize_with_verification(&destination, |candidate_path| {
+            // Simulates a generator that crashed mid-write, leaving garbage
+            // instead of a parseable PDF — exactly what `qpdf --check` (not
+            // our own less-mature `pdf_cos` scanner) is well-suited to catch.
+            std::fs::write(candidate_path, b"not a pdf at all, just garbage bytes")
+                .map_err(|e| e.to_string())?;
+            Ok("optimized: garbage".to_string())
+        });
+
+        assert!(result.is_err(), "garbage candidate must fail verification");
+        assert!(!destination.exists(), "unverified candidate must never be published");
+        let leftover = std::fs::read_dir(&base).unwrap().count();
+        assert_eq!(leftover, 0, "rejected candidate must self-delete");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn optimize_with_verification_never_overwrites_an_existing_destination() {
+        if !pdf_model::assembly_ops::qpdf_available() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!(
+            "pdf-platform-optimize-verify-exists-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let destination = base.join("optimized.pdf");
+        std::fs::write(&destination, b"pre-existing user file").unwrap();
+
+        let result = optimize_with_verification(&destination, |candidate_path| {
+            std::fs::write(candidate_path, minimal_pdf(1)).map_err(|e| e.to_string())?;
+            Ok("optimized: 1 page".to_string())
+        });
+
+        assert!(result.is_err(), "must refuse to publish over an existing file");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"pre-existing user file",
+            "existing destination must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn optimization_candidate_never_changes_source_before_verified_publish() {
