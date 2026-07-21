@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod persistence;
+
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::{
