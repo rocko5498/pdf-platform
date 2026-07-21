@@ -42,6 +42,8 @@ pub struct JobSpec {
     pub priority: JobPriority,
     /// Jobs that must complete first.
     pub dependencies: Vec<JobId>,
+    /// Whether this operation is safe to repeat after utility-worker loss.
+    pub idempotent: bool,
 }
 
 impl JobSpec {
@@ -52,12 +54,19 @@ impl JobSpec {
             operation: operation.into(),
             priority,
             dependencies: Vec::new(),
+            idempotent: false,
         }
     }
 
     /// Add a dependency.
     pub fn depends_on(mut self, dependency: JobId) -> Self {
         self.dependencies.push(dependency);
+        self
+    }
+
+    /// Declare that the operation may be retried after worker loss.
+    pub fn idempotent(mut self) -> Self {
+        self.idempotent = true;
         self
     }
 }
@@ -206,6 +215,24 @@ pub enum JobEvent {
         /// Human-readable persistence failure detail.
         message: String,
     },
+    /// The utility worker executing a job exited unexpectedly.
+    WorkerCrashed {
+        /// Job identifier.
+        job: JobId,
+        /// Whether the scheduler will retry the job.
+        will_retry: bool,
+        /// Human-readable worker failure detail.
+        message: String,
+    },
+}
+
+/// Typed result failure from a utility-job executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobRunError {
+    /// The operation ran but failed.
+    Execution(String),
+    /// The utility worker exited or became unusable during the operation.
+    WorkerCrashed(String),
 }
 
 /// Context supplied to a job executor.
@@ -255,7 +282,7 @@ pub enum SubmitError {
     Closed,
 }
 
-type Executor = dyn Fn(JobSpec, JobContext) -> Result<(), String> + Send + Sync + 'static;
+type Executor = dyn Fn(JobSpec, JobContext) -> Result<(), JobRunError> + Send + Sync + 'static;
 
 enum Control {
     Submit(JobGraph),
@@ -269,7 +296,7 @@ struct Work {
 
 struct WorkDone {
     job: JobId,
-    result: Result<(), String>,
+    result: Result<(), JobRunError>,
     cancelled: bool,
 }
 
@@ -304,6 +331,7 @@ struct Pending {
     spec: JobSpec,
     remaining: usize,
     blocked: bool,
+    crash_retries: u8,
 }
 
 /// Bounded scheduler backed by named standard-library worker threads.
@@ -323,6 +351,24 @@ impl JobScheduler {
     where
         F: Fn(JobSpec, JobContext) -> Result<(), String> + Send + Sync + 'static,
     {
+        Self::create(
+            worker_count,
+            capacity,
+            move |spec, context| executor(spec, context).map_err(JobRunError::Execution),
+            None,
+            None,
+        )
+    }
+
+    /// Create a scheduler whose executor can distinguish worker loss from operation failure.
+    pub fn new_typed<F>(
+        worker_count: usize,
+        capacity: usize,
+        executor: F,
+    ) -> Result<Self, SchedulerError>
+    where
+        F: Fn(JobSpec, JobContext) -> Result<(), JobRunError> + Send + Sync + 'static,
+    {
         Self::create(worker_count, capacity, executor, None, None)
     }
 
@@ -336,27 +382,27 @@ impl JobScheduler {
     where
         F: Fn(JobSpec, JobContext) -> Result<(), String> + Send + Sync + 'static,
     {
-        let path = path.as_ref().to_path_buf();
-        let restored = persistence::load_latest(&path).map_err(SchedulerError::Persistence)?;
-        let live = restored
-            .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .graph()
-                    .jobs()
-                    .iter()
-                    .filter(|job| {
-                        matches!(
-                            snapshot.state(job.id),
-                            Some(PersistedJobState::Pending | PersistedJobState::Running)
-                        )
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-        if live > capacity {
-            return Err(SchedulerError::RestoreExceedsCapacity);
-        }
+        let (path, restored) = load_persistent(path.as_ref(), capacity)?;
+        Self::create(
+            worker_count,
+            capacity,
+            move |spec, context| executor(spec, context).map_err(JobRunError::Execution),
+            Some(path),
+            restored,
+        )
+    }
+
+    /// Create a persistent scheduler with typed utility-worker failures.
+    pub fn new_persistent_typed<F>(
+        worker_count: usize,
+        capacity: usize,
+        path: impl AsRef<Path>,
+        executor: F,
+    ) -> Result<Self, SchedulerError>
+    where
+        F: Fn(JobSpec, JobContext) -> Result<(), JobRunError> + Send + Sync + 'static,
+    {
+        let (path, restored) = load_persistent(path.as_ref(), capacity)?;
         Self::create(worker_count, capacity, executor, Some(path), restored)
     }
 
@@ -368,7 +414,7 @@ impl JobScheduler {
         restored: Option<JobSnapshot>,
     ) -> Result<Self, SchedulerError>
     where
-        F: Fn(JobSpec, JobContext) -> Result<(), String> + Send + Sync + 'static,
+        F: Fn(JobSpec, JobContext) -> Result<(), JobRunError> + Send + Sync + 'static,
     {
         if worker_count == 0 || capacity == 0 {
             return Err(SchedulerError::ZeroCapacity);
@@ -524,6 +570,29 @@ impl JobScheduler {
     }
 }
 
+fn load_persistent(
+    path: &Path,
+    capacity: usize,
+) -> Result<(PathBuf, Option<JobSnapshot>), SchedulerError> {
+    let path = path.to_path_buf();
+    let restored = persistence::load_latest(&path).map_err(SchedulerError::Persistence)?;
+    let live = restored
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .graph()
+                .jobs()
+                .iter()
+                .filter(|job| snapshot.state(job.id) == Some(PersistedJobState::Pending))
+                .count()
+        })
+        .unwrap_or(0);
+    if live > capacity {
+        return Err(SchedulerError::RestoreExceedsCapacity);
+    }
+    Ok((path, restored))
+}
+
 impl Drop for JobScheduler {
     fn drop(&mut self) {
         self.stop();
@@ -634,6 +703,7 @@ fn scheduler_loop(
                     spec: spec.clone(),
                     remaining,
                     blocked: failed_dependency,
+                    crash_retries: 0,
                 },
             );
             let _ = events.send(JobEvent::Queued { job: spec.id });
@@ -668,13 +738,48 @@ fn scheduler_loop(
     loop {
         while let Ok(done) = done_rx.try_recv() {
             running = running.saturating_sub(1);
+            if !done.cancelled {
+                if let Err(JobRunError::WorkerCrashed(message)) = &done.result {
+                    let retry = pending
+                        .get_mut(&done.job)
+                        .filter(|pending| pending.spec.idempotent && pending.crash_retries == 0);
+                    if let Some(pending_job) = retry {
+                        pending_job.crash_retries = 1;
+                        let _ = events.send(JobEvent::WorkerCrashed {
+                            job: done.job,
+                            will_retry: true,
+                            message: message.clone(),
+                        });
+                        ready.push(Ready {
+                            priority: pending_job.spec.priority,
+                            sequence,
+                            job: done.job,
+                        });
+                        sequence += 1;
+                        if let Some(queue) = durable.as_mut() {
+                            queue.states.insert(done.job, PersistedJobState::Pending);
+                            queue.checkpoint(&events);
+                        }
+                        continue;
+                    }
+                    let _ = events.send(JobEvent::WorkerCrashed {
+                        job: done.job,
+                        will_retry: false,
+                        message: message.clone(),
+                    });
+                }
+            }
             let success = !done.cancelled && done.result.is_ok();
             let event = if done.cancelled {
                 JobEvent::Cancelled { job: done.job }
-            } else if let Err(message) = done.result {
+            } else if let Err(error) = done.result {
                 JobEvent::Failed {
                     job: done.job,
-                    message,
+                    message: match error {
+                        JobRunError::Execution(message) | JobRunError::WorkerCrashed(message) => {
+                            message
+                        }
+                    },
                 }
             } else {
                 JobEvent::Completed { job: done.job }
@@ -736,6 +841,7 @@ fn scheduler_loop(
                             spec,
                             remaining,
                             blocked: false,
+                            crash_retries: 0,
                         },
                     );
                 }
@@ -821,7 +927,7 @@ fn worker_loop(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             executor(work.spec.clone(), context)
         }))
-        .unwrap_or_else(|_| Err("job executor panicked".into()));
+        .unwrap_or_else(|_| Err(JobRunError::Execution("job executor panicked".into())));
         let _ = done.send(WorkDone {
             job: work.spec.id,
             cancelled: work.token.is_cancelled(),
@@ -1176,6 +1282,60 @@ mod tests {
             Some(PersistedJobState::Failed)
         );
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn idempotent_job_retries_one_worker_crash() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let scheduler = JobScheduler::new_typed(1, 1, move |_spec, _| {
+            if seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(JobRunError::WorkerCrashed("utility exited".into()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        scheduler
+            .submit(JobGraph::new(vec![job(1).idempotent()]).unwrap())
+            .unwrap();
+        assert_eq!(terminal_events(&scheduler, 1), 1);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn non_idempotent_job_does_not_retry_worker_crash() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let scheduler = JobScheduler::new_typed(1, 1, move |_spec, _| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Err(JobRunError::WorkerCrashed("utility exited".into()))
+        })
+        .unwrap();
+        scheduler
+            .submit(JobGraph::new(vec![job(1)]).unwrap())
+            .unwrap();
+        assert_eq!(terminal_events(&scheduler, 1), 1);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn idempotent_job_retries_worker_crash_only_once() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let scheduler = JobScheduler::new_typed(1, 1, move |_spec, _| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Err(JobRunError::WorkerCrashed("utility exited".into()))
+        })
+        .unwrap();
+        scheduler
+            .submit(JobGraph::new(vec![job(1).idempotent()]).unwrap())
+            .unwrap();
+        assert_eq!(terminal_events(&scheduler, 1), 1);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        scheduler.shutdown();
     }
 
     fn temp_path() -> std::path::PathBuf {

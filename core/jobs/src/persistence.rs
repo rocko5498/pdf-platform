@@ -8,7 +8,7 @@ use crate::{GraphError, JobGraph, JobId, JobPriority, JobSpec};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"PDFJOBS\0";
 const FRAME_MAGIC: &[u8; 8] = b"JOBSFRM\0";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_JOBS: usize = 100_000;
@@ -109,6 +109,7 @@ pub fn encode_snapshot(snapshot: &JobSnapshot) -> Result<Vec<u8>, PersistenceErr
         put_u64(&mut output, job.id);
         output.push(priority_tag(job.priority));
         output.push(state_tag(snapshot.states[&job.id]));
+        output.push(u8::from(job.idempotent));
         put_u32(&mut output, job.operation.len() as u32);
         output.extend_from_slice(job.operation.as_bytes());
         put_u32(&mut output, job.dependencies.len() as u32);
@@ -132,7 +133,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<JobSnapshot, PersistenceError> {
         return Err(PersistenceError::Malformed("snapshot magic"));
     }
     let version = cursor.u32()?;
-    if version != FORMAT_VERSION {
+    if !matches!(version, 1 | FORMAT_VERSION) {
         return Err(PersistenceError::UnsupportedVersion(version));
     }
     let count = cursor.u32()? as usize;
@@ -145,6 +146,15 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<JobSnapshot, PersistenceError> {
         let id = cursor.u64()?;
         let priority = decode_priority(cursor.byte()?)?;
         let state = decode_state(cursor.byte()?)?;
+        let idempotent = if version >= 2 {
+            match cursor.byte()? {
+                0 => false,
+                1 => true,
+                _ => return Err(PersistenceError::Malformed("idempotency tag")),
+            }
+        } else {
+            false
+        };
         let operation_len = cursor.u32()? as usize;
         if operation_len > MAX_OPERATION_BYTES {
             return Err(PersistenceError::LimitExceeded("operation length"));
@@ -165,6 +175,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<JobSnapshot, PersistenceError> {
             operation,
             priority,
             dependencies,
+            idempotent,
         });
         if states.insert(id, normalize_state(state)).is_some() {
             return Err(PersistenceError::Malformed("duplicate job state"));
@@ -357,12 +368,31 @@ mod tests {
 
     #[test]
     fn snapshot_codec_round_trips_graph_and_states() {
-        let encoded =
-            encode_snapshot(&snapshot("ocr page 1", PersistedJobState::Completed)).unwrap();
+        let mut original = snapshot("ocr page 1", PersistedJobState::Completed);
+        original.graph.jobs[0].idempotent = true;
+        let encoded = encode_snapshot(&original).unwrap();
         let decoded = decode_snapshot(&encoded).unwrap();
         assert_eq!(decoded.graph().jobs()[0].operation, "ocr page 1");
         assert_eq!(decoded.graph().jobs()[1].dependencies, vec![1]);
         assert_eq!(decoded.state(1), Some(PersistedJobState::Completed));
+        assert!(decoded.graph().jobs()[0].idempotent);
+    }
+
+    #[test]
+    fn version_one_jobs_restore_as_non_idempotent() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(SNAPSHOT_MAGIC);
+        put_u32(&mut encoded, 1);
+        put_u32(&mut encoded, 1);
+        put_u64(&mut encoded, 7);
+        encoded.push(priority_tag(JobPriority::Maintenance));
+        encoded.push(state_tag(PersistedJobState::Pending));
+        put_u32(&mut encoded, 3);
+        encoded.extend_from_slice(b"ocr");
+        put_u32(&mut encoded, 0);
+
+        let decoded = decode_snapshot(&encoded).unwrap();
+        assert!(!decoded.graph().jobs()[0].idempotent);
     }
 
     #[test]
