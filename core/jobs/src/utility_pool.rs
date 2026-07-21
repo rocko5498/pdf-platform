@@ -2,10 +2,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use protocol::utility_jobs::{decode_event, encode_command, UtilityJobCommand, UtilityJobEvent};
+use protocol::utility_jobs::{
+    decode_event, encode_command, UtilityJobCommand, UtilityJobEvent, UtilityJobInput,
+};
 use sandbox::spawn::{spawn_utility_worker, WorkerChild};
 
 use crate::{JobContext, JobRunError, JobSpec};
@@ -17,6 +19,8 @@ pub enum UtilityPoolError {
     ZeroWorkers,
     /// A sandboxed worker could not be spawned.
     Spawn(std::io::Error),
+    /// Requested slot does not exist.
+    UnknownWorkerSlot(usize),
 }
 
 impl std::fmt::Display for UtilityPoolError {
@@ -24,6 +28,9 @@ impl std::fmt::Display for UtilityPoolError {
         match self {
             Self::ZeroWorkers => write!(formatter, "utility pool requires at least one worker"),
             Self::Spawn(error) => write!(formatter, "utility worker spawn failed: {error}"),
+            Self::UnknownWorkerSlot(slot) => {
+                write!(formatter, "unknown utility worker slot: {slot}")
+            }
         }
     }
 }
@@ -36,7 +43,18 @@ pub struct UtilityPool {
     workers: Vec<Mutex<WorkerChild>>,
     next_worker: AtomicUsize,
     next_correlation: AtomicU64,
+    generations: Vec<AtomicU64>,
+    replacement_hook: Arc<dyn Fn(UtilityWorkerIdentity) + Send + Sync>,
     response_timeout: Duration,
+}
+
+/// Stable worker slot plus incarnation counter used to scope capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UtilityWorkerIdentity {
+    /// Fixed pool slot.
+    pub slot: usize,
+    /// Incremented whenever the process in this slot is replaced.
+    pub generation: u64,
 }
 
 impl UtilityPool {
@@ -45,6 +63,18 @@ impl UtilityPool {
         worker_exe: impl AsRef<Path>,
         worker_count: usize,
     ) -> Result<Self, UtilityPoolError> {
+        Self::new_with_replacement_hook(worker_exe, worker_count, |_| {})
+    }
+
+    /// Spawn a pool and observe invalidated worker generations before replacement.
+    pub fn new_with_replacement_hook<F>(
+        worker_exe: impl AsRef<Path>,
+        worker_count: usize,
+        replacement_hook: F,
+    ) -> Result<Self, UtilityPoolError>
+    where
+        F: Fn(UtilityWorkerIdentity) + Send + Sync + 'static,
+    {
         if worker_count == 0 {
             return Err(UtilityPoolError::ZeroWorkers);
         }
@@ -64,6 +94,8 @@ impl UtilityPool {
             workers,
             next_worker: AtomicUsize::new(0),
             next_correlation: AtomicU64::new(1),
+            generations: (0..worker_count).map(|_| AtomicU64::new(0)).collect(),
+            replacement_hook: Arc::new(replacement_hook),
             response_timeout: Duration::from_secs(30),
         })
     }
@@ -73,8 +105,38 @@ impl UtilityPool {
         self.workers.len()
     }
 
+    /// Replace one worker and invalidate capabilities bound to its old generation.
+    pub fn restart_worker(&self, slot: usize) -> Result<(), UtilityPoolError> {
+        let worker = self
+            .workers
+            .get(slot)
+            .ok_or(UtilityPoolError::UnknownWorkerSlot(slot))?;
+        let mut worker = worker
+            .lock()
+            .map_err(|_| UtilityPoolError::Spawn(std::io::Error::other("worker lock poisoned")))?;
+        let identity = UtilityWorkerIdentity {
+            slot,
+            generation: self.generations[slot].fetch_add(1, Ordering::AcqRel),
+        };
+        (self.replacement_hook)(identity);
+        replace_worker(&self.worker_exe, &mut worker).map_err(UtilityPoolError::Spawn)
+    }
+
     /// Execute one declarative job through a utility process.
     pub fn execute(&self, spec: JobSpec, context: JobContext) -> Result<(), JobRunError> {
+        self.execute_prepared(spec, context, |_| Ok(Vec::new()))
+    }
+
+    /// Select and lock a worker, then prepare inputs scoped to that exact incarnation.
+    pub fn execute_prepared<P>(
+        &self,
+        spec: JobSpec,
+        context: JobContext,
+        prepare: P,
+    ) -> Result<(), JobRunError>
+    where
+        P: FnOnce(UtilityWorkerIdentity) -> Result<Vec<UtilityJobInput>, JobRunError>,
+    {
         if context.is_cancelled() {
             return Err(JobRunError::Execution(
                 "job cancelled before dispatch".into(),
@@ -82,18 +144,23 @@ impl UtilityPool {
         }
         let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let correlation_id = self.next_correlation.fetch_add(1, Ordering::Relaxed);
+        let mut worker = self.workers[index]
+            .lock()
+            .map_err(|_| JobRunError::WorkerCrashed("utility worker lock poisoned".into()))?;
+        let identity = UtilityWorkerIdentity {
+            slot: index,
+            generation: self.generations[index].load(Ordering::Acquire),
+        };
+        let inputs = prepare(identity)?;
         let request = UtilityJobCommand {
             correlation_id,
             job_id: spec.id,
             operation: spec.operation,
-            inputs: Vec::new(),
+            inputs,
         };
         let frame = encode_command(&request).map_err(|error| {
             JobRunError::Execution(format!("job request encoding failed: {error:?}"))
         })?;
-        let mut worker = self.workers[index]
-            .lock()
-            .map_err(|_| JobRunError::WorkerCrashed("utility worker lock poisoned".into()))?;
         let result = worker
             .transport
             .send(&frame)
@@ -115,13 +182,17 @@ impl UtilityPool {
                 Err(JobRunError::Execution(message))
             }
             Ok(_) => {
-                replace_worker(&self.worker_exe, &mut worker);
+                (self.replacement_hook)(identity);
+                self.generations[index].fetch_add(1, Ordering::AcqRel);
+                let _ = replace_worker(&self.worker_exe, &mut worker);
                 Err(JobRunError::WorkerCrashed(
                     "mismatched utility response".into(),
                 ))
             }
             Err(message) => {
-                replace_worker(&self.worker_exe, &mut worker);
+                (self.replacement_hook)(identity);
+                self.generations[index].fetch_add(1, Ordering::AcqRel);
+                let _ = replace_worker(&self.worker_exe, &mut worker);
                 Err(JobRunError::WorkerCrashed(message))
             }
         }
@@ -134,12 +205,11 @@ impl Drop for UtilityPool {
     }
 }
 
-fn replace_worker(worker_exe: &Path, worker: &mut WorkerChild) {
+fn replace_worker(worker_exe: &Path, worker: &mut WorkerChild) -> std::io::Result<()> {
     let _ = worker.child.kill();
     let _ = worker.child.wait();
-    if let Ok(replacement) = spawn_utility_worker(worker_exe) {
-        *worker = replacement;
-    }
+    *worker = spawn_utility_worker(worker_exe)?;
+    Ok(())
 }
 
 fn stop_workers(workers: &mut [Mutex<WorkerChild>]) {

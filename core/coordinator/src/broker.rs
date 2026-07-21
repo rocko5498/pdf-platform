@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use jobs::utility_pool::UtilityWorkerIdentity;
 
 const MAX_UTILITY_GRANTS: usize = 4096;
 
@@ -37,7 +40,7 @@ pub enum UtilityGrantError {
     /// Grant belongs to a different scheduler job.
     WrongJob,
     /// Grant belongs to a worker process that has been replaced.
-    WrongWorkerGeneration,
+    WrongWorkerIdentity,
     /// Requested byte range exceeds the grant.
     OutOfBounds,
 }
@@ -46,7 +49,7 @@ pub enum UtilityGrantError {
 struct UtilityGrant {
     kind: UtilityGrantKind,
     job_id: u64,
-    worker_generation: u64,
+    worker: UtilityWorkerIdentity,
     byte_len: u64,
     expires_at: Instant,
 }
@@ -68,25 +71,18 @@ impl UtilityGrantRegistry {
         &mut self,
         kind: UtilityGrantKind,
         job_id: u64,
-        worker_generation: u64,
+        worker: UtilityWorkerIdentity,
         byte_len: u64,
         ttl: Duration,
     ) -> Result<[u8; 16], UtilityGrantError> {
-        self.issue_at(
-            kind,
-            job_id,
-            worker_generation,
-            byte_len,
-            ttl,
-            Instant::now(),
-        )
+        self.issue_at(kind, job_id, worker, byte_len, ttl, Instant::now())
     }
 
     fn issue_at(
         &mut self,
         kind: UtilityGrantKind,
         job_id: u64,
-        worker_generation: u64,
+        worker: UtilityWorkerIdentity,
         byte_len: u64,
         ttl: Duration,
         now: Instant,
@@ -105,7 +101,7 @@ impl UtilityGrantRegistry {
                 entry.insert(UtilityGrant {
                     kind,
                     job_id,
-                    worker_generation,
+                    worker,
                     byte_len,
                     expires_at,
                 });
@@ -123,19 +119,11 @@ impl UtilityGrantRegistry {
         id: [u8; 16],
         kind: UtilityGrantKind,
         job_id: u64,
-        worker_generation: u64,
+        worker: UtilityWorkerIdentity,
         offset: u64,
         length: u64,
     ) -> Result<(), UtilityGrantError> {
-        self.validate_at(
-            id,
-            kind,
-            job_id,
-            worker_generation,
-            offset,
-            length,
-            Instant::now(),
-        )
+        self.validate_at(id, kind, job_id, worker, offset, length, Instant::now())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -144,7 +132,7 @@ impl UtilityGrantRegistry {
         id: [u8; 16],
         kind: UtilityGrantKind,
         job_id: u64,
-        worker_generation: u64,
+        worker: UtilityWorkerIdentity,
         offset: u64,
         length: u64,
         now: Instant,
@@ -164,8 +152,8 @@ impl UtilityGrantRegistry {
         if grant.job_id != job_id {
             return Err(UtilityGrantError::WrongJob);
         }
-        if grant.worker_generation != worker_generation {
-            return Err(UtilityGrantError::WrongWorkerGeneration);
+        if grant.worker != worker {
+            return Err(UtilityGrantError::WrongWorkerIdentity);
         }
         let end = offset
             .checked_add(length)
@@ -177,11 +165,21 @@ impl UtilityGrantRegistry {
     }
 
     /// Revoke all capabilities held by a worker process before replacement.
-    pub fn revoke_worker_generation(&mut self, worker_generation: u64) -> usize {
+    pub fn revoke_worker(&mut self, worker: UtilityWorkerIdentity) -> usize {
         let before = self.grants.len();
-        self.grants
-            .retain(|_, grant| grant.worker_generation != worker_generation);
+        self.grants.retain(|_, grant| grant.worker != worker);
         before - self.grants.len()
+    }
+}
+
+/// Build the pool replacement hook that revokes every grant for the old process identity.
+pub fn utility_grant_revocation_hook(
+    registry: Arc<Mutex<UtilityGrantRegistry>>,
+) -> impl Fn(UtilityWorkerIdentity) + Send + Sync + 'static {
+    move |worker| {
+        if let Ok(mut registry) = registry.lock() {
+            registry.revoke_worker(worker);
+        }
     }
 }
 
@@ -250,36 +248,71 @@ mod tests {
     #[test]
     fn utility_grants_fail_closed_for_forgery_scope_and_bounds() {
         let mut grants = UtilityGrantRegistry::new();
+        let worker = UtilityWorkerIdentity {
+            slot: 3,
+            generation: 0,
+        };
         let grant = grants
             .issue(
                 UtilityGrantKind::SharedMemoryRead,
                 41,
-                3,
+                worker,
                 4096,
                 std::time::Duration::from_secs(60),
             )
             .unwrap();
         assert!(grants
-            .validate(grant, UtilityGrantKind::SharedMemoryRead, 41, 3, 1024, 2048)
+            .validate(
+                grant,
+                UtilityGrantKind::SharedMemoryRead,
+                41,
+                worker,
+                1024,
+                2048
+            )
             .is_ok());
         assert_eq!(
-            grants.validate([0; 16], UtilityGrantKind::SharedMemoryRead, 41, 3, 0, 1),
+            grants.validate(
+                [0; 16],
+                UtilityGrantKind::SharedMemoryRead,
+                41,
+                worker,
+                0,
+                1
+            ),
             Err(UtilityGrantError::Unknown)
         );
         assert_eq!(
-            grants.validate(grant, UtilityGrantKind::SharedMemoryWrite, 41, 3, 0, 1),
+            grants.validate(grant, UtilityGrantKind::SharedMemoryWrite, 41, worker, 0, 1),
             Err(UtilityGrantError::WrongCapability)
         );
         assert_eq!(
-            grants.validate(grant, UtilityGrantKind::SharedMemoryRead, 99, 3, 0, 1),
+            grants.validate(grant, UtilityGrantKind::SharedMemoryRead, 99, worker, 0, 1),
             Err(UtilityGrantError::WrongJob)
         );
         assert_eq!(
-            grants.validate(grant, UtilityGrantKind::SharedMemoryRead, 41, 4, 0, 1),
-            Err(UtilityGrantError::WrongWorkerGeneration)
+            grants.validate(
+                grant,
+                UtilityGrantKind::SharedMemoryRead,
+                41,
+                UtilityWorkerIdentity {
+                    slot: 4,
+                    generation: 0
+                },
+                0,
+                1,
+            ),
+            Err(UtilityGrantError::WrongWorkerIdentity)
         );
         assert_eq!(
-            grants.validate(grant, UtilityGrantKind::SharedMemoryRead, 41, 3, 4090, 32),
+            grants.validate(
+                grant,
+                UtilityGrantKind::SharedMemoryRead,
+                41,
+                worker,
+                4090,
+                32
+            ),
             Err(UtilityGrantError::OutOfBounds)
         );
     }
@@ -288,11 +321,15 @@ mod tests {
     fn utility_grants_expire_and_worker_replacement_revokes_them() {
         let start = std::time::Instant::now();
         let mut grants = UtilityGrantRegistry::new();
+        let worker = UtilityWorkerIdentity {
+            slot: 0,
+            generation: 7,
+        };
         let expired = grants
             .issue_at(
                 UtilityGrantKind::SharedMemoryRead,
                 1,
-                7,
+                worker,
                 10,
                 std::time::Duration::from_secs(1),
                 start,
@@ -303,7 +340,7 @@ mod tests {
                 expired,
                 UtilityGrantKind::SharedMemoryRead,
                 1,
-                7,
+                worker,
                 0,
                 1,
                 start + std::time::Duration::from_secs(2),
@@ -314,15 +351,23 @@ mod tests {
             .issue_at(
                 UtilityGrantKind::SharedMemoryRead,
                 2,
-                7,
+                worker,
                 10,
                 std::time::Duration::from_secs(60),
                 start,
             )
             .unwrap();
-        assert_eq!(grants.revoke_worker_generation(7), 1);
+        assert_eq!(grants.revoke_worker(worker), 1);
         assert_eq!(
-            grants.validate_at(live, UtilityGrantKind::SharedMemoryRead, 2, 7, 0, 1, start,),
+            grants.validate_at(
+                live,
+                UtilityGrantKind::SharedMemoryRead,
+                2,
+                worker,
+                0,
+                1,
+                start,
+            ),
             Err(UtilityGrantError::Unknown)
         );
     }

@@ -3,19 +3,19 @@ use std::time::Duration;
 
 use jobs::utility_pool::UtilityPool;
 use jobs::{JobEvent, JobGraph, JobPriority, JobScheduler, JobSpec};
+use protocol::utility_jobs::UtilityJobInput;
 
 #[test]
 fn noop_job_crosses_real_utility_process_boundary() {
     let pool = Arc::new(UtilityPool::new(env!("CARGO_BIN_EXE_worker"), 1).unwrap());
     let executor = pool.clone();
-    let scheduler = JobScheduler::new_typed(1, 1, move |spec, context| {
-        executor.execute(spec, context)
-    })
-    .unwrap();
+    let scheduler =
+        JobScheduler::new_typed(1, 1, move |spec, context| executor.execute(spec, context))
+            .unwrap();
     scheduler
         .submit(
             JobGraph::new(vec![
-                JobSpec::new(1, "noop", JobPriority::UserInitiated).idempotent(),
+                JobSpec::new(1, "noop", JobPriority::UserInitiated).idempotent()
             ])
             .unwrap(),
         )
@@ -30,4 +30,113 @@ fn noop_job_crosses_real_utility_process_boundary() {
         }
     }
     scheduler.shutdown();
+}
+
+#[test]
+fn inputs_are_prepared_for_the_selected_worker_generation() {
+    let pool = UtilityPool::new(env!("CARGO_BIN_EXE_worker"), 1).unwrap();
+    let selected = Arc::new(std::sync::Mutex::new(None));
+    let observed = selected.clone();
+    let context_scheduler = JobScheduler::new_typed(1, 1, move |spec, context| {
+        pool.execute_prepared(spec, context, |identity| {
+            *observed.lock().unwrap() = Some(identity);
+            Ok(Vec::new())
+        })
+    })
+    .unwrap();
+    context_scheduler
+        .submit(JobGraph::new(vec![JobSpec::new(2, "noop", JobPriority::UserInitiated)]).unwrap())
+        .unwrap();
+    loop {
+        if matches!(
+            context_scheduler.recv_event_timeout(Duration::from_secs(5)),
+            Some(JobEvent::Completed { job: 2 })
+        ) {
+            break;
+        }
+    }
+    context_scheduler.shutdown();
+    let identity = selected.lock().unwrap().expect("worker identity");
+    assert_eq!(identity.slot, 0);
+    assert_eq!(identity.generation, 0);
+}
+
+#[test]
+fn replacing_worker_notifies_old_generation() {
+    let invalidated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = invalidated.clone();
+    let pool =
+        UtilityPool::new_with_replacement_hook(env!("CARGO_BIN_EXE_worker"), 1, move |identity| {
+            observed.lock().unwrap().push(identity)
+        })
+        .unwrap();
+    pool.restart_worker(0).unwrap();
+    let identities = invalidated.lock().unwrap();
+    assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].slot, 0);
+    assert_eq!(identities[0].generation, 0);
+}
+
+#[test]
+fn replacing_worker_revokes_its_broker_grants() {
+    use coordinator::broker::{
+        utility_grant_revocation_hook, UtilityGrantError, UtilityGrantKind, UtilityGrantRegistry,
+    };
+
+    let grants = Arc::new(std::sync::Mutex::new(UtilityGrantRegistry::new()));
+    let pool = Arc::new(
+        UtilityPool::new_with_replacement_hook(
+            env!("CARGO_BIN_EXE_worker"),
+            1,
+            utility_grant_revocation_hook(grants.clone()),
+        )
+        .unwrap(),
+    );
+    let issued = Arc::new(std::sync::Mutex::new(None));
+    let executor_pool = pool.clone();
+    let executor_grants = grants.clone();
+    let executor_issued = issued.clone();
+    let scheduler = JobScheduler::new_typed(1, 1, move |spec, context| {
+        executor_pool.execute_prepared(spec.clone(), context, |worker| {
+            let grant = executor_grants
+                .lock()
+                .unwrap()
+                .issue(
+                    UtilityGrantKind::SharedMemoryRead,
+                    spec.id,
+                    worker,
+                    16,
+                    Duration::from_secs(60),
+                )
+                .map_err(|error| jobs::JobRunError::Execution(format!("{error:?}")))?;
+            *executor_issued.lock().unwrap() = Some((grant, worker));
+            Ok(vec![UtilityJobInput::SharedMemory {
+                grant_id: grant,
+                offset: 0,
+                length: 16,
+            }])
+        })
+    })
+    .unwrap();
+    scheduler
+        .submit(JobGraph::new(vec![JobSpec::new(3, "noop", JobPriority::UserInitiated)]).unwrap())
+        .unwrap();
+    loop {
+        if matches!(
+            scheduler.recv_event_timeout(Duration::from_secs(5)),
+            Some(JobEvent::Completed { job: 3 })
+        ) {
+            break;
+        }
+    }
+    scheduler.shutdown();
+    let (grant, worker) = issued.lock().unwrap().expect("issued grant");
+    pool.restart_worker(worker.slot).unwrap();
+    assert_eq!(
+        grants
+            .lock()
+            .unwrap()
+            .validate(grant, UtilityGrantKind::SharedMemoryRead, 3, worker, 0, 1,),
+        Err(UtilityGrantError::Unknown)
+    );
 }
