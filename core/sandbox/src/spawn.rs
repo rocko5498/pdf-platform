@@ -53,7 +53,11 @@ pub struct SpawnAttachments<'a> {
 
 impl<'a> Default for SpawnAttachments<'a> {
     fn default() -> Self {
-        Self { doc: None, shmem: None, password: None }
+        Self {
+            doc: None,
+            shmem: None,
+            password: None,
+        }
     }
 }
 
@@ -87,16 +91,34 @@ pub fn spawn_utility_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
 }
 
 /// Spawn a low-priority utility worker with one inherited shared-memory region.
-pub fn spawn_utility_worker_with_shmem(
-    worker_exe: &Path,
-    shmem: &File,
-) -> io::Result<WorkerChild> {
+pub fn spawn_utility_worker_with_shmem(worker_exe: &Path, shmem: &File) -> io::Result<WorkerChild> {
     spawn_impl(
         worker_exe,
         &SpawnAttachments {
             doc: None,
             shmem: Some(shmem),
             password: None,
+        },
+        &[],
+        SpawnPriority::UtilityLow,
+    )
+}
+
+/// Spawn a low-priority utility worker with brokered document and shared-memory handles.
+///
+/// No document or shared-memory path is exposed to the child. [GR-1, ADR-009]
+pub fn spawn_utility_worker_with_attachments(
+    worker_exe: &Path,
+    doc: &File,
+    shmem: &File,
+    password: Option<&str>,
+) -> io::Result<WorkerChild> {
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments {
+            doc: Some(doc),
+            shmem: Some(shmem),
+            password,
         },
         &[],
         SpawnPriority::UtilityLow,
@@ -247,7 +269,10 @@ where
         }
     }
     Err(last.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::ConnectionRefused, "connect retries exhausted")
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connect retries exhausted",
+        )
     }))
 }
 
@@ -376,10 +401,7 @@ mod unix {
             return Ok(None);
         };
         let fd: RawFd = raw.parse().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("bad {env_key}: {raw}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad {env_key}: {raw}"))
         })?;
         // SAFETY: parent set env to an inheritable FD for this process only.
         let file = unsafe { File::from_raw_fd(fd) };
@@ -486,11 +508,7 @@ mod windows {
                 format!("missing env {ENV_IPC_PIPE}"),
             )
         })?;
-        let client = connect_with_retry(
-            || NamedPipeClient::connect(&pipe_name),
-            50,
-            100,
-        )?;
+        let client = connect_with_retry(|| NamedPipeClient::connect(&pipe_name), 50, 100)?;
         Ok(Box::new(client))
     }
 
@@ -499,10 +517,7 @@ mod windows {
             return Ok(None);
         };
         let as_int: usize = raw.parse().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("bad {env_key}: {raw}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad {env_key}: {raw}"))
         })?;
         let handle = as_int as RawHandle;
         // SAFETY: parent set env to an inheritable HANDLE for this process only.

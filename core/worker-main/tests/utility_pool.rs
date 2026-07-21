@@ -6,6 +6,196 @@ use jobs::{JobEvent, JobGraph, JobPriority, JobScheduler, JobSpec};
 use protocol::utility_jobs::UtilityJobInput;
 
 #[test]
+fn low_priority_utility_worker_inherits_document_and_shmem_handles() {
+    use protocol::commands::{encode_command, Command};
+    use protocol::events::{decode_worker_event, WorkerEvent};
+    use sandbox::shmem::SharedRegion;
+    use sandbox::spawn::spawn_utility_worker_with_attachments;
+
+    let path = std::env::temp_dir().join(format!(
+        "pdf-platform-utility-attachment-{}.bin",
+        std::process::id()
+    ));
+    std::fs::write(&path, b"not a PDF").unwrap();
+    let document = std::fs::File::open(&path).unwrap();
+    let shmem = SharedRegion::create(4096).unwrap();
+    let mut child = spawn_utility_worker_with_attachments(
+        std::path::Path::new(env!("CARGO_BIN_EXE_worker")),
+        &document,
+        shmem.file(),
+        None,
+    )
+    .unwrap();
+    child
+        .transport
+        .send(&encode_command(&Command::Inspect { correlation_id: 91 }))
+        .unwrap();
+    let response = child
+        .transport
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    match decode_worker_event(&response).unwrap() {
+        WorkerEvent::RenderError { message, .. } => {
+            assert_ne!(message, "no inherited document");
+        }
+        other => panic!("unexpected inspect response: {other:?}"),
+    }
+    let _ = child.child.kill();
+    let _ = child.child.wait();
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn document_bound_pool_job_replaces_and_then_scrubs_worker() {
+    let invalidated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_invalidated = invalidated.clone();
+    let pool = Arc::new(
+        UtilityPool::new_with_replacement_hook(env!("CARGO_BIN_EXE_worker"), 1, move |identity| {
+            observed_invalidated.lock().unwrap().push(identity)
+        })
+        .unwrap(),
+    );
+    let path = std::env::temp_dir().join(format!(
+        "pdf-platform-utility-pool-document-{}.bin",
+        std::process::id()
+    ));
+    std::fs::write(&path, b"brokered bytes").unwrap();
+    let document = Arc::new(std::fs::File::open(&path).unwrap());
+    let prepared_identity = Arc::new(std::sync::Mutex::new(None));
+    let observed_identity = prepared_identity.clone();
+    let executor = pool.clone();
+    let scheduler = JobScheduler::new_typed(1, 1, move |spec, context| {
+        executor
+            .execute_prepared_with_document(spec, context, &document, None, |preparation| {
+                *observed_identity.lock().unwrap() = Some(preparation.identity);
+                Ok(Vec::new())
+            })
+            .map(|_| ())
+    })
+    .unwrap();
+    scheduler
+        .submit(JobGraph::new(vec![JobSpec::new(19, "noop", JobPriority::UserInitiated)]).unwrap())
+        .unwrap();
+    loop {
+        match scheduler.recv_event_timeout(Duration::from_secs(5)) {
+            Some(JobEvent::Completed { job: 19 }) => break,
+            Some(JobEvent::Failed { message, .. }) => panic!("utility job failed: {message}"),
+            Some(_) => {}
+            None => panic!("timed out waiting for utility job"),
+        }
+    }
+    scheduler.shutdown();
+    let identity = prepared_identity.lock().unwrap().unwrap();
+    assert_eq!(identity.generation, 1);
+    assert_eq!(
+        invalidated.lock().unwrap().as_slice(),
+        &[
+            jobs::utility_pool::UtilityWorkerIdentity {
+                slot: 0,
+                generation: 0
+            },
+            jobs::utility_pool::UtilityWorkerIdentity {
+                slot: 0,
+                generation: 1
+            },
+        ]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn thumbnail_crosses_document_bound_utility_process() {
+    use protocol::utility_thumbnails::{
+        decode_thumbnail_result, encode_thumbnail_request, ThumbnailRequest,
+    };
+
+    let path = std::env::temp_dir().join(format!(
+        "pdf-platform-utility-thumbnail-{}.pdf",
+        std::process::id()
+    ));
+    std::fs::write(&path, one_page_pdf()).unwrap();
+    let document = Arc::new(std::fs::File::open(&path).unwrap());
+    let pool = Arc::new(UtilityPool::new(env!("CARGO_BIN_EXE_worker"), 1).unwrap());
+    let result = Arc::new(std::sync::Mutex::new(None));
+    let observed = result.clone();
+    let executor = pool.clone();
+    let scheduler = JobScheduler::new_typed(1, 1, move |spec, context| {
+        let bytes =
+            executor.execute_prepared_with_document(spec, context, &document, None, |_| {
+                let request = ThumbnailRequest {
+                    page: 0,
+                    width: 16,
+                    height: 16,
+                    scale: 0.25,
+                    generation: 6,
+                    revision: 4,
+                };
+                Ok(vec![
+                    UtilityJobInput::Inline(encode_thumbnail_request(&request).unwrap()),
+                    UtilityJobInput::SharedMemory {
+                        grant_id: [3; 16],
+                        offset: 0,
+                        length: 16 * 16 * 4,
+                    },
+                ])
+            })?;
+        *observed.lock().unwrap() = Some(bytes);
+        Ok(())
+    })
+    .unwrap();
+    scheduler
+        .submit(
+            JobGraph::new(vec![JobSpec::new(
+                20,
+                "thumbnail",
+                JobPriority::Maintenance,
+            )])
+            .unwrap(),
+        )
+        .unwrap();
+    loop {
+        match scheduler.recv_event_timeout(Duration::from_secs(10)) {
+            Some(JobEvent::Completed { job: 20 }) => break,
+            Some(JobEvent::Failed { message, .. }) => panic!("thumbnail failed: {message}"),
+            Some(_) => {}
+            None => panic!("timed out waiting for thumbnail"),
+        }
+    }
+    scheduler.shutdown();
+    let bytes = result.lock().unwrap().take().unwrap();
+    let thumbnail = decode_thumbnail_result(&bytes).unwrap();
+    assert_eq!(thumbnail.page, 0);
+    assert!(thumbnail.is_current(6, 4));
+    let _ = std::fs::remove_file(path);
+}
+
+fn one_page_pdf() -> Vec<u8> {
+    use std::io::Write as _;
+
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    ] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object.as_bytes());
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets {
+        writeln!(bytes, "{offset:010} 00000 n ").unwrap();
+    }
+    write!(
+        bytes,
+        "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+    )
+    .unwrap();
+    bytes
+}
+
+#[test]
 fn noop_job_crosses_real_utility_process_boundary() {
     let pool = Arc::new(UtilityPool::new(env!("CARGO_BIN_EXE_worker"), 1).unwrap());
     let executor = pool.clone();

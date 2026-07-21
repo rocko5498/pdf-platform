@@ -98,6 +98,40 @@ fn main() -> ExitCode {
                             job_id: job.job_id,
                             output: Vec::new(),
                         }
+                    } else if job.operation == "thumbnail" {
+                        #[cfg(feature = "pdfium")]
+                        {
+                            match (shmem_file.as_ref(), pdfium.as_ref()) {
+                                (Some(shmem), Some(engine)) => {
+                                    match execute_thumbnail_job(&job, shmem, engine) {
+                                        Ok(output) => UtilityJobEvent::Completed {
+                                            correlation_id: job.correlation_id,
+                                            job_id: job.job_id,
+                                            output,
+                                        },
+                                        Err(message) => UtilityJobEvent::Failed {
+                                            correlation_id: job.correlation_id,
+                                            job_id: job.job_id,
+                                            message,
+                                        },
+                                    }
+                                }
+                                _ => UtilityJobEvent::Failed {
+                                    correlation_id: job.correlation_id,
+                                    job_id: job.job_id,
+                                    message: "thumbnail requires document engine and shared memory"
+                                        .into(),
+                                },
+                            }
+                        }
+                        #[cfg(not(feature = "pdfium"))]
+                        {
+                            UtilityJobEvent::Failed {
+                                correlation_id: job.correlation_id,
+                                job_id: job.job_id,
+                                message: "thumbnail engine unavailable in this build".into(),
+                            }
+                        }
                     } else {
                         UtilityJobEvent::Failed {
                             correlation_id: job.correlation_id,

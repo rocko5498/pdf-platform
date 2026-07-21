@@ -1,5 +1,6 @@
 //! Fixed sandboxed utility-worker process pool. [ADR-008, ADR-009]
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,9 @@ use protocol::utility_jobs::{
     decode_event, encode_command, UtilityJobCommand, UtilityJobEvent, UtilityJobInput,
 };
 use sandbox::shmem::SharedRegion;
-use sandbox::spawn::{spawn_utility_worker_with_shmem, WorkerChild};
+use sandbox::spawn::{
+    spawn_utility_worker_with_attachments, spawn_utility_worker_with_shmem, WorkerChild,
+};
 
 use crate::{JobContext, JobRunError, JobSpec};
 
@@ -198,6 +201,36 @@ impl UtilityPool {
     where
         P: FnOnce(UtilityWorkerPreparation<'_>) -> Result<Vec<UtilityJobInput>, JobRunError>,
     {
+        self.execute_prepared_result_inner(spec, context, None, prepare)
+    }
+
+    /// Run one job in a fresh incarnation holding a brokered document handle.
+    ///
+    /// The slot is returned to a document-free worker after the terminal event.
+    pub fn execute_prepared_with_document<P>(
+        &self,
+        spec: JobSpec,
+        context: JobContext,
+        document: &File,
+        password: Option<&str>,
+        prepare: P,
+    ) -> Result<Vec<u8>, JobRunError>
+    where
+        P: FnOnce(UtilityWorkerPreparation<'_>) -> Result<Vec<UtilityJobInput>, JobRunError>,
+    {
+        self.execute_prepared_result_inner(spec, context, Some((document, password)), prepare)
+    }
+
+    fn execute_prepared_result_inner<P>(
+        &self,
+        spec: JobSpec,
+        context: JobContext,
+        document: Option<(&File, Option<&str>)>,
+        prepare: P,
+    ) -> Result<Vec<u8>, JobRunError>
+    where
+        P: FnOnce(UtilityWorkerPreparation<'_>) -> Result<Vec<UtilityJobInput>, JobRunError>,
+    {
         if context.is_cancelled() {
             return Err(JobRunError::Execution(
                 "job cancelled before dispatch".into(),
@@ -208,6 +241,21 @@ impl UtilityPool {
         let mut worker = self.workers[index]
             .lock()
             .map_err(|_| JobRunError::WorkerCrashed("utility worker lock poisoned".into()))?;
+        if let Some((document, password)) = document {
+            let old_identity = UtilityWorkerIdentity {
+                slot: index,
+                generation: self.generations[index].fetch_add(1, Ordering::AcqRel),
+            };
+            (self.replacement_hook)(old_identity);
+            if let Err(error) =
+                replace_worker_with_document(&self.worker_exe, &mut worker, document, password)
+            {
+                let _ = replace_worker(&self.worker_exe, &mut worker);
+                return Err(JobRunError::WorkerCrashed(format!(
+                    "utility document attachment failed: {error}"
+                )));
+            }
+        }
         let identity = UtilityWorkerIdentity {
             slot: index,
             generation: self.generations[index].load(Ordering::Acquire),
@@ -234,34 +282,37 @@ impl UtilityPool {
             .and_then(|bytes| {
                 decode_event(&bytes).map_err(|error| format!("invalid utility response: {error:?}"))
             });
-        match result {
+        let (job_result, transport_broken) = match result {
             Ok(UtilityJobEvent::Completed {
                 correlation_id: cid,
                 job_id,
                 output,
-            }) if cid == correlation_id && job_id == spec.id => Ok(output),
+            }) if cid == correlation_id && job_id == spec.id => (Ok(output), false),
             Ok(UtilityJobEvent::Failed {
                 correlation_id: cid,
                 job_id,
                 message,
             }) if cid == correlation_id && job_id == spec.id => {
-                Err(JobRunError::Execution(message))
+                (Err(JobRunError::Execution(message)), false)
             }
-            Ok(_) => {
-                (self.replacement_hook)(identity);
-                self.generations[index].fetch_add(1, Ordering::AcqRel);
-                let _ = replace_worker(&self.worker_exe, &mut worker);
+            Ok(_) => (
                 Err(JobRunError::WorkerCrashed(
                     "mismatched utility response".into(),
-                ))
-            }
-            Err(message) => {
-                (self.replacement_hook)(identity);
-                self.generations[index].fetch_add(1, Ordering::AcqRel);
-                let _ = replace_worker(&self.worker_exe, &mut worker);
-                Err(JobRunError::WorkerCrashed(message))
+                )),
+                true,
+            ),
+            Err(message) => (Err(JobRunError::WorkerCrashed(message)), true),
+        };
+        if document.is_some() || transport_broken {
+            (self.replacement_hook)(identity);
+            self.generations[index].fetch_add(1, Ordering::AcqRel);
+            if let Err(error) = replace_worker(&self.worker_exe, &mut worker) {
+                return Err(JobRunError::WorkerCrashed(format!(
+                    "utility worker scrub failed: {error}"
+                )));
             }
         }
+        job_result
     }
 }
 
@@ -275,6 +326,23 @@ fn replace_worker(worker_exe: &Path, worker: &mut UtilityWorkerSlot) -> std::io:
     let _ = worker.child.child.kill();
     let _ = worker.child.child.wait();
     worker.child = spawn_utility_worker_with_shmem(worker_exe, worker.shared_memory.file())?;
+    Ok(())
+}
+
+fn replace_worker_with_document(
+    worker_exe: &Path,
+    worker: &mut UtilityWorkerSlot,
+    document: &File,
+    password: Option<&str>,
+) -> std::io::Result<()> {
+    let _ = worker.child.child.kill();
+    let _ = worker.child.child.wait();
+    worker.child = spawn_utility_worker_with_attachments(
+        worker_exe,
+        document,
+        worker.shared_memory.file(),
+        password,
+    )?;
     Ok(())
 }
 
