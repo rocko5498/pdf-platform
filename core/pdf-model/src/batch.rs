@@ -185,18 +185,45 @@ impl BatchPipeline {
 ///
 /// Each step is executed in order. If a step fails, execution stops
 /// and the error is reported. Returns results for each completed step.
+///
+/// Runs `Optimize` steps directly through `assembly_ops::optimize_pdf` with
+/// no verification — the same as this crate always has. Callers that can
+/// see the coordinator layer (which owns the candidate/verify/publish
+/// safety net, `pdf-model` must not depend on it — ADR-025) should use
+/// [`execute_pipeline_with`] instead so `Optimize` steps get the same
+/// verified-publish guarantee the CLI's standalone `optimize` command has.
 pub fn execute_pipeline(pipeline: &BatchPipeline) -> Vec<StepResult> {
+    execute_pipeline_with(pipeline, &|input, output, profile| {
+        crate::assembly_ops::optimize_pdf(input, output, profile).map_err(|e| e.to_string())
+    })
+}
+
+/// Like [`execute_pipeline`], but `Optimize` steps are generated through the
+/// supplied `optimize` hook instead of calling `assembly_ops::optimize_pdf`
+/// directly. The hook receives the same `(input, output, profile)` the step
+/// declares and decides how to get bytes to `output` safely — e.g. wrapping
+/// `coordinator::broker::optimize_with_verification` around
+/// `assembly_ops::optimize_pdf` to add candidate/verify/atomic-publish —
+/// without `pdf-model` itself depending on `coordinator` (ADR-025 layering).
+/// [FR-BATCH-1]
+pub fn execute_pipeline_with(
+    pipeline: &BatchPipeline,
+    optimize: &dyn Fn(&std::path::Path, &std::path::Path, crate::assembly::OptimizeProfile) -> Result<String, String>,
+) -> Vec<StepResult> {
     let mut results: Vec<StepResult> = Vec::new();
     for step in &pipeline.steps {
         let start = std::time::Instant::now();
-        let result = execute_step(step);
+        let result = execute_step(step, optimize);
         let duration_ms = start.elapsed().as_millis() as u64;
         let success = result.is_ok();
-        let outputs = result.unwrap_or_default();
+        let (outputs, message) = match result {
+            Ok(outputs) => (outputs, "ok".to_string()),
+            Err(error) => (Vec::new(), error),
+        };
         results.push(StepResult {
             success,
             outputs,
-            message: if success { "ok".into() } else { "failed".into() },
+            message,
             duration_ms,
         });
         // Stop on first failure.
@@ -208,7 +235,10 @@ pub fn execute_pipeline(pipeline: &BatchPipeline) -> Vec<StepResult> {
 }
 
 /// Execute a single batch step. Returns output paths on success.
-fn execute_step(step: &BatchStep) -> Result<Vec<PathBuf>, String> {
+fn execute_step(
+    step: &BatchStep,
+    optimize: &dyn Fn(&std::path::Path, &std::path::Path, crate::assembly::OptimizeProfile) -> Result<String, String>,
+) -> Result<Vec<PathBuf>, String> {
     match step {
         BatchStep::Merge { inputs, output } => {
             let paths: Vec<&std::path::Path> = inputs.iter().map(|p| p.as_path()).collect();
@@ -237,8 +267,7 @@ fn execute_step(step: &BatchStep) -> Result<Vec<PathBuf>, String> {
                 "archive" => crate::assembly::OptimizeProfile::ArchivePreserving,
                 _ => crate::assembly::OptimizeProfile::Screen,
             };
-            crate::assembly_ops::optimize_pdf(input, output, prof)
-                .map_err(|e| e.to_string())?;
+            optimize(input, output, prof)?;
             Ok(vec![output.clone()])
         }
         BatchStep::Watermark { input, text, output } => {
@@ -307,7 +336,7 @@ mod tests {
             inputs: vec!["a.pdf".into()],
             output: "out.pdf".into(),
         };
-        let result = execute_step(&step);
+        let result = execute_step(&step, &default_optimize);
         assert!(result.is_err());
     }
 
@@ -324,7 +353,7 @@ mod tests {
             text: "CONFIDENTIAL".into(),
             output: out.clone(),
         };
-        let result = execute_step(&step).unwrap();
+        let result = execute_step(&step, &default_optimize).unwrap();
         assert_eq!(result.len(), 1);
         assert!(out.exists());
         assert_eq!(std::fs::read(&out).unwrap(), b"fake pdf content");
@@ -338,8 +367,16 @@ mod tests {
             output: "out.pdf".into(),
             profile: "screen".into(),
         };
-        let result = execute_step(&step);
+        let result = execute_step(&step, &default_optimize);
         // Will fail because file doesn't exist (or qpdf missing).
         assert!(result.is_err());
+    }
+
+    fn default_optimize(
+        input: &std::path::Path,
+        output: &std::path::Path,
+        profile: crate::assembly::OptimizeProfile,
+    ) -> Result<String, String> {
+        crate::assembly_ops::optimize_pdf(input, output, profile).map_err(|e| e.to_string())
     }
 }

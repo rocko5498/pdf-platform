@@ -574,6 +574,7 @@ fn cmd_extract_pages(path: &Path, rest: &[String]) {
 }
 
 fn cmd_optimize(path: &Path, rest: &[String]) {
+    use coordinator::broker::optimize_with_verification;
     use pdf_model::assembly::OptimizeProfile;
     use pdf_model::assembly_ops::optimize_pdf;
     let profile_name = rest
@@ -593,7 +594,10 @@ fn cmd_optimize(path: &Path, rest: &[String]) {
             process::exit(1);
         }
     };
-    match optimize_pdf(path, &out, profile) {
+    let result = optimize_with_verification(&out, |candidate_path| {
+        optimize_pdf(path, candidate_path, profile).map_err(|e| e.to_string())
+    });
+    match result {
         Ok(preflight) => {
             print!("{preflight}");
             println!("\nWrote {}", out.display());
@@ -1007,7 +1011,13 @@ fn extract_docmdp_level(dict: &str) -> Option<sign::DocMDPLevel> {
 /// and saves the result. Pages with existing text are skipped unless
 /// --with-text is specified. [FR-OCR-3]
 fn cmd_ocr(path: &Path, rest: &[String]) {
-    use ocr_bridge::{TesseractEngine, OcrEngine, PreprocessOptions, generate_text_layer_stream, page_has_text};
+    use coordinator::ocr::{run_ocr_for_page, OcrOutcome, OcrPageContext, DEFAULT_CONFIDENCE_THRESHOLD};
+    use jobs::utility_pool::UtilityPool;
+    use jobs::{JobEvent, JobGraph, JobPriority, JobScheduler, JobSpec};
+    use ocr_bridge::{OcrEngine, PreprocessOptions, TesseractEngine};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     // Parse arguments.
     let lang = rest.iter()
@@ -1076,7 +1086,9 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
     };
 
     let page_count = coord.page_count();
-    let pages_to_ocr = pages.unwrap_or_else(|| (0..page_count).collect());
+    let mut pages_to_ocr = pages.unwrap_or_else(|| (0..page_count).collect());
+    pages_to_ocr.sort_unstable();
+    pages_to_ocr.dedup();
 
     println!("Processing {} page(s)...", pages_to_ocr.len());
 
@@ -1087,32 +1099,174 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
         ocr_pages_with_text: with_text,
     };
 
-    let mut ocr_count = 0u32;
+    // Resolve each page's object number/bytes/geometry and reserve its two
+    // object numbers (content stream + font, see build_apply_ocr_text_layer_group)
+    // up front — sequential on the main thread, before any job dispatch, so
+    // concurrent per-page jobs never race over the same free object number.
+    let mut page_contexts: HashMap<u64, OcrPageContext> = HashMap::new();
     let mut skip_count = 0u32;
-    let mut error_count = 0u32;
-
     for &page_idx in &pages_to_ocr {
         if page_idx >= page_count {
             eprintln!("  warning: page {} out of range (max {}), skipping", page_idx, page_count - 1);
+            skip_count += 1;
             continue;
         }
+        let (page_obj_num, original_page_bytes) = match coord.page_object(page_idx) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  error: page {page_idx}: could not resolve page object: {e}");
+                skip_count += 1;
+                continue;
+            }
+        };
+        let (page_width_pt, page_height_pt, _rotation) =
+            coord.summary().page_dimensions_f()[page_idx as usize];
+        let next_obj_num = coord.next_obj_num();
+        coord.set_next_obj_num(next_obj_num + 2);
+        page_contexts.insert(
+            page_idx as u64,
+            OcrPageContext {
+                page_index: page_idx,
+                page_obj_num,
+                original_page_bytes,
+                page_width_pt,
+                page_height_pt,
+                next_obj_num,
+            },
+        );
+    }
 
-        // Check if page already has text.
-        if !with_text {
-            // We'd need to check the text model here. For now, we OCR all pages.
-            // A proper implementation would use the coordinator's text extraction.
+    if page_contexts.is_empty() {
+        println!();
+        println!("OCR summary:");
+        println!("  Pages processed: 0");
+        println!("  Pages skipped:   {skip_count}");
+        let _ = coord.close();
+        process::exit(if skip_count > 0 { 2 } else { 0 });
+    }
+
+    let worker = find_worker();
+    let pool = match UtilityPool::new(&worker, 1) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("error: utility pool spawn failed: {e:?}");
+            process::exit(2);
         }
+    };
+    let document = match std::fs::File::open(path) {
+        Ok(f) => Arc::new(f),
+        Err(e) => {
+            eprintln!("error: reopen for OCR failed: {e}");
+            process::exit(2);
+        }
+    };
 
-        // For the CLI, we report what would be done.
-        // Full OCR requires rasterization from the engine, which happens in the worker.
-        // The coordinator would need to:
-        // 1. Request a page raster from the worker
-        // 2. Run OCR on it (in the utility pool)
-        // 3. Generate the text layer
-        // 4. Apply it to the overlay
-        // For now, we report the OCR would run on this page.
-        println!("  page {}: OCR would run (rasterization + recognition + text layer)", page_idx);
-        ocr_count += 1;
+    let job_count = page_contexts.len();
+    let contexts = Arc::new(Mutex::new(page_contexts));
+    let outcomes: Arc<Mutex<HashMap<u64, OcrOutcome>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let exec_pool = pool.clone();
+    let exec_document = document.clone();
+    let exec_contexts = contexts.clone();
+    let exec_outcomes = outcomes.clone();
+    let lang_owned = lang.clone();
+    let scheduler = match JobScheduler::new_typed(1, job_count, move |spec, context| {
+        let page = exec_contexts
+            .lock()
+            .unwrap()
+            .remove(&spec.id)
+            .ok_or_else(|| jobs::JobRunError::Execution(format!("no context for job {}", spec.id)))?;
+        let outcome = run_ocr_for_page(
+            &exec_pool,
+            &exec_document,
+            None,
+            spec.id,
+            context,
+            page,
+            &lang_owned,
+            options.clone(),
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        )?;
+        exec_outcomes.lock().unwrap().insert(spec.id, outcome);
+        Ok(())
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: job scheduler init failed: {e:?}");
+            process::exit(2);
+        }
+    };
+
+    let job_ids: Vec<u64> = contexts.lock().unwrap().keys().copied().collect();
+    let specs: Vec<JobSpec> = job_ids
+        .iter()
+        .map(|&id| JobSpec::new(id, "ocr-schedule", JobPriority::UserInitiated).idempotent())
+        .collect();
+    let graph = match JobGraph::new(specs) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: OCR job graph construction failed: {e:?}");
+            process::exit(2);
+        }
+    };
+    if let Err(e) = scheduler.submit(graph) {
+        eprintln!("error: OCR job submission failed: {e:?}");
+        process::exit(2);
+    }
+
+    let mut remaining = job_count;
+    let mut dispatch_errors: Vec<(u64, String)> = Vec::new();
+    while remaining > 0 {
+        match scheduler.recv_event_timeout(Duration::from_secs(120)) {
+            Some(JobEvent::Completed { .. }) => remaining -= 1,
+            Some(JobEvent::Failed { job, message }) => {
+                dispatch_errors.push((job, message));
+                remaining -= 1;
+            }
+            Some(_) => {}
+            None => {
+                eprintln!("error: timed out waiting for OCR jobs");
+                break;
+            }
+        }
+    }
+    scheduler.shutdown();
+
+    let mut ocr_count = 0u32;
+    let mut error_count = 0u32;
+    let mut outcomes = outcomes.lock().unwrap();
+    for &page_idx in &pages_to_ocr {
+        let job_id = page_idx as u64;
+        if let Some((_, message)) = dispatch_errors.iter().find(|(id, _)| *id == job_id) {
+            eprintln!("  page {page_idx}: dispatch failed: {message}");
+            error_count += 1;
+            continue;
+        }
+        match outcomes.remove(&job_id) {
+            Some(OcrOutcome::Applied(group)) => {
+                if let Err(e) = coord.apply_command_group(group) {
+                    eprintln!("  page {page_idx}: apply failed: {e}");
+                    error_count += 1;
+                } else {
+                    println!("  page {page_idx}: OCR applied");
+                    ocr_count += 1;
+                }
+            }
+            Some(OcrOutcome::Uncertain { result, threshold }) => {
+                eprintln!(
+                    "  page {page_idx}: OCR uncertain (confidence {:.2} < {:.2}), not applied",
+                    result.average_confidence, threshold
+                );
+                skip_count += 1;
+            }
+            Some(OcrOutcome::Failed(message)) => {
+                eprintln!("  page {page_idx}: OCR failed: {message}");
+                error_count += 1;
+            }
+            None => {
+                // Page was out of range or unresolvable — already counted above.
+            }
+        }
     }
 
     println!();
@@ -1122,17 +1276,18 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
     println!("  Errors:          {}", error_count);
 
     if ocr_count > 0 {
-        println!();
-        println!("Note: Full OCR pipeline (rasterize → recognize → apply text layer)");
-        println!("requires worker integration. The OCR engine and text layer generation");
-        println!("are implemented in ocr-bridge; coordinator wiring is pending.");
-        println!();
-        println!("To use OCR with Tesseract directly:");
-        println!("  tesseract input.png output --oem 1 --psm 6 -l {} tsv", lang);
+        match coord.save_incremental(&out) {
+            Ok(_) => println!("Saved: {}", out.display()),
+            Err(e) => {
+                eprintln!("error: save failed: {e}");
+                let _ = coord.close();
+                process::exit(2);
+            }
+        }
     }
 
     let _ = coord.close();
-    process::exit(0);
+    process::exit(if error_count > 0 { 1 } else { 0 });
 }
 
 /// Validate PDF/A conformance. [FR-STD-1, FR-STD-2, M10]
@@ -1338,7 +1493,8 @@ fn extract_xref_offsets(_bytes: &[u8]) -> Vec<(u32, u64)> {
 /// Pipeline file format: one step per section, type=merge/split/etc.
 /// See `pdf_model::batch::BatchPipeline::serialize()` for the format.
 fn cmd_batch(pipeline_path: &Path) {
-    use pdf_model::batch::{BatchPipeline, BatchStep, execute_pipeline};
+    use coordinator::broker::optimize_with_verification;
+    use pdf_model::batch::{BatchPipeline, BatchStep, execute_pipeline_with};
 
     if !pipeline_path.exists() {
         eprintln!("error: pipeline file not found: {}", pipeline_path.display());
@@ -1436,7 +1592,14 @@ fn cmd_batch(pipeline_path: &Path) {
     }
 
     println!("Executing pipeline '{}' ({} steps)...", pipeline.name, pipeline.step_count());
-    let results = execute_pipeline(&pipeline);
+    // Same verified candidate/publish safety net `optimize` gets standalone
+    // (FR-BATCH: identical behavior via GUI/CLI/batch — see cmd_optimize).
+    let results = execute_pipeline_with(&pipeline, &|input, output, profile| {
+        optimize_with_verification(output, |candidate_path| {
+            pdf_model::assembly_ops::optimize_pdf(input, candidate_path, profile)
+                .map_err(|e| e.to_string())
+        })
+    });
 
     let mut all_ok = true;
     for (i, result) in results.iter().enumerate() {
