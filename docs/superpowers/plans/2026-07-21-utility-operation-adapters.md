@@ -18,6 +18,8 @@ a new file and therefore needs the strongest broker and verification gates.
 
 ## Task 1 — Capability and bulk-input contract
 
+**Status:** Complete on `codex/jobs-scheduler`; security review required before merge.
+
 **Files:** `core/protocol/src/utility_jobs.rs`, `core/jobs/src/utility_pool.rs`,
 `core/coordinator/src/broker.rs`, focused tests.
 
@@ -30,6 +32,10 @@ a new file and therefore needs the strongest broker and verification gates.
   worker replacement invalidating process-local grants.
 
 **Gate:** No operation adapter starts until forged and out-of-bounds inputs are rejected in tests.
+
+**Evidence:** forged/expired/wrong-scope grants fail closed; real worker replacement revokes its
+grants; fixed per-slot shared memory is inherited without paths; real IPC rejects an out-of-bounds
+descriptor. Workspace total: 531 passing tests.
 
 ## Task 2 — OCR recognition adapter
 

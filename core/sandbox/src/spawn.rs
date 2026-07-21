@@ -86,6 +86,23 @@ pub fn spawn_utility_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
     )
 }
 
+/// Spawn a low-priority utility worker with one inherited shared-memory region.
+pub fn spawn_utility_worker_with_shmem(
+    worker_exe: &Path,
+    shmem: &File,
+) -> io::Result<WorkerChild> {
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments {
+            doc: None,
+            shmem: Some(shmem),
+            password: None,
+        },
+        &[],
+        SpawnPriority::UtilityLow,
+    )
+}
+
 /// Like [`spawn_worker`], with extra environment variables for the child.
 pub fn spawn_worker_with_env(
     worker_exe: &Path,

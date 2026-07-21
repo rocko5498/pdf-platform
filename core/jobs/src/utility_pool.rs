@@ -8,9 +8,13 @@ use std::time::Duration;
 use protocol::utility_jobs::{
     decode_event, encode_command, UtilityJobCommand, UtilityJobEvent, UtilityJobInput,
 };
-use sandbox::spawn::{spawn_utility_worker, WorkerChild};
+use sandbox::shmem::SharedRegion;
+use sandbox::spawn::{spawn_utility_worker_with_shmem, WorkerChild};
 
 use crate::{JobContext, JobRunError, JobSpec};
+
+/// Default fixed shared-memory capacity for each utility process (16 MiB). [GR-7]
+pub const DEFAULT_UTILITY_SHMEM_BYTES: usize = 16 * 1024 * 1024;
 
 /// Utility pool construction failure.
 #[derive(Debug)]
@@ -40,12 +44,17 @@ impl std::error::Error for UtilityPoolError {}
 /// Fixed set of sandbox-spawned utility worker processes.
 pub struct UtilityPool {
     worker_exe: PathBuf,
-    workers: Vec<Mutex<WorkerChild>>,
+    workers: Vec<Mutex<UtilityWorkerSlot>>,
     next_worker: AtomicUsize,
     next_correlation: AtomicU64,
     generations: Vec<AtomicU64>,
     replacement_hook: Arc<dyn Fn(UtilityWorkerIdentity) + Send + Sync>,
     response_timeout: Duration,
+}
+
+struct UtilityWorkerSlot {
+    child: WorkerChild,
+    shared_memory: SharedRegion,
 }
 
 /// Stable worker slot plus incarnation counter used to scope capabilities.
@@ -55,6 +64,14 @@ pub struct UtilityWorkerIdentity {
     pub slot: usize,
     /// Incremented whenever the process in this slot is replaced.
     pub generation: u64,
+}
+
+/// Z0 preparation view for the selected and locked utility worker.
+pub struct UtilityWorkerPreparation<'a> {
+    /// Exact worker incarnation that will receive the request.
+    pub identity: UtilityWorkerIdentity,
+    /// Fixed-capacity shared-memory region inherited by that worker.
+    pub shared_memory: &'a mut [u8],
 }
 
 impl UtilityPool {
@@ -75,14 +92,43 @@ impl UtilityPool {
     where
         F: Fn(UtilityWorkerIdentity) + Send + Sync + 'static,
     {
+        Self::new_with_capacity_and_hook(
+            worker_exe,
+            worker_count,
+            DEFAULT_UTILITY_SHMEM_BYTES,
+            replacement_hook,
+        )
+    }
+
+    /// Spawn a pool with an explicit per-worker shared-memory bound.
+    pub fn new_with_capacity_and_hook<F>(
+        worker_exe: impl AsRef<Path>,
+        worker_count: usize,
+        shared_memory_bytes: usize,
+        replacement_hook: F,
+    ) -> Result<Self, UtilityPoolError>
+    where
+        F: Fn(UtilityWorkerIdentity) + Send + Sync + 'static,
+    {
         if worker_count == 0 {
             return Err(UtilityPoolError::ZeroWorkers);
+        }
+        if shared_memory_bytes == 0 {
+            return Err(UtilityPoolError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "utility shared-memory capacity must be non-zero",
+            )));
         }
         let worker_exe = worker_exe.as_ref().to_path_buf();
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            match spawn_utility_worker(&worker_exe) {
-                Ok(worker) => workers.push(Mutex::new(worker)),
+            let shared_memory =
+                SharedRegion::create(shared_memory_bytes).map_err(UtilityPoolError::Spawn)?;
+            match spawn_utility_worker_with_shmem(&worker_exe, shared_memory.file()) {
+                Ok(child) => workers.push(Mutex::new(UtilityWorkerSlot {
+                    child,
+                    shared_memory,
+                })),
                 Err(error) => {
                     stop_workers(&mut workers);
                     return Err(UtilityPoolError::Spawn(error));
@@ -135,7 +181,7 @@ impl UtilityPool {
         prepare: P,
     ) -> Result<(), JobRunError>
     where
-        P: FnOnce(UtilityWorkerIdentity) -> Result<Vec<UtilityJobInput>, JobRunError>,
+        P: FnOnce(UtilityWorkerPreparation<'_>) -> Result<Vec<UtilityJobInput>, JobRunError>,
     {
         if context.is_cancelled() {
             return Err(JobRunError::Execution(
@@ -151,7 +197,10 @@ impl UtilityPool {
             slot: index,
             generation: self.generations[index].load(Ordering::Acquire),
         };
-        let inputs = prepare(identity)?;
+        let inputs = prepare(UtilityWorkerPreparation {
+            identity,
+            shared_memory: worker.shared_memory.as_mut_slice(),
+        })?;
         let request = UtilityJobCommand {
             correlation_id,
             job_id: spec.id,
@@ -162,9 +211,10 @@ impl UtilityPool {
             JobRunError::Execution(format!("job request encoding failed: {error:?}"))
         })?;
         let result = worker
+            .child
             .transport
             .send(&frame)
-            .and_then(|()| worker.transport.recv_timeout(self.response_timeout))
+            .and_then(|()| worker.child.transport.recv_timeout(self.response_timeout))
             .map_err(|error| format!("utility transport failed: {error}"))
             .and_then(|bytes| {
                 decode_event(&bytes).map_err(|error| format!("invalid utility response: {error:?}"))
@@ -205,18 +255,18 @@ impl Drop for UtilityPool {
     }
 }
 
-fn replace_worker(worker_exe: &Path, worker: &mut WorkerChild) -> std::io::Result<()> {
-    let _ = worker.child.kill();
-    let _ = worker.child.wait();
-    *worker = spawn_utility_worker(worker_exe)?;
+fn replace_worker(worker_exe: &Path, worker: &mut UtilityWorkerSlot) -> std::io::Result<()> {
+    let _ = worker.child.child.kill();
+    let _ = worker.child.child.wait();
+    worker.child = spawn_utility_worker_with_shmem(worker_exe, worker.shared_memory.file())?;
     Ok(())
 }
 
-fn stop_workers(workers: &mut [Mutex<WorkerChild>]) {
+fn stop_workers(workers: &mut [Mutex<UtilityWorkerSlot>]) {
     for worker in workers {
         if let Ok(worker) = worker.get_mut() {
-            let _ = worker.child.kill();
-            let _ = worker.child.wait();
+            let _ = worker.child.child.kill();
+            let _ = worker.child.child.wait();
         }
     }
 }

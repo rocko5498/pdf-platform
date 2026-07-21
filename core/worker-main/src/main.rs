@@ -18,7 +18,7 @@ use protocol::inspect::StructuralSummary;
 use protocol::transport::TransportError;
 use protocol::utility_jobs::{
     decode_command as decode_utility_job, encode_event as encode_utility_event,
-    UtilityJobEvent,
+    UtilityJobCommand, UtilityJobEvent, UtilityJobInput,
 };
 use sandbox::shmem::map_shmem_file;
 use sandbox::spawn::{adopt_document_file, adopt_inherited, adopt_password, adopt_shmem_file};
@@ -84,7 +84,13 @@ fn main() -> ExitCode {
         match transport.recv_timeout(Duration::from_secs(1)) {
             Ok(msg) => {
                 if let Ok(job) = decode_utility_job(&msg) {
-                    let event = if job.operation == "noop" {
+                    let event = if let Err(message) = validate_utility_inputs(&job, &shmem_file) {
+                        UtilityJobEvent::Failed {
+                            correlation_id: job.correlation_id,
+                            job_id: job.job_id,
+                            message,
+                        }
+                    } else if job.operation == "noop" {
                         UtilityJobEvent::Completed {
                             correlation_id: job.correlation_id,
                             job_id: job.job_id,
@@ -232,6 +238,41 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+fn validate_utility_inputs(
+    job: &UtilityJobCommand,
+    shmem_file: &Option<File>,
+) -> Result<(), String> {
+    for input in &job.inputs {
+        let UtilityJobInput::SharedMemory {
+            grant_id,
+            offset,
+            length,
+        } = input
+        else {
+            continue;
+        };
+        if *grant_id == [0; 16] {
+            return Err("invalid zero utility grant".into());
+        }
+        let file = shmem_file
+            .as_ref()
+            .ok_or_else(|| "utility shared memory not attached".to_string())?;
+        let region_len = file
+            .metadata()
+            .map_err(|error| format!("utility shared memory metadata failed: {error}"))?
+            .len();
+        let end = offset
+            .checked_add(*length)
+            .ok_or_else(|| "utility shared memory range overflow".to_string())?;
+        if end > region_len {
+            return Err(format!(
+                "utility shared memory range out of bounds: {end} > {region_len}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
