@@ -173,3 +173,191 @@ fn ocr_dispatch_reaches_render_recognize_and_decode() {
         }
     }
 }
+
+/// Proves an OCR job participates correctly in `JobScheduler`'s existing
+/// idempotent-retry-once-after-worker-loss mechanism (`jobs::lib`'s own
+/// `idempotent_job_retries_one_worker_crash` proves the mechanism generically
+/// with a mocked executor; this proves a *real* `run_ocr_for_page` call is
+/// what actually runs on the retried attempt, not just a bare mock).
+/// [ADR-009]
+#[test]
+fn ocr_job_is_idempotent_and_retries_after_simulated_worker_loss() {
+    // Environment-tolerant like the other OCR e2e tests: on a machine
+    // without Tesseract, the real (retried) attempt legitimately fails too
+    // (EngineUnavailable, a JobRunError::Execution -- correctly NOT retried
+    // further, unlike the simulated WorkerCrashed first attempt). What this
+    // proves either way: exactly one retry happens, and the retried attempt
+    // is a genuine run_ocr_for_page call (captured below), not a mock.
+    let path = temp_pdf(&one_page_pdf());
+    let pool = Arc::new(UtilityPool::new(worker_path(), 1).unwrap());
+    let document = Arc::new(std::fs::File::open(&path).unwrap());
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let second_attempt: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let exec_pool = pool.clone();
+    let exec_document = document.clone();
+    let exec_attempts = attempts.clone();
+    let exec_second_attempt = second_attempt.clone();
+    let scheduler = JobScheduler::new_typed(1, 1, move |spec, context| {
+        if exec_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            // Simulate the utility worker being lost before this attempt
+            // could run at all -- the same failure shape a real crash
+            // produces (JobRunError::WorkerCrashed), before ever touching
+            // run_ocr_for_page.
+            return Err(jobs::JobRunError::WorkerCrashed(
+                "simulated utility worker loss".into(),
+            ));
+        }
+        let page = OcrPageContext {
+            page_index: 0,
+            page_obj_num: 3,
+            original_page_bytes: PAGE_OBJECT_BYTES.to_vec(),
+            page_width_pt: 612.0,
+            page_height_pt: 792.0,
+            next_obj_num: 4,
+        };
+        let result = run_ocr_for_page(
+            &exec_pool,
+            &exec_document,
+            None,
+            spec.id,
+            context,
+            page,
+            "eng",
+            PreprocessOptions::default(),
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        );
+        *exec_second_attempt.lock().unwrap() = Some(match &result {
+            Ok(OcrOutcome::Applied(_)) => "applied".to_string(),
+            Ok(OcrOutcome::Uncertain { .. }) => "uncertain".to_string(),
+            Ok(OcrOutcome::Failed(message)) => format!("failed: {message}"),
+            Err(error) => format!("job-error: {error:?}"),
+        });
+        result?;
+        Ok(())
+    })
+    .unwrap();
+
+    scheduler
+        .submit(JobGraph::new(vec![JobSpec::new(1, "ocr-schedule", JobPriority::Maintenance).idempotent()]).unwrap())
+        .unwrap();
+
+    loop {
+        match scheduler.recv_event_timeout(Duration::from_secs(20)) {
+            Some(JobEvent::Completed { job: 1 }) | Some(JobEvent::Failed { job: 1, .. }) => break,
+            Some(_) => {}
+            None => panic!("timed out waiting for the retried ocr job"),
+        }
+    }
+    scheduler.shutdown();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "idempotent ocr job must retry exactly once after simulated worker loss"
+    );
+    let second = second_attempt.lock().unwrap().take();
+    let second = second.expect("the retried attempt must have actually run run_ocr_for_page");
+    let lower = second.to_lowercase();
+    assert!(
+        lower.contains("applied")
+            || lower.contains("uncertain")
+            || lower.contains("tesseract")
+            || lower.contains("unavailable")
+            || lower.contains("no text"),
+        "unexpected retried-attempt outcome: {second}"
+    );
+}
+
+/// Proves a cancelled OCR job never reaches the sandboxed worker at all --
+/// `JobScheduler` checks cancellation before dispatch (see
+/// `jobs::lib`'s dispatch loop) and short-circuits to `JobEvent::Cancelled`
+/// without ever invoking the executor. Blocks the scheduler's only worker
+/// thread with an unrelated job first so the OCR job is guaranteed to still
+/// be pending (and therefore cancellable) when cancelled. [ADR-009]
+#[test]
+fn ocr_job_never_dispatches_to_the_pool_when_cancelled_before_start() {
+    let path = temp_pdf(&one_page_pdf());
+    let pool = Arc::new(UtilityPool::new(worker_path(), 1).unwrap());
+    let document = Arc::new(std::fs::File::open(&path).unwrap());
+    let outcome: Arc<Mutex<Option<OcrOutcome>>> = Arc::new(Mutex::new(None));
+
+    let exec_pool = pool.clone();
+    let exec_document = document.clone();
+    let exec_outcome = outcome.clone();
+    let scheduler = JobScheduler::new_typed(1, 2, move |spec, context| {
+        if spec.id == 1 {
+            // Occupy the sole worker thread so job 2 (the OCR job) is
+            // guaranteed to still be pending when the test cancels it.
+            std::thread::sleep(Duration::from_millis(300));
+            return Ok(());
+        }
+        if context.is_cancelled() {
+            return Err(jobs::JobRunError::Execution("cancelled before dispatch".into()));
+        }
+        let page = OcrPageContext {
+            page_index: 0,
+            page_obj_num: 3,
+            original_page_bytes: PAGE_OBJECT_BYTES.to_vec(),
+            page_width_pt: 612.0,
+            page_height_pt: 792.0,
+            next_obj_num: 4,
+        };
+        let result = run_ocr_for_page(
+            &exec_pool,
+            &exec_document,
+            None,
+            spec.id,
+            context,
+            page,
+            "eng",
+            PreprocessOptions::default(),
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        )?;
+        *exec_outcome.lock().unwrap() = Some(result);
+        Ok(())
+    })
+    .unwrap();
+
+    scheduler
+        .submit(JobGraph::new(vec![JobSpec::new(1, "blocker", JobPriority::Maintenance)]).unwrap())
+        .unwrap();
+    scheduler
+        .submit(JobGraph::new(vec![JobSpec::new(2, "ocr-schedule", JobPriority::Maintenance)]).unwrap())
+        .unwrap();
+    assert!(
+        scheduler.cancel(2),
+        "ocr job must be tracked and cancellable while still pending"
+    );
+
+    let mut seen: std::collections::HashMap<u64, &str> = std::collections::HashMap::new();
+    while seen.len() < 2 {
+        match scheduler.recv_event_timeout(Duration::from_secs(5)) {
+            Some(JobEvent::Completed { job }) => {
+                seen.insert(job, "completed");
+            }
+            Some(JobEvent::Cancelled { job }) => {
+                seen.insert(job, "cancelled");
+            }
+            Some(JobEvent::Failed { job, .. }) => {
+                seen.insert(job, "failed");
+            }
+            Some(_) => {}
+            None => panic!("timed out waiting for terminal events"),
+        }
+    }
+    scheduler.shutdown();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(seen.get(&1), Some(&"completed"));
+    assert_eq!(
+        seen.get(&2),
+        Some(&"cancelled"),
+        "ocr job must be cancelled cooperatively, not dispatched to the worker"
+    );
+    assert!(
+        outcome.lock().unwrap().is_none(),
+        "a cancelled ocr job must never actually run recognition"
+    );
+}
