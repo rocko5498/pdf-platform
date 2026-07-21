@@ -20,4 +20,6 @@ plugin-host     = { path = "../plugin-host" }
 sandbox         = { path = "../sandbox" }
 protocol        = { path = "../protocol" }
 diagnostics     = { path = "../diagnostics" }
+# MIT OR Apache-2.0. Exit seam: broker::UtilityGrantRegistry::issue_at.
+getrandom       = "0.4"
 base64          = "0.22"

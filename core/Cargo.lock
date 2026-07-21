@@ -355,6 +355,7 @@ dependencies = [
  "base64 0.22.1",
  "diagnostics",
  "engine-api",
+ "getrandom 0.4.3",
  "jobs",
  "ocr-bridge",
  "pdf-cos",
