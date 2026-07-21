@@ -24,6 +24,7 @@ protocol      = { path = "../protocol" }
 diagnostics   = { path = "../diagnostics" }
 pdf-model     = { path = "../pdf-model" }
 ocr-bridge    = { path = "../ocr-bridge" }
+render-pipeline = { path = "../render-pipeline" }
 base64        = "0.22"
 
 [dev-dependencies]

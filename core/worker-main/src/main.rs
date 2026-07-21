@@ -329,6 +329,47 @@ fn execute_ocr_job(
         .map_err(|error| format!("OCR execution failed: {error:?}"))
 }
 
+fn execute_thumbnail_job(
+    job: &UtilityJobCommand,
+    shmem_file: &File,
+    engine: &dyn Rasterize,
+) -> Result<Vec<u8>, String> {
+    let [UtilityJobInput::Inline(request), UtilityJobInput::SharedMemory {
+        grant_id,
+        offset,
+        length,
+    }] = job.inputs.as_slice()
+    else {
+        return Err("thumbnail requires request metadata and one shared-memory output".into());
+    };
+    if *grant_id == [0; 16] {
+        return Err("invalid zero thumbnail output grant".into());
+    }
+    let region_len = usize::try_from(
+        shmem_file
+            .metadata()
+            .map_err(|error| format!("thumbnail shared-memory metadata failed: {error}"))?
+            .len(),
+    )
+    .map_err(|_| "thumbnail shared-memory region is too large".to_string())?;
+    let mut map = map_shmem_file(shmem_file, region_len)
+        .map_err(|error| format!("thumbnail shared-memory map failed: {error}"))?;
+    let start = usize::try_from(*offset).map_err(|_| "thumbnail output offset is too large")?;
+    let output_len =
+        usize::try_from(*length).map_err(|_| "thumbnail output length is too large")?;
+    let end = start
+        .checked_add(output_len)
+        .ok_or_else(|| "thumbnail output range overflow".to_string())?;
+    let output = map
+        .get_mut(start..end)
+        .ok_or_else(|| "thumbnail output range is out of bounds".to_string())?;
+    let result = render_pipeline::thumbnail::render_thumbnail(engine, request, output)
+        .map_err(|error| format!("thumbnail render failed: {error:?}"))?;
+    map.flush()
+        .map_err(|error| format!("thumbnail shared-memory flush failed: {error}"))?;
+    Ok(result)
+}
+
 // ---------------------------------------------------------------------------
 // Typed command handlers
 // ---------------------------------------------------------------------------
@@ -1078,5 +1119,64 @@ mod utility_ocr_tests {
         let result = decode_utility_result(&output).unwrap();
         assert_eq!(result.page_index, 4);
         assert_eq!(result.full_text, "worker fixture");
+    }
+}
+
+#[cfg(test)]
+mod utility_thumbnail_tests {
+    use super::*;
+    use engine_api::rasterize::{RasterizeError, RasterizeRequest, TileOutput};
+    use protocol::utility_thumbnails::{
+        decode_thumbnail_result, encode_thumbnail_request, ThumbnailRequest,
+    };
+    use sandbox::shmem::SharedRegion;
+
+    struct FixtureRasterizer;
+
+    impl Rasterize for FixtureRasterizer {
+        fn rasterize(&self, request: &RasterizeRequest) -> Result<TileOutput, RasterizeError> {
+            Ok(TileOutput {
+                rgba_pixels: vec![11; (request.rect.w * request.rect.h * 4) as usize],
+                width: request.rect.w,
+                height: request.rect.h,
+            })
+        }
+
+        fn page_count(&self) -> u32 {
+            1
+        }
+    }
+
+    #[test]
+    fn worker_writes_thumbnail_only_to_declared_output_grant() {
+        let region = SharedRegion::create(80).unwrap();
+        let request = ThumbnailRequest {
+            page: 0,
+            width: 4,
+            height: 4,
+            scale: 0.25,
+            generation: 2,
+            revision: 5,
+        };
+        let job = UtilityJobCommand {
+            correlation_id: 1,
+            job_id: 2,
+            operation: "thumbnail".into(),
+            inputs: vec![
+                UtilityJobInput::Inline(encode_thumbnail_request(&request).unwrap()),
+                UtilityJobInput::SharedMemory {
+                    grant_id: [2; 16],
+                    offset: 8,
+                    length: 64,
+                },
+            ],
+        };
+
+        let encoded = execute_thumbnail_job(&job, region.file(), &FixtureRasterizer).unwrap();
+        let result = decode_thumbnail_result(&encoded).unwrap();
+        assert!(result.is_current(2, 5));
+        assert!(region.as_slice()[..8].iter().all(|byte| *byte == 0));
+        assert!(region.as_slice()[8..72].iter().all(|byte| *byte == 11));
+        assert!(region.as_slice()[72..].iter().all(|byte| *byte == 0));
     }
 }
