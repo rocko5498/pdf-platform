@@ -303,10 +303,176 @@ pub fn open_read_only(path: &Path) -> io::Result<BrokeredFile> {
     })
 }
 
+/// Z0-owned optimization candidate created beside its final destination.
+///
+/// The temporary path never crosses into Z1; workers receive only [`Self::file_mut`]'s
+/// inherited OS handle. Dropping an unpublished candidate removes it.
+pub struct BrokeredOptimizationCandidate {
+    id: [u8; 16],
+    path: PathBuf,
+    destination: PathBuf,
+    file: Option<File>,
+    published: bool,
+}
+
+/// Proof that the coordinator verified one exact optimization candidate.
+pub struct VerifiedOptimizationCandidate {
+    id: [u8; 16],
+}
+
+impl BrokeredOptimizationCandidate {
+    /// Mutable candidate handle for serialization or inheritance into Z1.
+    pub fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("candidate file remains open")
+    }
+
+    /// Flush candidate bytes and run coordinator-owned structural/conformance checks.
+    pub fn verify_with(
+        &mut self,
+        verifier: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<VerifiedOptimizationCandidate> {
+        let file = self.file.as_ref().expect("candidate file remains open");
+        file.sync_all()?;
+        verifier(file)?;
+        Ok(VerifiedOptimizationCandidate { id: self.id })
+    }
+
+    /// Flush candidate bytes and atomically publish to a new destination.
+    ///
+    /// Existing destinations are never overwritten by this path.
+    pub fn publish_verified(
+        mut self,
+        verification: VerifiedOptimizationCandidate,
+    ) -> io::Result<()> {
+        if verification.id != self.id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "verification belongs to a different candidate",
+            ));
+        }
+        let file = self.file.take().expect("candidate file remains open");
+        file.sync_all()?;
+        drop(file);
+        if self.destination.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "optimization destination already exists",
+            ));
+        }
+        std::fs::rename(&self.path, &self.destination)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for BrokeredOptimizationCandidate {
+    fn drop(&mut self) {
+        if !self.published {
+            self.file.take();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Create a unique candidate in the destination directory for atomic publication.
+pub fn create_optimization_candidate(
+    destination: &Path,
+) -> io::Result<BrokeredOptimizationCandidate> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
+    if !parent.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "destination directory does not exist",
+        ));
+    }
+    for _ in 0..4 {
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).map_err(io::Error::other)?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = parent.join(format!(".pdf-platform-candidate-{suffix}.tmp"));
+        match File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                return Ok(BrokeredOptimizationCandidate {
+                    id: random,
+                    path,
+                    destination: destination.to_path_buf(),
+                    file: Some(file),
+                    published: false,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "repeated optimization candidate collision",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn optimization_candidate_never_changes_source_before_verified_publish() {
+        let base =
+            std::env::temp_dir().join(format!("pdf-platform-candidate-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let source = base.join("source.pdf");
+        let destination = base.join("optimized.pdf");
+        std::fs::write(&source, b"original").unwrap();
+
+        {
+            let mut candidate = create_optimization_candidate(&destination).unwrap();
+            candidate.file_mut().write_all(b"candidate").unwrap();
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert!(!destination.exists());
+
+        let mut candidate = create_optimization_candidate(&destination).unwrap();
+        candidate.file_mut().write_all(b"verified").unwrap();
+        let verification = candidate
+            .verify_with(|file| {
+                if file.metadata()?.len() != 8 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "wrong length"));
+                }
+                Ok(())
+            })
+            .unwrap();
+        candidate.publish_verified(verification).unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"verified");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn optimization_verification_cannot_authorize_another_candidate() {
+        let base = std::env::temp_dir().join(format!(
+            "pdf-platform-candidate-token-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut first = create_optimization_candidate(&base.join("first.pdf")).unwrap();
+        first.file_mut().write_all(b"first").unwrap();
+        let verification = first.verify_with(|_| Ok(())).unwrap();
+        let second = create_optimization_candidate(&base.join("second.pdf")).unwrap();
+
+        assert_eq!(
+            second.publish_verified(verification).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!base.join("second.pdf").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn index_enrollment_denies_files_outside_explicit_root() {
