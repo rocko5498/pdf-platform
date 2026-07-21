@@ -329,6 +329,7 @@ dependencies = [
  "plugin-host",
  "protocol",
  "sandbox",
+ "search",
  "serde_json",
  "sign",
 ]

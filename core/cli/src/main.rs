@@ -42,6 +42,10 @@ fn main() {
             cmd_plugin_list();
             return;
         }
+        "index" => {
+            cmd_index(&args[2..]);
+            return;
+        }
         "plugin-validate" => {
             if args.len() < 3 {
                 eprintln!("error: plugin-validate requires a manifest file argument");
@@ -190,6 +194,7 @@ fn usage() {
          \x20 pdf-platform plugin-list\n\
          \x20 pdf-platform plugin-validate <manifest.json>\n\
          \x20 pdf-platform batch <pipeline.txt>\n\
+         \x20 pdf-platform index enroll|list|reindex|remove|search <args>\n\
          \x20 pdf-platform forms-calc-demo\n\
          \x20 pdf-platform confinement"
     );
@@ -1618,6 +1623,236 @@ fn cmd_batch(pipeline_path: &Path) {
         eprintln!("Pipeline failed.");
         process::exit(2);
     }
+}
+
+/// Cross-document index state directory (per-user app state, not beside any
+/// document — matches the existing sidecar-journal convention in
+/// `DocumentCoordinator::compute_sidecar_path`). [ADR-019 §3, ADR-021]
+fn index_state_dir() -> PathBuf {
+    std::env::temp_dir().join("pdf-platform-index")
+}
+
+/// Cross-document indexing: enroll/list/reindex/remove/search. [ADR-019 §3]
+///
+/// Usage:
+///   pdf-platform index enroll <dir>
+///   pdf-platform index list
+///   pdf-platform index reindex [dir]   (all enrollments if omitted)
+///   pdf-platform index remove <dir>
+///   pdf-platform index search <query>
+fn cmd_index(args: &[String]) {
+    use coordinator::broker::{load_enrollment_registry, save_enrollment_registry};
+    use coordinator::indexing::{
+        indexing_summary, load_registry, reindex_enrollment, remove_enrollment_files,
+        save_registry,
+    };
+    use search::tantivy_backend::CrossDocumentIndex;
+
+    let Some(sub) = args.first() else {
+        eprintln!("error: index requires a subcommand: enroll|list|reindex|remove|search");
+        process::exit(1);
+    };
+
+    let state_dir = index_state_dir();
+    if let Err(e) = std::fs::create_dir_all(&state_dir) {
+        eprintln!("error: cannot create index state directory: {e}");
+        process::exit(2);
+    }
+    let enrollment_path = state_dir.join("enrollments.bin");
+    let file_registry_path = state_dir.join("file-registry.bin");
+    let tantivy_dir = state_dir.join("tantivy");
+
+    let mut enrollment_registry = match load_enrollment_registry(&enrollment_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: cannot load enrollment registry: {e}");
+            process::exit(2);
+        }
+    };
+
+    match sub.as_str() {
+        "enroll" => {
+            let Some(dir) = args.get(1) else {
+                eprintln!("error: index enroll requires a directory argument");
+                process::exit(1);
+            };
+            match enrollment_registry.enroll(Path::new(dir)) {
+                Ok(id) => {
+                    if let Err(e) = save_enrollment_registry(&enrollment_registry, &enrollment_path) {
+                        eprintln!("error: cannot save enrollment registry: {e}");
+                        process::exit(2);
+                    }
+                    println!("Enrolled: {dir}");
+                    println!("Enrollment id: {}", hex_id(&id));
+                }
+                Err(e) => {
+                    eprintln!("error: enroll failed: {e:?}");
+                    process::exit(2);
+                }
+            }
+        }
+        "list" => {
+            let file_registry = load_registry(&file_registry_path).unwrap_or_default();
+            let enrollments: Vec<_> = enrollment_registry.enrollments().collect();
+            if enrollments.is_empty() {
+                println!("No enrolled roots.");
+            } else {
+                println!("Enrolled roots:");
+                for (id, root) in &enrollments {
+                    println!("  {} — {}", hex_id(id), root.display());
+                }
+            }
+            if let Ok(index) = CrossDocumentIndex::open_or_create(&tantivy_dir) {
+                let summary = indexing_summary(&file_registry, &index, &tantivy_dir);
+                println!();
+                println!("Tracked files: {}", summary.tracked_file_count);
+                println!("Index size:    {} bytes", summary.disk_size_bytes);
+            }
+        }
+        "reindex" => {
+            let worker = find_worker();
+            let mut file_registry = load_registry(&file_registry_path).unwrap_or_default();
+            let mut index = match CrossDocumentIndex::open_or_create(&tantivy_dir) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("error: cannot open index: {e}");
+                    process::exit(2);
+                }
+            };
+            let targets: Vec<([u8; 16], PathBuf)> = match args.get(1) {
+                Some(dir) => {
+                    // Enrolled roots are stored canonicalized (see `enroll`);
+                    // compare against the canonical form of the argument too,
+                    // or this silently matches nothing (e.g. Windows
+                    // canonicalize prepends \\?\).
+                    let canonical = Path::new(dir)
+                        .canonicalize()
+                        .unwrap_or_else(|_| PathBuf::from(dir));
+                    enrollment_registry
+                        .enrollments()
+                        .filter(|(_, root)| *root == canonical)
+                        .map(|(id, root)| (id, root.to_path_buf()))
+                        .collect()
+                }
+                None => enrollment_registry
+                    .enrollments()
+                    .map(|(id, root)| (id, root.to_path_buf()))
+                    .collect(),
+            };
+            if targets.is_empty() {
+                eprintln!("error: no matching enrollment(s) to reindex");
+                process::exit(1);
+            }
+            let mut any_errors = false;
+            for (id, root) in &targets {
+                let report = reindex_enrollment(
+                    &worker,
+                    &enrollment_registry,
+                    *id,
+                    root,
+                    &mut file_registry,
+                    &mut index,
+                );
+                println!(
+                    "{}: scanned {}, reindexed {}, skipped {}, pages {}",
+                    root.display(),
+                    report.files_scanned,
+                    report.files_reindexed,
+                    report.files_skipped_unchanged,
+                    report.pages_indexed
+                );
+                for (path, message) in &report.errors {
+                    eprintln!("  error: {}: {message}", path.display());
+                    any_errors = true;
+                }
+            }
+            if let Err(e) = save_registry(&file_registry, &file_registry_path) {
+                eprintln!("error: cannot save file registry: {e}");
+                process::exit(2);
+            }
+            process::exit(if any_errors { 1 } else { 0 });
+        }
+        "remove" => {
+            let Some(dir) = args.get(1) else {
+                eprintln!("error: index remove requires a directory argument");
+                process::exit(1);
+            };
+            let mut file_registry = load_registry(&file_registry_path).unwrap_or_default();
+            let mut index = match CrossDocumentIndex::open_or_create(&tantivy_dir) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("error: cannot open index: {e}");
+                    process::exit(2);
+                }
+            };
+            let removed_files = match remove_enrollment_files(&mut file_registry, &mut index, Path::new(dir)) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("error: index removal failed: {e}");
+                    process::exit(2);
+                }
+            };
+            let canonical_dir = Path::new(dir)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(dir));
+            let ids: Vec<[u8; 16]> = enrollment_registry
+                .enrollments()
+                .filter(|(_, root)| *root == canonical_dir)
+                .map(|(id, _)| id)
+                .collect();
+            for id in ids {
+                enrollment_registry.remove(id);
+            }
+            if let Err(e) = save_enrollment_registry(&enrollment_registry, &enrollment_path) {
+                eprintln!("error: cannot save enrollment registry: {e}");
+                process::exit(2);
+            }
+            if let Err(e) = save_registry(&file_registry, &file_registry_path) {
+                eprintln!("error: cannot save file registry: {e}");
+                process::exit(2);
+            }
+            println!("Removed enrollment for {dir} ({removed_files} file(s) unindexed).");
+        }
+        "search" => {
+            let Some(query) = args.get(1) else {
+                eprintln!("error: index search requires a query argument");
+                process::exit(1);
+            };
+            let index = match CrossDocumentIndex::open_or_create(&tantivy_dir) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("error: cannot open index: {e}");
+                    process::exit(2);
+                }
+            };
+            match index.search(query, 20) {
+                Ok(hits) if hits.is_empty() => println!("No matches."),
+                Ok(hits) => {
+                    for hit in hits {
+                        println!(
+                            "source={} page={} reliable={} score={}",
+                            hex_id(&hit.source),
+                            hit.page,
+                            hit.reliable,
+                            hit.score_milli
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: search failed: {e}");
+                    process::exit(2);
+                }
+            }
+        }
+        other => {
+            eprintln!("error: unknown index subcommand '{other}' (enroll|list|reindex|remove|search)");
+            process::exit(1);
+        }
+    }
+}
+
+fn hex_id(id: &[u8; 16]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn flush_batch_step(

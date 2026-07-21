@@ -94,6 +94,79 @@ impl IndexEnrollmentRegistry {
     pub fn remove(&mut self, enrollment: [u8; 16]) -> bool {
         self.roots.remove(&enrollment).is_some()
     }
+
+    /// Every currently enrolled `(id, root)` pair, for settings visibility
+    /// and CLI listing.
+    pub fn enrollments(&self) -> impl Iterator<Item = ([u8; 16], &Path)> {
+        self.roots.iter().map(|(id, root)| (*id, root.as_path()))
+    }
+}
+
+const ENROLLMENT_REGISTRY_MAGIC: &[u8; 8] = b"IDXENRL\0";
+const MAX_ENROLLMENT_PATH_BYTES: usize = 4096;
+
+/// Persist enrolled roots so they survive across CLI invocations / restart
+/// (a fresh process otherwise starts with an empty, in-memory-only
+/// registry — enrollment would be useless if it didn't outlive one
+/// process). Full-rewrite, matching `coordinator::indexing`'s file
+/// registry persistence style: a torn write just means re-enrolling next
+/// time, not data corruption.
+pub fn save_enrollment_registry(
+    registry: &IndexEnrollmentRegistry,
+    path: &Path,
+) -> io::Result<()> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(ENROLLMENT_REGISTRY_MAGIC);
+    bytes.extend_from_slice(&(registry.roots.len() as u32).to_le_bytes());
+    for (id, root) in &registry.roots {
+        let root_bytes = root.to_string_lossy().into_owned().into_bytes();
+        bytes.extend_from_slice(id);
+        bytes.extend_from_slice(&(root_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&root_bytes);
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Load a persisted enrollment registry, or an empty one if none exists yet.
+pub fn load_enrollment_registry(path: &Path) -> io::Result<IndexEnrollmentRegistry> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(IndexEnrollmentRegistry::new())
+        }
+        Err(error) => return Err(error),
+    };
+    let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed enrollment registry");
+    if bytes.len() < 12 || &bytes[..8] != ENROLLMENT_REGISTRY_MAGIC {
+        return Err(malformed());
+    }
+    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    if count > MAX_INDEX_ENROLLMENTS {
+        return Err(malformed());
+    }
+    let mut offset = 12usize;
+    let mut roots = HashMap::with_capacity(count);
+    for _ in 0..count {
+        if bytes.len() < offset + 16 + 4 {
+            return Err(malformed());
+        }
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes[offset..offset + 16]);
+        offset += 16;
+        let path_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if path_len > MAX_ENROLLMENT_PATH_BYTES || bytes.len() < offset + path_len {
+            return Err(malformed());
+        }
+        let root_str = std::str::from_utf8(&bytes[offset..offset + path_len])
+            .map_err(|_| malformed())?
+            .to_owned();
+        offset += path_len;
+        roots.insert(id, PathBuf::from(root_str));
+    }
+    Ok(IndexEnrollmentRegistry { roots })
 }
 
 /// Capability attached to an opaque utility-worker grant.
@@ -724,6 +797,40 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn enrollment_registry_persists_across_save_and_load() {
+        let base = std::env::temp_dir().join(format!(
+            "pdf-platform-enrollment-persist-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut registry = IndexEnrollmentRegistry::new();
+        let id = registry.enroll(&base).unwrap();
+
+        let file = base.join("enrollments.bin");
+        save_enrollment_registry(&registry, &file).unwrap();
+        let loaded = load_enrollment_registry(&file).unwrap();
+
+        let allowed = base.join("doc.pdf");
+        std::fs::write(&allowed, b"x").unwrap();
+        assert!(loaded.authorize(id, &allowed).is_ok());
+        assert_eq!(loaded.enrollments().count(), 1);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn load_enrollment_registry_missing_file_returns_empty() {
+        let file = std::env::temp_dir().join(format!(
+            "pdf-platform-enrollment-missing-{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        let loaded = load_enrollment_registry(&file).unwrap();
+        assert_eq!(loaded.enrollments().count(), 0);
     }
 
     #[test]
