@@ -8,5 +8,6 @@ pub mod events; // Events: DocumentOpened, TilesReady, DocumentChanged, WorkerDi
 pub mod handles; // ShmemHandle, TileDescriptor, CorrelationId
 pub mod inspect; // StructuralSummary: wire type for inspect command result
 pub mod transport; // WorkerTransport trait (ADR-031); platform impls live in sandbox/
-pub mod utility_jobs;
-pub mod utility_thumbnails; // Bounded utility thumbnail metadata. [ADR-007, ADR-009] // Declarative utility job command/result frames. [ADR-009]
+pub mod utility_indexing; // Path-free canonical-text index requests. [ADR-019]
+pub mod utility_jobs; // Declarative utility job command/result frames. [ADR-009]
+pub mod utility_thumbnails; // Bounded utility thumbnail metadata. [ADR-007, ADR-009]

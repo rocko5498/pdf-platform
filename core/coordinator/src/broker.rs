@@ -12,6 +12,89 @@ use std::time::{Duration, Instant};
 use jobs::utility_pool::UtilityWorkerIdentity;
 
 const MAX_UTILITY_GRANTS: usize = 4096;
+const MAX_INDEX_ENROLLMENTS: usize = 256;
+
+/// Fail-closed cross-document indexing enrollment error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexEnrollmentError {
+    /// The selected root is missing or is not a directory.
+    InvalidRoot,
+    /// The bounded enrollment registry is full.
+    RegistryFull,
+    /// OS entropy was unavailable or repeatedly collided.
+    Entropy(String),
+    /// Enrollment identifier was never issued or was removed.
+    Unknown,
+    /// Candidate file resolves outside the explicitly enrolled root.
+    OutsideEnrollment,
+    /// Candidate resolves inside the root but is not a regular file.
+    NotFile,
+}
+
+/// Z0-only registry of explicitly enrolled indexing roots.
+#[derive(Default)]
+pub struct IndexEnrollmentRegistry {
+    roots: HashMap<[u8; 16], PathBuf>,
+}
+
+impl IndexEnrollmentRegistry {
+    /// Create an empty enrollment registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Canonicalize and enroll one user-selected directory.
+    pub fn enroll(&mut self, root: &Path) -> Result<[u8; 16], IndexEnrollmentError> {
+        if self.roots.len() >= MAX_INDEX_ENROLLMENTS {
+            return Err(IndexEnrollmentError::RegistryFull);
+        }
+        let root = root
+            .canonicalize()
+            .map_err(|_| IndexEnrollmentError::InvalidRoot)?;
+        if !root.is_dir() {
+            return Err(IndexEnrollmentError::InvalidRoot);
+        }
+        for _ in 0..4 {
+            let mut id = [0; 16];
+            getrandom::fill(&mut id)
+                .map_err(|error| IndexEnrollmentError::Entropy(error.to_string()))?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.roots.entry(id) {
+                entry.insert(root.clone());
+                return Ok(id);
+            }
+        }
+        Err(IndexEnrollmentError::Entropy(
+            "repeated enrollment identifier collision".into(),
+        ))
+    }
+
+    /// Authorize one existing regular file under an active enrollment.
+    pub fn authorize(
+        &self,
+        enrollment: [u8; 16],
+        candidate: &Path,
+    ) -> Result<PathBuf, IndexEnrollmentError> {
+        let root = self
+            .roots
+            .get(&enrollment)
+            .ok_or(IndexEnrollmentError::Unknown)?;
+        let candidate = candidate
+            .canonicalize()
+            .map_err(|_| IndexEnrollmentError::OutsideEnrollment)?;
+        if !candidate.starts_with(root) {
+            return Err(IndexEnrollmentError::OutsideEnrollment);
+        }
+        if !candidate.is_file() {
+            return Err(IndexEnrollmentError::NotFile);
+        }
+        Ok(candidate)
+    }
+
+    /// Remove an enrollment and deny future indexing under it.
+    pub fn remove(&mut self, enrollment: [u8; 16]) -> bool {
+        self.roots.remove(&enrollment).is_some()
+    }
+}
 
 /// Capability attached to an opaque utility-worker grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +307,36 @@ pub fn open_read_only(path: &Path) -> io::Result<BrokeredFile> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn index_enrollment_denies_files_outside_explicit_root() {
+        let base = std::env::temp_dir().join(format!(
+            "pdf-platform-index-enrollment-{}",
+            std::process::id()
+        ));
+        let enrolled = base.join("enrolled");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&enrolled).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let allowed_file = enrolled.join("allowed.pdf");
+        let denied_file = outside.join("denied.pdf");
+        std::fs::write(&allowed_file, b"allowed").unwrap();
+        std::fs::write(&denied_file, b"denied").unwrap();
+
+        let mut registry = IndexEnrollmentRegistry::new();
+        let enrollment = registry.enroll(&enrolled).unwrap();
+        assert!(registry.authorize(enrollment, &allowed_file).is_ok());
+        assert_eq!(
+            registry.authorize(enrollment, &denied_file),
+            Err(IndexEnrollmentError::OutsideEnrollment)
+        );
+        assert_eq!(
+            registry.authorize([0; 16], &allowed_file),
+            Err(IndexEnrollmentError::Unknown)
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn open_read_only_temp_file() {
