@@ -65,9 +65,25 @@ pub struct WorkerChild {
     pub child: Child,
 }
 
+#[derive(Clone, Copy)]
+enum SpawnPriority {
+    Normal,
+    UtilityLow,
+}
+
 /// Spawn `worker_exe` and establish a framed control channel (no attachments).
 pub fn spawn_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
     spawn_worker_with_env(worker_exe, &[])
+}
+
+/// Spawn a utility worker at OS-level below-normal priority. [ADR-009]
+pub fn spawn_utility_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments::default(),
+        &[],
+        SpawnPriority::UtilityLow,
+    )
 }
 
 /// Like [`spawn_worker`], with extra environment variables for the child.
@@ -75,7 +91,12 @@ pub fn spawn_worker_with_env(
     worker_exe: &Path,
     extra_env: &[(&str, &str)],
 ) -> io::Result<WorkerChild> {
-    spawn_impl(worker_exe, &SpawnAttachments::default(), extra_env)
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments::default(),
+        extra_env,
+        SpawnPriority::Normal,
+    )
 }
 
 /// Spawn worker with an inheritable document file (no path string). [SDS Â§3.1]
@@ -93,6 +114,7 @@ pub fn spawn_worker_with_file(
             password,
         },
         extra_env,
+        SpawnPriority::Normal,
     )
 }
 
@@ -102,7 +124,7 @@ pub fn spawn_worker_with_attachments(
     attachments: &SpawnAttachments<'_>,
     extra_env: &[(&str, &str)],
 ) -> io::Result<WorkerChild> {
-    spawn_impl(worker_exe, attachments, extra_env)
+    spawn_impl(worker_exe, attachments, extra_env, SpawnPriority::Normal)
 }
 
 /// Adopt the IPC end inside the worker process.
@@ -165,18 +187,19 @@ fn spawn_impl(
     worker_exe: &Path,
     attachments: &SpawnAttachments<'_>,
     extra_env: &[(&str, &str)],
+    priority: SpawnPriority,
 ) -> io::Result<WorkerChild> {
     #[cfg(unix)]
     {
-        return unix::spawn_worker(worker_exe, attachments, extra_env);
+        return unix::spawn_worker(worker_exe, attachments, extra_env, priority);
     }
     #[cfg(windows)]
     {
-        return windows::spawn_worker(worker_exe, attachments, extra_env);
+        return windows::spawn_worker(worker_exe, attachments, extra_env, priority);
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (worker_exe, attachments, extra_env);
+        let _ = (worker_exe, attachments, extra_env, priority);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "spawn_worker unsupported on this OS",
@@ -256,6 +279,7 @@ mod unix {
         worker_exe: &Path,
         attachments: &SpawnAttachments<'_>,
         extra_env: &[(&str, &str)],
+        priority: SpawnPriority,
     ) -> io::Result<WorkerChild> {
         let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
         let sock_path: PathBuf = std::env::temp_dir().join(format!(
@@ -274,7 +298,14 @@ mod unix {
         }
         let unlink = Unlink(sock_path.clone());
 
-        let mut cmd = Command::new(worker_exe);
+        let mut cmd = match priority {
+            SpawnPriority::Normal => Command::new(worker_exe),
+            SpawnPriority::UtilityLow => {
+                let mut command = Command::new("nice");
+                command.arg("-n").arg("10").arg(worker_exe);
+                command
+            }
+        };
         cmd.env(ENV_IPC_SOCK, &sock_path)
             .env_remove(ENV_IPC_PIPE)
             .env_remove(ENV_DOC_HANDLE)
@@ -348,8 +379,10 @@ mod windows {
     use super::*;
     use crate::transport::{NamedPipeClient, NamedPipeServer};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use std::os::windows::process::CommandExt;
 
     const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -382,6 +415,7 @@ mod windows {
         worker_exe: &Path,
         attachments: &SpawnAttachments<'_>,
         extra_env: &[(&str, &str)],
+        priority: SpawnPriority,
     ) -> io::Result<WorkerChild> {
         let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
         let pipe_name = format!(
@@ -391,6 +425,9 @@ mod windows {
         );
 
         let mut cmd = Command::new(worker_exe);
+        if matches!(priority, SpawnPriority::UtilityLow) {
+            cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+        }
         cmd.env(ENV_IPC_PIPE, &pipe_name)
             .env_remove(ENV_IPC_SOCK)
             .env_remove(ENV_DOC_FD)

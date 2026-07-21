@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use protocol::utility_jobs::{decode_event, encode_command, UtilityJobCommand, UtilityJobEvent};
-use sandbox::spawn::{spawn_worker, WorkerChild};
+use sandbox::spawn::{spawn_utility_worker, WorkerChild};
 
 use crate::{JobContext, JobRunError, JobSpec};
 
@@ -51,7 +51,7 @@ impl UtilityPool {
         let worker_exe = worker_exe.as_ref().to_path_buf();
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            match spawn_worker(&worker_exe) {
+            match spawn_utility_worker(&worker_exe) {
                 Ok(worker) => workers.push(Mutex::new(worker)),
                 Err(error) => {
                     stop_workers(&mut workers);
@@ -136,7 +136,7 @@ impl Drop for UtilityPool {
 fn replace_worker(worker_exe: &Path, worker: &mut WorkerChild) {
     let _ = worker.child.kill();
     let _ = worker.child.wait();
-    if let Ok(replacement) = spawn_worker(worker_exe) {
+    if let Ok(replacement) = spawn_utility_worker(worker_exe) {
         *worker = replacement;
     }
 }
