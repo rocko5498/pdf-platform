@@ -26,7 +26,10 @@ use std::io::Write;
 pub struct OcrTextBlock {
     /// The recognized text.
     pub text: String,
-    /// Bounding box in PDF user-space coordinates [x, y, w, h].
+    /// Bounding box `[left, top, width, height]` in source-raster pixel
+    /// space (top-left origin, y-down) — the units `recognize()` was given,
+    /// e.g. Tesseract TSV coordinates. NOT PDF user-space; the caller
+    /// registering a text layer must convert via [`scale_blocks_to_page`].
     pub bbox: [f32; 4],
     /// Confidence score (0.0–1.0).
     pub confidence: f32,
@@ -39,6 +42,15 @@ pub struct OcrTextBlock {
 pub struct OcrPageResult {
     /// 0-based page index.
     pub page_index: u32,
+    /// Pixel width of the raster recognition actually ran against.
+    ///
+    /// Authoritative for converting `blocks[].bbox` (raster pixel space)
+    /// into PDF points via [`scale_blocks_to_page`] — the worker
+    /// self-renders at its own chosen DPI, so the caller cannot assume any
+    /// particular value ahead of time.
+    pub raster_width: u32,
+    /// Pixel height of the raster recognition actually ran against.
+    pub raster_height: u32,
     /// Recognized text blocks.
     pub blocks: Vec<OcrTextBlock>,
     /// Full page text (concatenation of all blocks).
@@ -112,17 +124,22 @@ const MAX_UTILITY_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UTILITY_BLOCKS: usize = 65_535;
 const MAX_UTILITY_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_UTILITY_LANGUAGE_BYTES: usize = 256;
-const MAX_UTILITY_RASTER_BYTES: u64 = 16 * 1024 * 1024;
+// Bounds the worker's own self-rendered raster (GR-7); the raster never
+// crosses IPC, so this only needs to cap worst-case worker memory, not fit
+// a transport frame. A full US-Letter/A4 page at the ADR-018 default 300
+// DPI is ~32MB uncompressed RGBA8 — 128MB covers that plus headroom for
+// larger formats/higher DPI. ponytail: flat ceiling, not corpus-tuned yet;
+// revisit against the real scan corpus (ADR-022 §2) once one exists.
+const MAX_UTILITY_RASTER_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Bounded OCR control data sent beside one scoped RGBA8 shared-memory input.
+/// Bounded OCR control data for one utility job. The worker renders the
+/// page itself (via its already-loaded document engine) at `options.target_dpi`
+/// rather than receiving a caller-supplied raster — no page raster crosses
+/// any IPC boundary, in either direction. [FR-OCR-1]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcrUtilityRequest {
     /// Zero-based source page.
     pub page_index: u32,
-    /// Raster width in pixels.
-    pub width: u32,
-    /// Raster height in pixels.
-    pub height: u32,
     /// Tesseract-style language selection such as `eng+hin`.
     pub language: String,
     /// Requested preprocessing behavior.
@@ -145,7 +162,8 @@ pub enum OcrUtilityCodecError {
 pub enum OcrUtilityExecutionError {
     /// Request or result bytes failed bounded codec validation.
     Codec(OcrUtilityCodecError),
-    /// The shared-memory raster length does not match its declared geometry.
+    /// The rendered raster's byte length doesn't match `width*height*4`, or
+    /// the requested dimensions are zero/oversized (`GR-7` bound).
     RasterLengthMismatch,
     /// The selected recognition backend is unavailable.
     EngineUnavailable,
@@ -153,14 +171,28 @@ pub enum OcrUtilityExecutionError {
     PageIdentityMismatch,
 }
 
-/// Execute one bounded OCR request without granting the engine document access.
+/// Execute one bounded OCR request against a raster the caller already
+/// rendered (worker-side self-render — see [`OcrUtilityRequest`]).
+///
+/// `width`/`height` describe `raster`, supplied directly by the caller (not
+/// decoded from the wire request) since the caller is the one that just
+/// rendered it. [GR-7]
 pub fn execute_utility_ocr(
     engine: &dyn OcrEngine,
     request_bytes: &[u8],
     raster: &[u8],
+    width: u32,
+    height: u32,
 ) -> Result<Vec<u8>, OcrUtilityExecutionError> {
     let request = decode_utility_request(request_bytes).map_err(OcrUtilityExecutionError::Codec)?;
-    let expected_length = usize::try_from(u64::from(request.width) * u64::from(request.height) * 4)
+    let raster_bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(OcrUtilityExecutionError::RasterLengthMismatch)?;
+    if raster_bytes == 0 || raster_bytes > MAX_UTILITY_RASTER_BYTES {
+        return Err(OcrUtilityExecutionError::RasterLengthMismatch);
+    }
+    let expected_length = usize::try_from(raster_bytes)
         .map_err(|_| OcrUtilityExecutionError::RasterLengthMismatch)?;
     if raster.len() != expected_length {
         return Err(OcrUtilityExecutionError::RasterLengthMismatch);
@@ -168,16 +200,15 @@ pub fn execute_utility_ocr(
     if !engine.is_available() {
         return Err(OcrUtilityExecutionError::EngineUnavailable);
     }
-    let result = engine.recognize(
-        raster,
-        request.width,
-        request.height,
-        request.page_index,
-        &request.options,
-    );
+    let result = engine.recognize(raster, width, height, request.page_index, &request.options);
     if result.page_index != request.page_index {
         return Err(OcrUtilityExecutionError::PageIdentityMismatch);
     }
+    let result = OcrPageResult {
+        raster_width: width,
+        raster_height: height,
+        ..result
+    };
     encode_utility_result(&result).map_err(OcrUtilityExecutionError::Codec)
 }
 
@@ -186,11 +217,9 @@ pub fn encode_utility_request(
     request: &OcrUtilityRequest,
 ) -> Result<Vec<u8>, OcrUtilityCodecError> {
     validate_request(request)?;
-    let mut bytes = Vec::with_capacity(27 + request.language.len());
+    let mut bytes = Vec::with_capacity(19 + request.language.len());
     bytes.extend_from_slice(OCR_REQUEST_MAGIC);
     bytes.extend_from_slice(&request.page_index.to_le_bytes());
-    bytes.extend_from_slice(&request.width.to_le_bytes());
-    bytes.extend_from_slice(&request.height.to_le_bytes());
     bytes.extend_from_slice(&request.options.target_dpi.to_le_bytes());
     bytes.push(request.options.deskew.into());
     bytes.push(request.options.despeckle.into());
@@ -207,8 +236,6 @@ pub fn decode_utility_request(bytes: &[u8]) -> Result<OcrUtilityRequest, OcrUtil
         return Err(OcrUtilityCodecError::Malformed);
     }
     let page_index = cursor.u32()?;
-    let width = cursor.u32()?;
-    let height = cursor.u32()?;
     let target_dpi = cursor.u32()?;
     let deskew = cursor.boolean()?;
     let despeckle = cursor.boolean()?;
@@ -225,8 +252,6 @@ pub fn decode_utility_request(bytes: &[u8]) -> Result<OcrUtilityRequest, OcrUtil
     }
     let request = OcrUtilityRequest {
         page_index,
-        width,
-        height,
         language,
         options: PreprocessOptions {
             deskew,
@@ -246,13 +271,6 @@ fn validate_request(request: &OcrUtilityRequest) -> Result<(), OcrUtilityCodecEr
     {
         return Err(OcrUtilityCodecError::LimitExceeded);
     }
-    let raster_bytes = u64::from(request.width)
-        .checked_mul(u64::from(request.height))
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or(OcrUtilityCodecError::Malformed)?;
-    if raster_bytes == 0 || raster_bytes > MAX_UTILITY_RASTER_BYTES {
-        return Err(OcrUtilityCodecError::LimitExceeded);
-    }
     Ok(())
 }
 
@@ -270,6 +288,8 @@ pub fn encode_utility_result(result: &OcrPageResult) -> Result<Vec<u8>, OcrUtili
     let mut bytes = Vec::new();
     bytes.extend_from_slice(OCR_RESULT_MAGIC);
     bytes.extend_from_slice(&result.page_index.to_le_bytes());
+    bytes.extend_from_slice(&result.raster_width.to_le_bytes());
+    bytes.extend_from_slice(&result.raster_height.to_le_bytes());
     bytes.extend_from_slice(&(result.blocks.len() as u32).to_le_bytes());
     for block in &result.blocks {
         put_text(&mut bytes, &block.text)?;
@@ -307,6 +327,8 @@ pub fn decode_utility_result(bytes: &[u8]) -> Result<OcrPageResult, OcrUtilityCo
         return Err(OcrUtilityCodecError::Malformed);
     }
     let page_index = cursor.u32()?;
+    let raster_width = cursor.u32()?;
+    let raster_height = cursor.u32()?;
     let block_count = cursor.u32()? as usize;
     if block_count > MAX_UTILITY_BLOCKS {
         return Err(OcrUtilityCodecError::LimitExceeded);
@@ -349,6 +371,8 @@ pub fn decode_utility_result(bytes: &[u8]) -> Result<OcrPageResult, OcrUtilityCo
     }
     Ok(OcrPageResult {
         page_index,
+        raster_width,
+        raster_height,
         blocks,
         full_text,
         average_confidence,
@@ -430,10 +454,49 @@ impl<'a> OcrCursor<'a> {
 // Text layer registration [FR-OCR-1]
 // ---------------------------------------------------------------------------
 
+/// Convert recognized blocks from source-raster pixel space into PDF
+/// user-space points, keeping the top-down `[left, top, width, height]`
+/// convention `generate_text_layer_stream` expects. [FR-OCR-1]
+///
+/// Without this step, blocks placed directly onto a point-space page use
+/// pixel-magnitude coordinates and land far outside the page's `MediaBox` —
+/// invisible, so no visual symptom, but a mis-registered text layer.
+pub fn scale_blocks_to_page(
+    blocks: &[OcrTextBlock],
+    raster_width: u32,
+    raster_height: u32,
+    page_width: f32,
+    page_height: f32,
+) -> Vec<OcrTextBlock> {
+    if raster_width == 0 || raster_height == 0 {
+        return Vec::new();
+    }
+    let sx = page_width / raster_width as f32;
+    let sy = page_height / raster_height as f32;
+    blocks
+        .iter()
+        .map(|block| OcrTextBlock {
+            bbox: [
+                block.bbox[0] * sx,
+                block.bbox[1] * sy,
+                block.bbox[2] * sx,
+                block.bbox[3] * sy,
+            ],
+            ..block.clone()
+        })
+        .collect()
+}
+
 /// Generate an invisible text layer content stream from OCR results. [FR-OCR-1]
 ///
 /// The text layer uses `Tr 3` (invisible text mode) so text is selectable
 /// and searchable but does not alter the visual appearance.
+///
+/// `blocks` must already be in PDF user-space points (see
+/// [`scale_blocks_to_page`]) and `page_height` is the page's point height —
+/// passing raw `recognize()` output here mis-registers the layer.
+/// References the `/F1` font resource; the caller must ensure the page's
+/// `/Resources/Font` dictionary defines it (see `pdf-model::ocr_layer`).
 pub fn generate_text_layer_stream(blocks: &[OcrTextBlock], page_height: f32) -> Vec<u8> {
     use std::io::Write;
     let mut buf = Vec::new();
@@ -669,6 +732,8 @@ impl OcrEngine for TesseractEngine {
         let Some(ref tesseract_path) = self.tesseract_path else {
             return OcrPageResult {
                 page_index,
+                raster_width: width,
+                raster_height: height,
                 blocks: Vec::new(),
                 full_text: String::new(),
                 average_confidence: 0.0,
@@ -693,6 +758,8 @@ impl OcrEngine for TesseractEngine {
         if let Err(e) = write_rgba_png(&png_path, &processed, proc_w, proc_h) {
             return OcrPageResult {
                 page_index,
+                raster_width: width,
+                raster_height: height,
                 blocks: Vec::new(),
                 full_text: String::new(),
                 average_confidence: 0.0,
@@ -723,6 +790,8 @@ impl OcrEngine for TesseractEngine {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     return OcrPageResult {
                         page_index,
+                        raster_width: width,
+                        raster_height: height,
                         blocks: Vec::new(),
                         full_text: String::new(),
                         average_confidence: 0.0,
@@ -735,10 +804,12 @@ impl OcrEngine for TesseractEngine {
 
                 // Parse TSV output.
                 let tsv_content = std::fs::read_to_string(&tsv_path).unwrap_or_default();
-                parse_tesseract_tsv(&tsv_content, page_index)
+                parse_tesseract_tsv(&tsv_content, page_index, proc_w, proc_h)
             }
             Err(e) => OcrPageResult {
                 page_index,
+                raster_width: width,
+                raster_height: height,
                 blocks: Vec::new(),
                 full_text: String::new(),
                 average_confidence: 0.0,
@@ -802,7 +873,7 @@ fn which_tesseract() -> Option<std::path::PathBuf> {
 }
 
 /// Parse Tesseract TSV output into OcrPageResult.
-fn parse_tesseract_tsv(tsv: &str, page_index: u32) -> OcrPageResult {
+fn parse_tesseract_tsv(tsv: &str, page_index: u32, raster_width: u32, raster_height: u32) -> OcrPageResult {
     let mut blocks = Vec::new();
     let mut full_text = String::new();
     let mut total_confidence = 0.0f32;
@@ -846,6 +917,8 @@ fn parse_tesseract_tsv(tsv: &str, page_index: u32) -> OcrPageResult {
 
     OcrPageResult {
         page_index,
+        raster_width,
+        raster_height,
         full_text,
         average_confidence: if word_count > 0 {
             total_confidence / word_count as f32
@@ -1008,13 +1081,15 @@ mod tests {
         fn recognize(
             &self,
             _raster: &[u8],
-            _width: u32,
-            _height: u32,
+            width: u32,
+            height: u32,
             page_index: u32,
             _options: &PreprocessOptions,
         ) -> OcrPageResult {
             OcrPageResult {
                 page_index,
+                raster_width: width,
+                raster_height: height,
                 blocks: Vec::new(),
                 full_text: "fixture".into(),
                 average_confidence: 0.4,
@@ -1038,8 +1113,6 @@ mod tests {
     fn utility_execution_invokes_injected_engine() {
         let request = OcrUtilityRequest {
             page_index: 5,
-            width: 2,
-            height: 2,
             language: "eng".into(),
             options: PreprocessOptions::default(),
         };
@@ -1047,6 +1120,8 @@ mod tests {
             &FixtureEngine,
             &encode_utility_request(&request).unwrap(),
             &[0; 16],
+            2,
+            2,
         )
         .unwrap();
 
@@ -1054,12 +1129,29 @@ mod tests {
         assert_eq!(result.page_index, 5);
         assert_eq!(result.full_text, "fixture");
         assert_eq!(result.average_confidence, 0.4);
+        assert_eq!(result.raster_width, 2);
+        assert_eq!(result.raster_height, 2);
+    }
+
+    #[test]
+    fn utility_execution_rejects_oversized_render_target() {
+        let request = OcrUtilityRequest {
+            page_index: 0,
+            language: "eng".into(),
+            options: PreprocessOptions::default(),
+        };
+        let request_bytes = encode_utility_request(&request).unwrap();
+        // 8192x8192x4 = 256MiB, over MAX_UTILITY_RASTER_BYTES (128MiB).
+        let result = execute_utility_ocr(&FixtureEngine, &request_bytes, &[], 8192, 8192);
+        assert_eq!(result, Err(OcrUtilityExecutionError::RasterLengthMismatch));
     }
 
     #[test]
     fn normalized_result_round_trips_for_utility_ipc() {
         let result = OcrPageResult {
             page_index: 3,
+            raster_width: 2550,
+            raster_height: 3300,
             blocks: vec![OcrTextBlock {
                 text: "hello".into(),
                 bbox: [1.0, 2.0, 30.0, 10.0],
@@ -1084,6 +1176,8 @@ mod tests {
     fn normalized_result_rejects_untrusted_geometry() {
         let result = OcrPageResult {
             page_index: 0,
+            raster_width: 100,
+            raster_height: 100,
             blocks: vec![OcrTextBlock {
                 text: "bad".into(),
                 bbox: [f32::NAN, 0.0, 1.0, 1.0],
@@ -1108,8 +1202,6 @@ mod tests {
     fn utility_request_round_trips_language_and_preprocessing() {
         let request = OcrUtilityRequest {
             page_index: 2,
-            width: 1200,
-            height: 1600,
             language: "eng+hin".into(),
             options: PreprocessOptions {
                 deskew: true,
@@ -1126,13 +1218,14 @@ mod tests {
     }
 
     #[test]
-    fn utility_request_rejects_raster_larger_than_worker_slot() {
+    fn utility_request_rejects_zero_dpi() {
         let request = OcrUtilityRequest {
             page_index: 0,
-            width: 4096,
-            height: 4096,
             language: "eng".into(),
-            options: PreprocessOptions::default(),
+            options: PreprocessOptions {
+                target_dpi: 0,
+                ..PreprocessOptions::default()
+            },
         };
 
         assert_eq!(
@@ -1165,6 +1258,45 @@ mod tests {
         let s = String::from_utf8_lossy(&stream);
         assert!(s.contains("BT"), "should have text object even if empty");
         assert!(s.contains("ET"), "should close text object");
+    }
+
+    #[test]
+    fn scale_blocks_to_page_converts_pixel_bbox_to_point_space() {
+        // 300 DPI raster of a 612x792pt (US Letter) page: scale factor
+        // page_pt / raster_px = 72/300 = 0.24.
+        let raster_w = 2550u32; // 612 * 300/72
+        let raster_h = 3300u32; // 792 * 300/72
+        let blocks = vec![OcrTextBlock {
+            text: "word".into(),
+            bbox: [100.0, 200.0, 400.0, 50.0],
+            confidence: 0.9,
+            language: "eng".into(),
+        }];
+        let scaled = scale_blocks_to_page(&blocks, raster_w, raster_h, 612.0, 792.0);
+        assert_eq!(scaled.len(), 1);
+        let b = scaled[0].bbox;
+        assert!((b[0] - 24.0).abs() < 0.5, "left: {}", b[0]);
+        assert!((b[1] - 48.0).abs() < 0.5, "top: {}", b[1]);
+        assert!((b[2] - 96.0).abs() < 0.5, "width: {}", b[2]);
+        assert!((b[3] - 12.0).abs() < 0.5, "height: {}", b[3]);
+        // A block placed via the raw (unscaled) bbox would land at x=100,
+        // y=200 pixel-magnitude on a 792pt-tall page — inside the MediaBox
+        // only by coincidence, but wildly mis-registered relative to where
+        // the word actually sits on the rendered page. Scaled coordinates
+        // must differ from the raw pixel bbox for any non-1:1 DPI.
+        assert_ne!(scaled[0].bbox, blocks[0].bbox);
+    }
+
+    #[test]
+    fn scale_blocks_to_page_rejects_zero_raster_dimensions() {
+        let blocks = vec![OcrTextBlock {
+            text: "x".into(),
+            bbox: [1.0, 1.0, 1.0, 1.0],
+            confidence: 1.0,
+            language: "eng".into(),
+        }];
+        assert!(scale_blocks_to_page(&blocks, 0, 100, 612.0, 792.0).is_empty());
+        assert!(scale_blocks_to_page(&blocks, 100, 0, 612.0, 792.0).is_empty());
     }
 
     #[test]
@@ -1265,6 +1397,8 @@ mod tests {
     fn ocr_page_result_fields() {
         let result = OcrPageResult {
             page_index: 5,
+            raster_width: 100,
+            raster_height: 20,
             blocks: vec![OcrTextBlock {
                 text: "test".into(),
                 bbox: [0.0, 0.0, 100.0, 20.0],

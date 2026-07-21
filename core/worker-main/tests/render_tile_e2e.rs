@@ -31,7 +31,7 @@ fn render_tile_stub_engine_produces_colored_pixels() {
     // 2. Spawn worker with shmem attached.
     let mut child = spawn_worker_with_attachments(
         worker_path(),
-        &SpawnAttachments { doc: None, shmem: Some(region.file()), password: None },
+        &SpawnAttachments { doc: None, shmem: Some(region.file()), output: None, password: None },
         &[],
     )
     .expect("spawn with shmem");
@@ -115,7 +115,7 @@ fn render_tile_page_out_of_range_returns_error() {
 
     let mut child = spawn_worker_with_attachments(
         worker_path(),
-        &SpawnAttachments { doc: None, shmem: Some(region.file()), password: None },
+        &SpawnAttachments { doc: None, shmem: Some(region.file()), output: None, password: None },
         &[],
     )
     .expect("spawn with shmem");
@@ -165,6 +165,7 @@ fn render_tile_real_pdf_via_pdfium() {
         &SpawnAttachments {
             doc: Some(brokered.file()),
             shmem: Some(region.file()),
+            output: None,
             password: None,
         },
         &[],

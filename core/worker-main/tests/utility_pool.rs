@@ -10,7 +10,7 @@ fn low_priority_utility_worker_inherits_document_and_shmem_handles() {
     use protocol::commands::{encode_command, Command};
     use protocol::events::{decode_worker_event, WorkerEvent};
     use sandbox::shmem::SharedRegion;
-    use sandbox::spawn::spawn_utility_worker_with_attachments;
+    use sandbox::spawn::spawn_utility_worker_with_io;
 
     let path = std::env::temp_dir().join(format!(
         "pdf-platform-utility-attachment-{}.bin",
@@ -18,11 +18,14 @@ fn low_priority_utility_worker_inherits_document_and_shmem_handles() {
     ));
     std::fs::write(&path, b"not a PDF").unwrap();
     let document = std::fs::File::open(&path).unwrap();
+    let output_path = path.with_extension("out");
+    let output = std::fs::File::create(&output_path).unwrap();
     let shmem = SharedRegion::create(4096).unwrap();
-    let mut child = spawn_utility_worker_with_attachments(
+    let mut child = spawn_utility_worker_with_io(
         std::path::Path::new(env!("CARGO_BIN_EXE_worker")),
         &document,
         shmem.file(),
+        &output,
         None,
     )
     .unwrap();
@@ -43,6 +46,7 @@ fn low_priority_utility_worker_inherits_document_and_shmem_handles() {
     let _ = child.child.kill();
     let _ = child.child.wait();
     let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(output_path);
 }
 
 #[test]
@@ -166,6 +170,67 @@ fn thumbnail_crosses_document_bound_utility_process() {
     let thumbnail = decode_thumbnail_result(&bytes).unwrap();
     assert_eq!(thumbnail.page, 0);
     assert!(thumbnail.is_current(6, 4));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn ocr_job_reaches_the_dispatch_handler_not_the_unsupported_fallback() {
+    use ocr_bridge::{
+        decode_utility_result, encode_utility_request, OcrUtilityRequest, PreprocessOptions,
+    };
+
+    let path = std::env::temp_dir().join(format!(
+        "pdf-platform-utility-ocr-{}.pdf",
+        std::process::id()
+    ));
+    std::fs::write(&path, one_page_pdf()).unwrap();
+    let document = Arc::new(std::fs::File::open(&path).unwrap());
+    let pool = Arc::new(UtilityPool::new(env!("CARGO_BIN_EXE_worker"), 1).unwrap());
+    let result = Arc::new(std::sync::Mutex::new(None));
+    let observed = result.clone();
+    let executor = pool.clone();
+    let scheduler = JobScheduler::new_typed(1, 1, move |spec, context| {
+        let bytes =
+            executor.execute_prepared_with_document(spec, context, &document, None, |_| {
+                let request = OcrUtilityRequest {
+                    page_index: 0,
+                    language: "eng".into(),
+                    options: PreprocessOptions::default(),
+                };
+                Ok(vec![UtilityJobInput::Inline(
+                    encode_utility_request(&request).unwrap(),
+                )])
+            })?;
+        *observed.lock().unwrap() = Some(bytes);
+        Ok(())
+    })
+    .unwrap();
+    scheduler
+        .submit(JobGraph::new(vec![JobSpec::new(21, "ocr", JobPriority::Maintenance)]).unwrap())
+        .unwrap();
+    // Dispatch-wiring check, not a Tesseract-installed check: whichever way the
+    // worker's real OCR engine resolves, it must not be the "unsupported
+    // operation" fallback that a missing match arm would produce.
+    loop {
+        match scheduler.recv_event_timeout(Duration::from_secs(10)) {
+            Some(JobEvent::Completed { job: 21 }) => break,
+            Some(JobEvent::Failed { job: 21, message }) => {
+                assert!(
+                    !message.contains("unsupported utility operation"),
+                    "ocr job hit the fallback branch: {message}"
+                );
+                scheduler.shutdown();
+                let _ = std::fs::remove_file(path);
+                return;
+            }
+            Some(_) => {}
+            None => panic!("timed out waiting for ocr job"),
+        }
+    }
+    scheduler.shutdown();
+    let bytes = result.lock().unwrap().take().unwrap();
+    let ocr_result = decode_utility_result(&bytes).unwrap();
+    assert_eq!(ocr_result.page_index, 0);
     let _ = std::fs::remove_file(path);
 }
 

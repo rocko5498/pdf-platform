@@ -23,6 +23,7 @@ pub mod form;
 pub mod form_import;
 pub mod forms_js;
 pub mod journal;
+pub mod ocr_layer;
 pub mod overlay;
 pub mod organize;
 pub mod redaction;

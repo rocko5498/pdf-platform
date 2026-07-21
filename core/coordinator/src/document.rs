@@ -110,18 +110,6 @@ pub struct SelectionBox {
     pub height: f32,
 }
 
-/// Output from OCR processing a single page. [FR-OCR, M9]
-#[derive(Debug, Clone)]
-pub struct OcrPageOutput {
-    /// 0-based page index.
-    pub page_index: u32,
-    /// The OCR recognition result.
-    pub ocr_result: ocr_bridge::OcrPageResult,
-    /// The invisible text layer content stream.
-    pub text_layer_stream: Vec<u8>,
-}
-
-
 impl DocumentCoordinator {
     /// Open a document and create a coordinator. [SDS §3.1]
     ///
@@ -669,6 +657,37 @@ impl DocumentCoordinator {
         self.summary.page_count
     }
 
+    /// Next free object number for allocating new objects (annotations, OCR
+    /// text layers, etc). `apply_command_group` does not itself advance this
+    /// — callers that allocate object numbers for a group must call
+    /// [`Self::set_next_obj_num`] afterward, or a second group built in the
+    /// same session will collide with the first's numbers.
+    pub fn next_obj_num(&self) -> u32 {
+        self.next_obj_num
+    }
+
+    /// Advance the next-free-object-number counter (see [`Self::next_obj_num`]).
+    pub fn set_next_obj_num(&mut self, value: u32) {
+        self.next_obj_num = value;
+    }
+
+    /// Resolve a page index to its object number and current serialized
+    /// bytes. [FR-OCR-1]
+    pub fn page_object(&mut self, page_index: u32) -> Result<(u32, Vec<u8>), SessionError> {
+        let pages_obj_num = self.find_pages_object()?;
+        let pages_bytes = self.session.get_object(pages_obj_num)?;
+        let pages_text = String::from_utf8_lossy(&pages_bytes);
+        let kid_refs = self.parse_kid_references(&pages_text);
+        let page_obj_num = *kid_refs.get(page_index as usize).ok_or_else(|| {
+            SessionError::Protocol(format!(
+                "page {page_index} out of range ({} pages)",
+                kid_refs.len()
+            ))
+        })?;
+        let page_bytes = self.session.get_object(page_obj_num)?;
+        Ok((page_obj_num, page_bytes))
+    }
+
     /// The document's structural summary.
     pub fn summary(&self) -> &StructuralSummary {
         &self.summary
@@ -998,80 +1017,18 @@ impl DocumentCoordinator {
         })
     }
 
-    /// Render a full page as a raster for OCR processing. [FR-OCR, M9]
-    ///
-    /// Sends a request to the worker to render the page at the specified
-    /// DPI scale and returns the RGBA8 pixel data.
-    pub fn render_page_for_ocr(
-        &mut self,
-        page_index: u32,
-        dpi: u32,
-    ) -> Result<crate::session::PageRasterResult, SessionError> {
-        // Convert DPI to scale factor: scale = dpi / 72 (PDF base unit is 72 DPI).
-        let scale = dpi as f32 / 72.0;
-        self.session.render_page_for_ocr(page_index, scale)
-    }
-
-    /// Run OCR on a page and return the text layer content stream. [FR-OCR, M9]
-    ///
-    /// Renders the page, runs Tesseract OCR, and generates an invisible
-    /// text layer content stream. The caller can apply this to the overlay.
-    pub fn ocr_page(
-        &mut self,
-        page_index: u32,
-        dpi: u32,
-        language: &str,
-    ) -> Result<OcrPageOutput, SessionError> {
-        use ocr_bridge::{TesseractEngine, OcrEngine, PreprocessOptions, generate_text_layer_stream};
-
-        // Step 1: Render the page.
-        let raster = self.render_page_for_ocr(page_index, dpi)?;
-
-        // Step 2: Run OCR.
-        let engine = TesseractEngine::with_config(
-            std::path::PathBuf::from("tesseract"),
-            language,
-        );
-
-        if !engine.is_available() {
-            return Err(SessionError::Protocol(
-                "Tesseract not found — install tesseract-ocr".into()
-            ));
-        }
-
-        let options = PreprocessOptions {
-            deskew: true,
-            despeckle: true,
-            target_dpi: dpi,
-            ocr_pages_with_text: false,
-        };
-
-        let result = engine.recognize(
-            &raster.pixels,
-            raster.width,
-            raster.height,
-            page_index,
-            &options,
-        );
-
-        if !result.success {
-            return Err(SessionError::Protocol(
-                result.error.unwrap_or_else(|| "OCR failed".into())
-            ));
-        }
-
-        // Step 3: Generate text layer.
-        // We need the page height in PDF points. For now, use a reasonable estimate.
-        // A proper implementation would get this from the document structure.
-        let page_height = raster.height as f32 * 72.0 / dpi as f32;
-        let text_layer = generate_text_layer_stream(&result.blocks, page_height);
-
-        Ok(OcrPageOutput {
-            page_index,
-            ocr_result: result,
-            text_layer_stream: text_layer,
-        })
-    }
+    // OCR entry point: `coordinator::ocr::run_ocr_for_page` [ADR-018, FR-OCR-1].
+    //
+    // This used to be `render_page_for_ocr`/`ocr_page` here, but that path ran
+    // Tesseract directly in Z0 (no sandbox — a real ADR-016/018 violation, not
+    // hypothetical) via the base64-over-IPC `RenderPageForOcr` command, which
+    // itself exceeds the transport's frame cap on any realistic page size, and
+    // scaled recognized blocks onto the page without converting out of raster
+    // pixel space first. Zero callers anywhere in the codebase. Removed rather
+    // than fixed in place: `coordinator::ocr::run_ocr_for_page` (this session)
+    // already does this correctly — self-rendering inside the sandboxed
+    // utility pool, no raster crossing IPC, and calling `scale_blocks_to_page`
+    // before generating the text layer.
 
     pub fn close_worker(&mut self) -> Result<(), SessionError> {
         let _ = self.session.send(b"CMD:QUIT\n");

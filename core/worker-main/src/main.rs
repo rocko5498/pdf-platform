@@ -23,7 +23,9 @@ use protocol::utility_jobs::{
     UtilityJobEvent, UtilityJobInput,
 };
 use sandbox::shmem::map_shmem_file;
-use sandbox::spawn::{adopt_document_file, adopt_inherited, adopt_password, adopt_shmem_file};
+use sandbox::spawn::{
+    adopt_document_file, adopt_inherited, adopt_output_file, adopt_password, adopt_shmem_file,
+};
 
 fn main() -> ExitCode {
     // Apply sandbox confinement BEFORE any handle adoption or untrusted input.
@@ -57,6 +59,14 @@ fn main() -> ExitCode {
         }
     };
 
+    let _output_file: Option<File> = match adopt_output_file() {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("worker: adopt output failed: {error}");
+            return ExitCode::from(8);
+        }
+    };
+
     // Read password for encrypted documents (passed as env var by coordinator).
     let password: Option<String> = adopt_password();
 
@@ -82,6 +92,9 @@ fn main() -> ExitCode {
     #[cfg(not(feature = "pdfium"))]
     let pdfium: Option<()> = None;
 
+    // Detected once at startup; degrades to EngineUnavailable per-job if absent. [ADR-018]
+    let ocr_engine = ocr_bridge::TesseractEngine::new();
+
     loop {
         match transport.recv_timeout(Duration::from_secs(1)) {
             Ok(msg) => {
@@ -97,6 +110,23 @@ fn main() -> ExitCode {
                             correlation_id: job.correlation_id,
                             job_id: job.job_id,
                             output: Vec::new(),
+                        }
+                    } else if job.operation == "ocr" {
+                        #[cfg(feature = "pdfium")]
+                        let rasterizer = pdfium.as_ref().map(|e| e as &dyn Rasterize);
+                        #[cfg(not(feature = "pdfium"))]
+                        let rasterizer: Option<&dyn Rasterize> = None;
+                        match execute_ocr_job(&job, rasterizer, &ocr_engine) {
+                            Ok(output) => UtilityJobEvent::Completed {
+                                correlation_id: job.correlation_id,
+                                job_id: job.job_id,
+                                output,
+                            },
+                            Err(message) => UtilityJobEvent::Failed {
+                                correlation_id: job.correlation_id,
+                                job_id: job.job_id,
+                                message,
+                            },
                         }
                     } else if job.operation == "thumbnail" {
                         #[cfg(feature = "pdfium")]
@@ -332,34 +362,60 @@ fn validate_utility_inputs(
     Ok(())
 }
 
+/// Render one page's raster in-process. [FR-OCR-1]
+///
+/// Shared by `handle_render_page_for_ocr` (legacy IPC path — kept for
+/// compatibility, but its base64-over-IPC transport breaks past ~4MB of
+/// pixels; not used by the OCR job path below) and `execute_ocr_job`, which
+/// renders and recognizes in the same process so no raster ever crosses IPC.
+fn rasterize_full_page(
+    engine: &dyn Rasterize,
+    page_index: u32,
+    scale: f32,
+) -> Result<engine_api::rasterize::TileOutput, String> {
+    let page_count = engine.page_count();
+    if page_index >= page_count {
+        return Err(format!(
+            "page {page_index} out of range (document has {page_count} pages)"
+        ));
+    }
+    engine
+        .rasterize(&RasterizeRequest {
+            page_index,
+            rect: TileRect {
+                x: 0,
+                y: 0,
+                w: 8192,
+                h: 8192,
+            },
+            scale,
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Run one OCR job: self-render the page, then recognize. [FR-OCR-1, ADR-018]
+///
+/// No page raster crosses IPC in either direction — the worker renders via
+/// its own loaded document engine and recognizes in the same process,
+/// unlike the shared-memory-input design this replaced (which required the
+/// coordinator to pre-render and hand over a raster) or the legacy
+/// `RenderPageForOcr` IPC path (which breaks on realistic page sizes).
 fn execute_ocr_job(
     job: &UtilityJobCommand,
-    shmem_file: &File,
+    rasterizer: Option<&dyn Rasterize>,
     engine: &dyn ocr_bridge::OcrEngine,
 ) -> Result<Vec<u8>, String> {
-    let [UtilityJobInput::Inline(request), UtilityJobInput::SharedMemory { offset, length, .. }] =
-        job.inputs.as_slice()
-    else {
-        return Err("OCR requires request metadata and one shared-memory raster".into());
+    let [UtilityJobInput::Inline(request)] = job.inputs.as_slice() else {
+        return Err("OCR requires exactly one inline request".into());
     };
-    let region_len = usize::try_from(
-        shmem_file
-            .metadata()
-            .map_err(|error| format!("OCR shared-memory metadata failed: {error}"))?
-            .len(),
-    )
-    .map_err(|_| "OCR shared-memory region is too large".to_string())?;
-    let map = map_shmem_file(shmem_file, region_len)
-        .map_err(|error| format!("OCR shared-memory map failed: {error}"))?;
-    let start = usize::try_from(*offset).map_err(|_| "OCR raster offset is too large")?;
-    let raster_len = usize::try_from(*length).map_err(|_| "OCR raster length is too large")?;
-    let end = start
-        .checked_add(raster_len)
-        .ok_or_else(|| "OCR raster range overflow".to_string())?;
-    let raster = map
-        .get(start..end)
-        .ok_or_else(|| "OCR raster range is out of bounds".to_string())?;
-    ocr_bridge::execute_utility_ocr(engine, request, raster)
+    let decoded = ocr_bridge::decode_utility_request(request)
+        .map_err(|error| format!("OCR request decode failed: {error:?}"))?;
+    let Some(rasterizer) = rasterizer else {
+        return Err("ocr requires a loaded document engine".into());
+    };
+    let dpi_scale = decoded.options.target_dpi as f32 / 72.0;
+    let tile = rasterize_full_page(rasterizer, decoded.page_index, dpi_scale)?;
+    ocr_bridge::execute_utility_ocr(engine, request, &tile.rgba_pixels, tile.width, tile.height)
         .map_err(|error| format!("OCR execution failed: {error:?}"))
 }
 
@@ -586,34 +642,7 @@ fn handle_render_page_for_ocr(
         return;
     };
 
-    // Get page dimensions by rendering a 1x1 tile to discover the page size.
-    let page_count = eng.page_count();
-    if page_index >= page_count {
-        send_error(
-            transport,
-            correlation_id,
-            &format!(
-                "page {} out of range (document has {} pages)",
-                page_index, page_count
-            ),
-        );
-        return;
-    }
-
-    // Render the full page at the requested scale.
-    // We render the entire page as one tile by using a large rect.
-    let output = eng.rasterize(&RasterizeRequest {
-        page_index,
-        rect: TileRect {
-            x: 0,
-            y: 0,
-            w: 8192,
-            h: 8192,
-        },
-        scale,
-    });
-
-    match output {
+    match rasterize_full_page(eng, page_index, scale) {
         Ok(tile) => {
             // Encode pixels as base64 for wire transport.
             use base64::Engine;
@@ -1085,11 +1114,11 @@ fn fill_tile_smoke(file: &File) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod utility_ocr_tests {
     use super::*;
+    use engine_api::rasterize::{RasterizeError, TileOutput};
     use ocr_bridge::{
         decode_utility_result, encode_utility_request, OcrEngine, OcrPageResult, OcrUtilityRequest,
         PreprocessOptions,
     };
-    use sandbox::shmem::SharedRegion;
 
     struct FixtureEngine;
 
@@ -1097,13 +1126,15 @@ mod utility_ocr_tests {
         fn recognize(
             &self,
             _raster: &[u8],
-            _width: u32,
-            _height: u32,
+            width: u32,
+            height: u32,
             page_index: u32,
             _options: &PreprocessOptions,
         ) -> OcrPageResult {
             OcrPageResult {
                 page_index,
+                raster_width: width,
+                raster_height: height,
                 blocks: Vec::new(),
                 full_text: "worker fixture".into(),
                 average_confidence: 0.3,
@@ -1123,15 +1154,26 @@ mod utility_ocr_tests {
         }
     }
 
+    struct FixtureRasterizer;
+
+    impl Rasterize for FixtureRasterizer {
+        fn rasterize(&self, _request: &RasterizeRequest) -> Result<TileOutput, RasterizeError> {
+            Ok(TileOutput {
+                rgba_pixels: vec![7; 2 * 2 * 4],
+                width: 2,
+                height: 2,
+            })
+        }
+
+        fn page_count(&self) -> u32 {
+            5
+        }
+    }
+
     #[test]
-    fn worker_reads_only_declared_raster_for_injected_engine() {
-        let mut region = SharedRegion::create(32).unwrap();
-        region.as_mut_slice()[8..24].fill(7);
-        region.flush().unwrap();
+    fn ocr_job_self_renders_via_engine_then_recognizes() {
         let request = OcrUtilityRequest {
             page_index: 4,
-            width: 2,
-            height: 2,
             language: "eng".into(),
             options: PreprocessOptions::default(),
         };
@@ -1139,20 +1181,18 @@ mod utility_ocr_tests {
             correlation_id: 1,
             job_id: 2,
             operation: "ocr".into(),
-            inputs: vec![
-                UtilityJobInput::Inline(encode_utility_request(&request).unwrap()),
-                UtilityJobInput::SharedMemory {
-                    grant_id: [1; 16],
-                    offset: 8,
-                    length: 16,
-                },
-            ],
+            inputs: vec![UtilityJobInput::Inline(
+                encode_utility_request(&request).unwrap(),
+            )],
         };
 
-        let output = execute_ocr_job(&job, region.file(), &FixtureEngine).unwrap();
+        let output = execute_ocr_job(&job, Some(&FixtureRasterizer as &dyn Rasterize), &FixtureEngine)
+            .unwrap();
         let result = decode_utility_result(&output).unwrap();
         assert_eq!(result.page_index, 4);
         assert_eq!(result.full_text, "worker fixture");
+        assert_eq!(result.raster_width, 2);
+        assert_eq!(result.raster_height, 2);
     }
 }
 
