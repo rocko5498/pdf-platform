@@ -1,8 +1,11 @@
 //! Bounded utility-job command/result wire codec. [ADR-009, ADR-031]
 
-const COMMAND_MAGIC: &[u8; 4] = b"UJQ1";
+const COMMAND_MAGIC_V1: &[u8; 4] = b"UJQ1";
+const COMMAND_MAGIC: &[u8; 4] = b"UJQ2";
 const EVENT_MAGIC: &[u8; 4] = b"UJR1";
 const MAX_TEXT_BYTES: usize = 64 * 1024;
+const MAX_INPUTS: usize = 16;
+const MAX_INLINE_BYTES: usize = 64 * 1024;
 
 /// One declarative job dispatched to a utility worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +16,24 @@ pub struct UtilityJobCommand {
     pub job_id: u64,
     /// Operation name understood by the utility operation registry.
     pub operation: String,
+    /// Bounded inputs or opaque shared-memory grants.
+    pub inputs: Vec<UtilityJobInput>,
+}
+
+/// Input supplied to a utility job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UtilityJobInput {
+    /// Small control data carried directly in the framed request.
+    Inline(Vec<u8>),
+    /// Bounded region in broker-approved shared memory.
+    SharedMemory {
+        /// Opaque process-local capability identifier.
+        grant_id: [u8; 16],
+        /// Byte offset from the start of the granted region.
+        offset: u64,
+        /// Number of accessible bytes.
+        length: u64,
+    },
 }
 
 /// Terminal result returned by a utility worker.
@@ -49,25 +70,109 @@ pub enum UtilityCodecError {
 
 /// Encode a utility-job request.
 pub fn encode_command(command: &UtilityJobCommand) -> Result<Vec<u8>, UtilityCodecError> {
-    encode(
-        COMMAND_MAGIC,
-        command.correlation_id,
-        command.job_id,
-        0,
-        &command.operation,
-    )
+    if command.operation.len() > MAX_TEXT_BYTES || command.inputs.len() > MAX_INPUTS {
+        return Err(UtilityCodecError::LimitExceeded);
+    }
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(COMMAND_MAGIC);
+    bytes.extend_from_slice(&command.correlation_id.to_le_bytes());
+    bytes.extend_from_slice(&command.job_id.to_le_bytes());
+    bytes.extend_from_slice(&(command.operation.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(command.operation.as_bytes());
+    bytes.push(command.inputs.len() as u8);
+    for input in &command.inputs {
+        match input {
+            UtilityJobInput::Inline(data) => {
+                if data.len() > MAX_INLINE_BYTES {
+                    return Err(UtilityCodecError::LimitExceeded);
+                }
+                bytes.push(0);
+                bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(data);
+            }
+            UtilityJobInput::SharedMemory {
+                grant_id,
+                offset,
+                length,
+            } => {
+                offset
+                    .checked_add(*length)
+                    .ok_or(UtilityCodecError::Malformed)?;
+                bytes.push(1);
+                bytes.extend_from_slice(grant_id);
+                bytes.extend_from_slice(&offset.to_le_bytes());
+                bytes.extend_from_slice(&length.to_le_bytes());
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 /// Decode a utility-job request.
 pub fn decode_command(bytes: &[u8]) -> Result<UtilityJobCommand, UtilityCodecError> {
-    let (correlation_id, job_id, tag, operation) = decode(bytes, COMMAND_MAGIC)?;
-    if tag != 0 {
+    if bytes.starts_with(COMMAND_MAGIC_V1) {
+        let (correlation_id, job_id, tag, operation) = decode(bytes, COMMAND_MAGIC_V1)?;
+        if tag != 0 {
+            return Err(UtilityCodecError::Malformed);
+        }
+        return Ok(UtilityJobCommand {
+            correlation_id,
+            job_id,
+            operation,
+            inputs: Vec::new(),
+        });
+    }
+    let mut cursor = Cursor::new(bytes);
+    if cursor.take(4)? != COMMAND_MAGIC {
+        return Err(UtilityCodecError::Malformed);
+    }
+    let correlation_id = cursor.u64()?;
+    let job_id = cursor.u64()?;
+    let operation_len = cursor.u32()? as usize;
+    if operation_len > MAX_TEXT_BYTES {
+        return Err(UtilityCodecError::LimitExceeded);
+    }
+    let operation = std::str::from_utf8(cursor.take(operation_len)?)
+        .map_err(|_| UtilityCodecError::InvalidUtf8)?
+        .to_owned();
+    let input_count = cursor.byte()? as usize;
+    if input_count > MAX_INPUTS {
+        return Err(UtilityCodecError::LimitExceeded);
+    }
+    let mut inputs = Vec::with_capacity(input_count);
+    for _ in 0..input_count {
+        match cursor.byte()? {
+            0 => {
+                let length = cursor.u32()? as usize;
+                if length > MAX_INLINE_BYTES {
+                    return Err(UtilityCodecError::LimitExceeded);
+                }
+                inputs.push(UtilityJobInput::Inline(cursor.take(length)?.to_vec()));
+            }
+            1 => {
+                let grant_id = cursor.take(16)?.try_into().expect("sixteen bytes");
+                let offset = cursor.u64()?;
+                let length = cursor.u64()?;
+                offset
+                    .checked_add(length)
+                    .ok_or(UtilityCodecError::Malformed)?;
+                inputs.push(UtilityJobInput::SharedMemory {
+                    grant_id,
+                    offset,
+                    length,
+                });
+            }
+            _ => return Err(UtilityCodecError::Malformed),
+        }
+    }
+    if !cursor.is_empty() {
         return Err(UtilityCodecError::Malformed);
     }
     Ok(UtilityJobCommand {
         correlation_id,
         job_id,
         operation,
+        inputs,
     })
 }
 
@@ -144,6 +249,50 @@ fn decode(bytes: &[u8], magic: &[u8; 4]) -> Result<(u64, u64, u8, String), Utili
     Ok((correlation_id, job_id, tag, text))
 }
 
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], UtilityCodecError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(UtilityCodecError::Malformed)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(UtilityCodecError::Malformed)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn byte(&mut self) -> Result<u8, UtilityCodecError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, UtilityCodecError> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("four bytes"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, UtilityCodecError> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?.try_into().expect("eight bytes"),
+        ))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +303,7 @@ mod tests {
             correlation_id: 4,
             job_id: 9,
             operation: "noop".into(),
+            inputs: Vec::new(),
         };
         assert_eq!(
             decode_command(&encode_command(&command).unwrap()).unwrap(),
@@ -177,10 +327,47 @@ mod tests {
             correlation_id: 1,
             job_id: 2,
             operation: "x".repeat(MAX_TEXT_BYTES + 1),
+            inputs: Vec::new(),
         };
         assert_eq!(
             encode_command(&command),
             Err(UtilityCodecError::LimitExceeded)
         );
+    }
+
+    #[test]
+    fn command_round_trips_bounded_inputs() {
+        let command = UtilityJobCommand {
+            correlation_id: 5,
+            job_id: 8,
+            operation: "ocr".into(),
+            inputs: vec![
+                UtilityJobInput::Inline(b"eng".to_vec()),
+                UtilityJobInput::SharedMemory {
+                    grant_id: [7; 16],
+                    offset: 4096,
+                    length: 8192,
+                },
+            ],
+        };
+        assert_eq!(
+            decode_command(&encode_command(&command).unwrap()).unwrap(),
+            command
+        );
+    }
+
+    #[test]
+    fn command_rejects_overflowing_shared_memory_range() {
+        let command = UtilityJobCommand {
+            correlation_id: 1,
+            job_id: 2,
+            operation: "ocr".into(),
+            inputs: vec![UtilityJobInput::SharedMemory {
+                grant_id: [1; 16],
+                offset: u64::MAX,
+                length: 1,
+            }],
+        };
+        assert_eq!(encode_command(&command), Err(UtilityCodecError::Malformed));
     }
 }

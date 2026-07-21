@@ -86,6 +86,7 @@ impl UtilityPool {
             correlation_id,
             job_id: spec.id,
             operation: spec.operation,
+            inputs: Vec::new(),
         };
         let frame = encode_command(&request).map_err(|error| {
             JobRunError::Execution(format!("job request encoding failed: {error:?}"))
