@@ -3,6 +3,7 @@
 #![warn(missing_docs)]
 
 pub mod persistence;
+pub mod utility_pool;
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};

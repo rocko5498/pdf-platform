@@ -1370,6 +1370,10 @@ dependencies = [
 [[package]]
 name = "jobs"
 version = "0.1.0"
+dependencies = [
+ "protocol",
+ "sandbox",
+]
 
 [[package]]
 name = "jobserver"
@@ -3498,6 +3502,7 @@ dependencies = [
  "engine-api",
  "engine-pdfium",
  "engine-stub",
+ "jobs",
  "memmap2",
  "pdf-cos",
  "pdf-model",

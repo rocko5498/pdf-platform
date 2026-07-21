@@ -30,3 +30,4 @@ base64        = "0.22"
 sandbox       = { path = "../sandbox" }
 protocol      = { path = "../protocol" }
 coordinator   = { path = "../coordinator" }
+jobs          = { path = "../jobs" }

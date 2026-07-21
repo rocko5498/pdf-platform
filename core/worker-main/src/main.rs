@@ -16,6 +16,10 @@ use protocol::events::{encode_worker_event, WorkerEvent};
 use protocol::handles::{encode_tile_ready, PixelFormat, TileSlotDesc, SHMEM_SMOKE_MAGIC, TILE_RGBA8_BYTES};
 use protocol::inspect::StructuralSummary;
 use protocol::transport::TransportError;
+use protocol::utility_jobs::{
+    decode_command as decode_utility_job, encode_event as encode_utility_event,
+    UtilityJobEvent,
+};
 use sandbox::shmem::map_shmem_file;
 use sandbox::spawn::{adopt_document_file, adopt_inherited, adopt_password, adopt_shmem_file};
 
@@ -79,6 +83,24 @@ fn main() -> ExitCode {
     loop {
         match transport.recv_timeout(Duration::from_secs(1)) {
             Ok(msg) => {
+                if let Ok(job) = decode_utility_job(&msg) {
+                    let event = if job.operation == "noop" {
+                        UtilityJobEvent::Completed {
+                            correlation_id: job.correlation_id,
+                            job_id: job.job_id,
+                        }
+                    } else {
+                        UtilityJobEvent::Failed {
+                            correlation_id: job.correlation_id,
+                            job_id: job.job_id,
+                            message: format!("unsupported utility operation: {}", job.operation),
+                        }
+                    };
+                    if let Ok(frame) = encode_utility_event(&event) {
+                        let _ = transport.send(&frame);
+                    }
+                    continue;
+                }
                 // Try typed command decode first, fall through to legacy.
                 match decode_command(&msg) {
                     Ok(cmd) => match cmd {

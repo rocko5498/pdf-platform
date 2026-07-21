@@ -5,3 +5,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+protocol = { path = "../protocol" }
+sandbox = { path = "../sandbox" }
