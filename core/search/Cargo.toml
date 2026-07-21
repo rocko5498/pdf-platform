@@ -8,3 +8,5 @@ edition.workspace = true
 pdf-types    = { path = "../pdf-types" }
 text-extract = { path = "../text-extract" }
 engine-api   = { path = "../engine-api" }
+# MIT. Tier-1 per ADR-028; adoption note: docs/adr/0034-tantivy-adoption.md.
+tantivy      = "0.22"

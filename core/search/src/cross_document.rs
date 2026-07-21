@@ -100,6 +100,13 @@ impl IndexStaging {
         self.records.values()
     }
 
+    /// Drop every staged record and reset byte usage to zero — called after
+    /// the contained backend seam has durably flushed them.
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.current_bytes = 0;
+    }
+
     /// Current exact canonical-text byte usage.
     pub fn current_bytes(&self) -> usize {
         self.current_bytes

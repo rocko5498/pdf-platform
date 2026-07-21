@@ -13,6 +13,7 @@
 use engine_api::extract::PageTextModel;
 
 pub mod cross_document;
+pub mod tantivy_backend;
 
 /// Search options for in-document find. [FR-SRCH-2]
 #[derive(Debug, Clone)]
