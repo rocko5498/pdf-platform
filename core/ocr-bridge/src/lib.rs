@@ -56,7 +56,7 @@ pub struct OcrPageResult {
 }
 
 /// Preprocessing options. [FR-OCR-3]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreprocessOptions {
     /// Deskew: correct page rotation/skew.
     pub deskew: bool,
@@ -107,9 +107,27 @@ pub trait OcrEngine: Send + Sync {
 }
 
 const OCR_RESULT_MAGIC: &[u8; 4] = b"OCR1";
+const OCR_REQUEST_MAGIC: &[u8; 4] = b"OCQ1";
 const MAX_UTILITY_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UTILITY_BLOCKS: usize = 65_535;
 const MAX_UTILITY_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_UTILITY_LANGUAGE_BYTES: usize = 256;
+const MAX_UTILITY_RASTER_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Bounded OCR control data sent beside one scoped RGBA8 shared-memory input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcrUtilityRequest {
+    /// Zero-based source page.
+    pub page_index: u32,
+    /// Raster width in pixels.
+    pub width: u32,
+    /// Raster height in pixels.
+    pub height: u32,
+    /// Tesseract-style language selection such as `eng+hin`.
+    pub language: String,
+    /// Requested preprocessing behavior.
+    pub options: PreprocessOptions,
+}
 
 /// Invalid or oversized normalized OCR utility result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +138,81 @@ pub enum OcrUtilityCodecError {
     LimitExceeded,
     /// A text field is not UTF-8.
     InvalidUtf8,
+}
+
+/// Encode bounded OCR request metadata for a utility job inline input.
+pub fn encode_utility_request(
+    request: &OcrUtilityRequest,
+) -> Result<Vec<u8>, OcrUtilityCodecError> {
+    validate_request(request)?;
+    let mut bytes = Vec::with_capacity(27 + request.language.len());
+    bytes.extend_from_slice(OCR_REQUEST_MAGIC);
+    bytes.extend_from_slice(&request.page_index.to_le_bytes());
+    bytes.extend_from_slice(&request.width.to_le_bytes());
+    bytes.extend_from_slice(&request.height.to_le_bytes());
+    bytes.extend_from_slice(&request.options.target_dpi.to_le_bytes());
+    bytes.push(request.options.deskew.into());
+    bytes.push(request.options.despeckle.into());
+    bytes.push(request.options.ocr_pages_with_text.into());
+    bytes.extend_from_slice(&(request.language.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(request.language.as_bytes());
+    Ok(bytes)
+}
+
+/// Decode and validate OCR request metadata inside a utility worker.
+pub fn decode_utility_request(bytes: &[u8]) -> Result<OcrUtilityRequest, OcrUtilityCodecError> {
+    let mut cursor = OcrCursor { bytes, offset: 0 };
+    if cursor.take(4)? != OCR_REQUEST_MAGIC {
+        return Err(OcrUtilityCodecError::Malformed);
+    }
+    let page_index = cursor.u32()?;
+    let width = cursor.u32()?;
+    let height = cursor.u32()?;
+    let target_dpi = cursor.u32()?;
+    let deskew = cursor.boolean()?;
+    let despeckle = cursor.boolean()?;
+    let ocr_pages_with_text = cursor.boolean()?;
+    let language_length = cursor.u32()? as usize;
+    if language_length > MAX_UTILITY_LANGUAGE_BYTES {
+        return Err(OcrUtilityCodecError::LimitExceeded);
+    }
+    let language = std::str::from_utf8(cursor.take(language_length)?)
+        .map(str::to_owned)
+        .map_err(|_| OcrUtilityCodecError::InvalidUtf8)?;
+    if !cursor.done() {
+        return Err(OcrUtilityCodecError::Malformed);
+    }
+    let request = OcrUtilityRequest {
+        page_index,
+        width,
+        height,
+        language,
+        options: PreprocessOptions {
+            deskew,
+            despeckle,
+            target_dpi,
+            ocr_pages_with_text,
+        },
+    };
+    validate_request(&request)?;
+    Ok(request)
+}
+
+fn validate_request(request: &OcrUtilityRequest) -> Result<(), OcrUtilityCodecError> {
+    if request.language.is_empty()
+        || request.language.len() > MAX_UTILITY_LANGUAGE_BYTES
+        || request.options.target_dpi == 0
+    {
+        return Err(OcrUtilityCodecError::LimitExceeded);
+    }
+    let raster_bytes = u64::from(request.width)
+        .checked_mul(u64::from(request.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(OcrUtilityCodecError::Malformed)?;
+    if raster_bytes == 0 || raster_bytes > MAX_UTILITY_RASTER_BYTES {
+        return Err(OcrUtilityCodecError::LimitExceeded);
+    }
+    Ok(())
 }
 
 /// Encode the normalized OCR intermediate returned by a utility worker.
@@ -913,6 +1006,43 @@ mod tests {
         assert_eq!(
             decode_utility_result(&encode_utility_result(&result).unwrap()),
             Err(OcrUtilityCodecError::Malformed)
+        );
+    }
+
+    #[test]
+    fn utility_request_round_trips_language_and_preprocessing() {
+        let request = OcrUtilityRequest {
+            page_index: 2,
+            width: 1200,
+            height: 1600,
+            language: "eng+hin".into(),
+            options: PreprocessOptions {
+                deskew: true,
+                despeckle: false,
+                target_dpi: 300,
+                ocr_pages_with_text: true,
+            },
+        };
+
+        assert_eq!(
+            decode_utility_request(&encode_utility_request(&request).unwrap()).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn utility_request_rejects_raster_larger_than_worker_slot() {
+        let request = OcrUtilityRequest {
+            page_index: 0,
+            width: 4096,
+            height: 4096,
+            language: "eng".into(),
+            options: PreprocessOptions::default(),
+        };
+
+        assert_eq!(
+            encode_utility_request(&request),
+            Err(OcrUtilityCodecError::LimitExceeded)
         );
     }
 
