@@ -2,10 +2,12 @@
 
 const COMMAND_MAGIC_V1: &[u8; 4] = b"UJQ1";
 const COMMAND_MAGIC: &[u8; 4] = b"UJQ2";
-const EVENT_MAGIC: &[u8; 4] = b"UJR1";
+const EVENT_MAGIC_V1: &[u8; 4] = b"UJR1";
+const EVENT_MAGIC: &[u8; 4] = b"UJR2";
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_INPUTS: usize = 16;
 const MAX_INLINE_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// One declarative job dispatched to a utility worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +47,8 @@ pub enum UtilityJobEvent {
         correlation_id: u64,
         /// Scheduler job identifier.
         job_id: u64,
+        /// Bounded operation-specific result bytes.
+        output: Vec<u8>,
     },
     /// Operation ran but failed.
     Failed {
@@ -182,7 +186,20 @@ pub fn encode_event(event: &UtilityJobEvent) -> Result<Vec<u8>, UtilityCodecErro
         UtilityJobEvent::Completed {
             correlation_id,
             job_id,
-        } => encode(EVENT_MAGIC, *correlation_id, *job_id, 0, ""),
+            output,
+        } => {
+            if output.len() > MAX_OUTPUT_BYTES {
+                return Err(UtilityCodecError::LimitExceeded);
+            }
+            let mut bytes = Vec::with_capacity(25 + output.len());
+            bytes.extend_from_slice(EVENT_MAGIC);
+            bytes.extend_from_slice(&correlation_id.to_le_bytes());
+            bytes.extend_from_slice(&job_id.to_le_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&(output.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(output);
+            Ok(bytes)
+        }
         UtilityJobEvent::Failed {
             correlation_id,
             job_id,
@@ -193,17 +210,49 @@ pub fn encode_event(event: &UtilityJobEvent) -> Result<Vec<u8>, UtilityCodecErro
 
 /// Decode a utility-job terminal event.
 pub fn decode_event(bytes: &[u8]) -> Result<UtilityJobEvent, UtilityCodecError> {
-    let (correlation_id, job_id, tag, text) = decode(bytes, EVENT_MAGIC)?;
+    if bytes.starts_with(EVENT_MAGIC_V1) {
+        let (correlation_id, job_id, tag, text) = decode(bytes, EVENT_MAGIC_V1)?;
+        return match tag {
+            0 if text.is_empty() => Ok(UtilityJobEvent::Completed {
+                correlation_id,
+                job_id,
+                output: Vec::new(),
+            }),
+            1 => Ok(UtilityJobEvent::Failed {
+                correlation_id,
+                job_id,
+                message: text,
+            }),
+            _ => Err(UtilityCodecError::Malformed),
+        };
+    }
+    if bytes.len() < 25 || &bytes[..4] != EVENT_MAGIC {
+        return Err(UtilityCodecError::Malformed);
+    }
+    let correlation_id = u64::from_le_bytes(bytes[4..12].try_into().expect("eight bytes"));
+    let job_id = u64::from_le_bytes(bytes[12..20].try_into().expect("eight bytes"));
+    let tag = bytes[20];
+    let length = u32::from_le_bytes(bytes[21..25].try_into().expect("four bytes")) as usize;
+    if bytes.len() != 25 + length {
+        return Err(UtilityCodecError::Malformed);
+    }
     match tag {
-        0 if text.is_empty() => Ok(UtilityJobEvent::Completed {
+        0 if length <= MAX_OUTPUT_BYTES => Ok(UtilityJobEvent::Completed {
             correlation_id,
             job_id,
+            output: bytes[25..].to_vec(),
         }),
-        1 => Ok(UtilityJobEvent::Failed {
-            correlation_id,
-            job_id,
-            message: text,
-        }),
+        1 if length <= MAX_TEXT_BYTES => {
+            let message = std::str::from_utf8(&bytes[25..])
+                .map_err(|_| UtilityCodecError::InvalidUtf8)?
+                .to_owned();
+            Ok(UtilityJobEvent::Failed {
+                correlation_id,
+                job_id,
+                message,
+            })
+        }
+        0 | 1 => Err(UtilityCodecError::LimitExceeded),
         _ => Err(UtilityCodecError::Malformed),
     }
 }
@@ -317,6 +366,19 @@ mod tests {
         assert_eq!(
             decode_event(&encode_event(&failed).unwrap()).unwrap(),
             failed
+        );
+    }
+
+    #[test]
+    fn completed_event_round_trips_bounded_output() {
+        let completed = UtilityJobEvent::Completed {
+            correlation_id: 4,
+            job_id: 9,
+            output: b"normalized OCR result".to_vec(),
+        };
+        assert_eq!(
+            decode_event(&encode_event(&completed).unwrap()).unwrap(),
+            completed
         );
     }
 

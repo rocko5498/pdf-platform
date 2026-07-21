@@ -170,7 +170,8 @@ impl UtilityPool {
 
     /// Execute one declarative job through a utility process.
     pub fn execute(&self, spec: JobSpec, context: JobContext) -> Result<(), JobRunError> {
-        self.execute_prepared(spec, context, |_| Ok(Vec::new()))
+        self.execute_prepared_result(spec, context, |_| Ok(Vec::new()))
+            .map(|_| ())
     }
 
     /// Select and lock a worker, then prepare inputs scoped to that exact incarnation.
@@ -180,6 +181,20 @@ impl UtilityPool {
         context: JobContext,
         prepare: P,
     ) -> Result<(), JobRunError>
+    where
+        P: FnOnce(UtilityWorkerPreparation<'_>) -> Result<Vec<UtilityJobInput>, JobRunError>,
+    {
+        self.execute_prepared_result(spec, context, prepare)
+            .map(|_| ())
+    }
+
+    /// Select and lock a worker, prepare its inputs, and return bounded result bytes.
+    pub fn execute_prepared_result<P>(
+        &self,
+        spec: JobSpec,
+        context: JobContext,
+        prepare: P,
+    ) -> Result<Vec<u8>, JobRunError>
     where
         P: FnOnce(UtilityWorkerPreparation<'_>) -> Result<Vec<UtilityJobInput>, JobRunError>,
     {
@@ -223,7 +238,8 @@ impl UtilityPool {
             Ok(UtilityJobEvent::Completed {
                 correlation_id: cid,
                 job_id,
-            }) if cid == correlation_id && job_id == spec.id => Ok(()),
+                output,
+            }) if cid == correlation_id && job_id == spec.id => Ok(output),
             Ok(UtilityJobEvent::Failed {
                 correlation_id: cid,
                 job_id,

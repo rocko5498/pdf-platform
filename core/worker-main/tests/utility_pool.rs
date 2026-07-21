@@ -33,6 +33,32 @@ fn noop_job_crosses_real_utility_process_boundary() {
 }
 
 #[test]
+fn utility_pool_returns_operation_output() {
+    let pool = UtilityPool::new(env!("CARGO_BIN_EXE_worker"), 1).unwrap();
+    let output = Arc::new(std::sync::Mutex::new(None));
+    let observed = output.clone();
+    let scheduler = JobScheduler::new_typed(1, 1, move |spec, context| {
+        let bytes = pool.execute_prepared_result(spec, context, |_| Ok(Vec::new()))?;
+        *observed.lock().unwrap() = Some(bytes);
+        Ok(())
+    })
+    .unwrap();
+    scheduler
+        .submit(JobGraph::new(vec![JobSpec::new(7, "noop", JobPriority::UserInitiated)]).unwrap())
+        .unwrap();
+    loop {
+        match scheduler.recv_event_timeout(Duration::from_secs(5)) {
+            Some(JobEvent::Completed { job: 7 }) => break,
+            Some(JobEvent::Failed { message, .. }) => panic!("utility job failed: {message}"),
+            Some(_) => {}
+            None => panic!("timed out waiting for utility job"),
+        }
+    }
+    scheduler.shutdown();
+    assert_eq!(*output.lock().unwrap(), Some(Vec::new()));
+}
+
+#[test]
 fn inputs_are_prepared_for_the_selected_worker_generation() {
     let pool = UtilityPool::new(env!("CARGO_BIN_EXE_worker"), 1).unwrap();
     let selected = Arc::new(std::sync::Mutex::new(None));

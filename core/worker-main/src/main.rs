@@ -13,12 +13,14 @@ use engine_api::rasterize::{Rasterize, RasterizeRequest, TileRect};
 use pdf_cos::scan::scan_file;
 use protocol::commands::{decode_command, Command};
 use protocol::events::{encode_worker_event, WorkerEvent};
-use protocol::handles::{encode_tile_ready, PixelFormat, TileSlotDesc, SHMEM_SMOKE_MAGIC, TILE_RGBA8_BYTES};
+use protocol::handles::{
+    encode_tile_ready, PixelFormat, TileSlotDesc, SHMEM_SMOKE_MAGIC, TILE_RGBA8_BYTES,
+};
 use protocol::inspect::StructuralSummary;
 use protocol::transport::TransportError;
 use protocol::utility_jobs::{
-    decode_command as decode_utility_job, encode_event as encode_utility_event,
-    UtilityJobCommand, UtilityJobEvent, UtilityJobInput,
+    decode_command as decode_utility_job, encode_event as encode_utility_event, UtilityJobCommand,
+    UtilityJobEvent, UtilityJobInput,
 };
 use sandbox::shmem::map_shmem_file;
 use sandbox::spawn::{adopt_document_file, adopt_inherited, adopt_password, adopt_shmem_file};
@@ -58,7 +60,7 @@ fn main() -> ExitCode {
     // Read password for encrypted documents (passed as env var by coordinator).
     let password: Option<String> = adopt_password();
 
-        // ONE engine instance per document. Re-opening the same inherited handle for
+    // ONE engine instance per document. Re-opening the same inherited handle for
     // Structure/Extract after Rasterize already loaded PDFium fails, which made
     // outline/layers report "no engine loaded" while tiles still rendered. [ADR-005]
     #[cfg(feature = "pdfium")]
@@ -94,6 +96,7 @@ fn main() -> ExitCode {
                         UtilityJobEvent::Completed {
                             correlation_id: job.correlation_id,
                             job_id: job.job_id,
+                            output: Vec::new(),
                         }
                     } else {
                         UtilityJobEvent::Failed {
@@ -149,7 +152,10 @@ fn main() -> ExitCode {
                                 &mut transport,
                             );
                         }
-                        Command::ExtractPage { correlation_id, page_index } => {
+                        Command::ExtractPage {
+                            correlation_id,
+                            page_index,
+                        } => {
                             handle_extract_page(
                                 pdfium.as_ref().map(|e| e as &dyn Extract),
                                 correlation_id,
@@ -159,26 +165,35 @@ fn main() -> ExitCode {
                         }
                         Command::GetOutline { correlation_id } => {
                             handle_get_outline(
-                                pdfium.as_ref().map(|e| e as &dyn engine_api::structure::Structure),
+                                pdfium
+                                    .as_ref()
+                                    .map(|e| e as &dyn engine_api::structure::Structure),
                                 correlation_id,
                                 &mut transport,
                             );
                         }
                         Command::GetLayers { correlation_id } => {
                             handle_get_layers(
-                                pdfium.as_ref().map(|e| e as &dyn engine_api::structure::Structure),
+                                pdfium
+                                    .as_ref()
+                                    .map(|e| e as &dyn engine_api::structure::Structure),
                                 correlation_id,
                                 &mut transport,
                             );
                         }
                         Command::GetAttachments { correlation_id } => {
                             handle_get_attachments(
-                                pdfium.as_ref().map(|e| e as &dyn engine_api::structure::Structure),
+                                pdfium
+                                    .as_ref()
+                                    .map(|e| e as &dyn engine_api::structure::Structure),
                                 correlation_id,
                                 &mut transport,
                             );
                         }
-                        Command::GetObject { correlation_id, obj_num } => {
+                        Command::GetObject {
+                            correlation_id,
+                            obj_num,
+                        } => {
                             handle_get_object(&doc_file, correlation_id, obj_num, &mut transport);
                         }
                         Command::RenderPageForOcr {
@@ -209,18 +224,26 @@ fn main() -> ExitCode {
                             );
                         }
                         // Coordinator-level commands — should not reach the worker.
-                        Command::DeletePages { correlation_id, .. } |
-                        Command::RotatePages { correlation_id, .. } |
-                        Command::AddAnnotation { correlation_id, .. } |
-                        Command::DeleteAnnotation { correlation_id, .. } |
-                        Command::RedactByTerm { correlation_id, .. } => {
-                            send_error(&mut transport, correlation_id, "organize/annotation/redaction commands are coordinator-level");
+                        Command::DeletePages { correlation_id, .. }
+                        | Command::RotatePages { correlation_id, .. }
+                        | Command::AddAnnotation { correlation_id, .. }
+                        | Command::DeleteAnnotation { correlation_id, .. }
+                        | Command::RedactByTerm { correlation_id, .. } => {
+                            send_error(
+                                &mut transport,
+                                correlation_id,
+                                "organize/annotation/redaction commands are coordinator-level",
+                            );
                         }
                         // M11 plugin commands — handled by coordinator, not document worker.
-                        Command::LoadPlugin { correlation_id, .. } |
-                        Command::UnloadPlugin { correlation_id, .. } |
-                        Command::InvokePluginAction { correlation_id, .. } => {
-                            send_error(&mut transport, correlation_id, "plugin commands are coordinator-level");
+                        Command::LoadPlugin { correlation_id, .. }
+                        | Command::UnloadPlugin { correlation_id, .. }
+                        | Command::InvokePluginAction { correlation_id, .. } => {
+                            send_error(
+                                &mut transport,
+                                correlation_id,
+                                "plugin commands are coordinator-level",
+                            );
                         }
                     },
                     Err(_) => {
@@ -293,7 +316,10 @@ fn handle_inspect(
     };
     match scan_and_encode(file, pdfium) {
         Ok(summary) => {
-            let event = WorkerEvent::Summary { correlation_id, summary };
+            let event = WorkerEvent::Summary {
+                correlation_id,
+                summary,
+            };
             let body = encode_worker_event(&event);
             if let Err(e) = transport.send(&body) {
                 eprintln!("worker: send summary failed: {e}");
@@ -352,7 +378,8 @@ fn handle_render_tile_typed(
             let total_needed = slot_offset as usize + output.rgba_pixels.len();
             match map_shmem_file(file, total_needed) {
                 Ok(mut map) => {
-                    let slot = &mut map[slot_offset as usize..slot_offset as usize + output.rgba_pixels.len()];
+                    let slot = &mut map
+                        [slot_offset as usize..slot_offset as usize + output.rgba_pixels.len()];
                     slot.copy_from_slice(&output.rgba_pixels);
                     let _ = map.flush();
 
@@ -365,7 +392,10 @@ fn handle_render_tile_typed(
                         col,
                         row,
                     };
-                    let event = WorkerEvent::TileReady { correlation_id, desc };
+                    let event = WorkerEvent::TileReady {
+                        correlation_id,
+                        desc,
+                    };
                     let body = encode_worker_event(&event);
                     if let Err(e) = transport.send(&body) {
                         eprintln!("worker: send TILE_READY failed: {e}");
@@ -453,9 +483,14 @@ fn handle_render_page_for_ocr(
     // Get page dimensions by rendering a 1x1 tile to discover the page size.
     let page_count = eng.page_count();
     if page_index >= page_count {
-        send_error(transport, correlation_id, &format!(
-            "page {} out of range (document has {} pages)", page_index, page_count
-        ));
+        send_error(
+            transport,
+            correlation_id,
+            &format!(
+                "page {} out of range (document has {} pages)",
+                page_index, page_count
+            ),
+        );
         return;
     }
 
@@ -463,7 +498,12 @@ fn handle_render_page_for_ocr(
     // We render the entire page as one tile by using a large rect.
     let output = eng.rasterize(&RasterizeRequest {
         page_index,
-        rect: TileRect { x: 0, y: 0, w: 8192, h: 8192 },
+        rect: TileRect {
+            x: 0,
+            y: 0,
+            w: 8192,
+            h: 8192,
+        },
         scale,
     });
 
@@ -486,7 +526,11 @@ fn handle_render_page_for_ocr(
             }
         }
         Err(e) => {
-            send_error(transport, correlation_id, &format!("render for OCR failed: {e}"));
+            send_error(
+                transport,
+                correlation_id,
+                &format!("render for OCR failed: {e}"),
+            );
         }
     }
 }
@@ -507,11 +551,18 @@ fn handle_get_outline(
             // Nesting indicated by leading pipe count: 0 pipes = top-level, 1 pipe = child, etc.
             // [FR-BOOK, M1 exit: bookmark navigation]
             let mut lines = Vec::new();
-            fn serialize_entries(entries: &[engine_api::structure::OutlineEntry], depth: u32, lines: &mut Vec<String>) {
+            fn serialize_entries(
+                entries: &[engine_api::structure::OutlineEntry],
+                depth: u32,
+                lines: &mut Vec<String>,
+            ) {
                 for entry in entries {
                     let prefix = "|".repeat(depth as usize);
                     let title_escaped = entry.title.replace('|', "\\p").replace('\n', "\\n");
-                    lines.push(format!("{}{}|{}|{}", prefix, entry.page, entry.y, title_escaped));
+                    lines.push(format!(
+                        "{}{}|{}|{}",
+                        prefix, entry.page, entry.y, title_escaped
+                    ));
                     serialize_entries(&entry.children, depth + 1, lines);
                 }
             }
@@ -575,7 +626,9 @@ fn handle_get_attachments(
     match structure.attachments() {
         Ok(attachments) => {
             let count = attachments.files.len() as u32;
-            let data = attachments.files.iter()
+            let data = attachments
+                .files
+                .iter()
                 .map(|a| format!("{} ({} bytes)", a.name, a.size))
                 .collect::<Vec<_>>()
                 .join(";");
@@ -635,14 +688,20 @@ fn handle_get_object(
 
     let idx = obj_num as usize;
     if idx >= entries.len() || !entries[idx].in_use {
-        send_error(transport, correlation_id, &format!("object {obj_num} not found"));
+        send_error(
+            transport,
+            correlation_id,
+            &format!("object {obj_num} not found"),
+        );
         return;
     }
 
     let offset = entries[idx].offset as usize;
     // Find endobj after the offset to determine object length.
     let obj_bytes = &map[offset..];
-    let end = obj_bytes.windows(7).position(|w| w == b"endobj")
+    let end = obj_bytes
+        .windows(7)
+        .position(|w| w == b"endobj")
         .map(|p| offset + p + 7)
         .unwrap_or(offset + obj_bytes.len().min(4096));
 
@@ -705,15 +764,21 @@ fn parse_xref_table(data: &[u8], offset: usize) -> Option<Vec<XrefEntry>> {
         let count = parse_uint(d, &mut pos)?;
         skip_ws(d, &mut pos);
         // skip eol
-        if d.get(pos) == Some(&b'\r') { pos += 1; }
-        if d.get(pos) == Some(&b'\n') { pos += 1; }
+        if d.get(pos) == Some(&b'\r') {
+            pos += 1;
+        }
+        if d.get(pos) == Some(&b'\n') {
+            pos += 1;
+        }
 
         let needed = first + count;
         if entries.len() < needed {
             entries.resize(needed, XrefEntry::default());
         }
         for obj in first..first + count {
-            if pos + 20 > d.len() { break; }
+            if pos + 20 > d.len() {
+                break;
+            }
             let entry_bytes = &d[pos..pos + 20];
             let offset_bytes = &entry_bytes[0..10];
             let in_use = entry_bytes.get(17) == Some(&b'n');
@@ -721,7 +786,10 @@ fn parse_xref_table(data: &[u8], offset: usize) -> Option<Vec<XrefEntry>> {
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(0);
-            entries[obj] = XrefEntry { offset: byte_offset, in_use };
+            entries[obj] = XrefEntry {
+                offset: byte_offset,
+                in_use,
+            };
             pos += 20;
         }
     }
@@ -733,7 +801,9 @@ fn parse_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
     while *pos < data.len() && data[*pos].is_ascii_digit() {
         *pos += 1;
     }
-    if *pos == start { return None; }
+    if *pos == start {
+        return None;
+    }
     std::str::from_utf8(&data[start..*pos]).ok()?.parse().ok()
 }
 
@@ -790,7 +860,11 @@ fn handle_forms_calc(
     }
 }
 
-fn send_error(transport: &mut Box<dyn protocol::transport::WorkerTransport>, correlation_id: u64, message: &str) {
+fn send_error(
+    transport: &mut Box<dyn protocol::transport::WorkerTransport>,
+    correlation_id: u64,
+    message: &str,
+) {
     let event = WorkerEvent::RenderError {
         correlation_id,
         message: message.to_string(),
