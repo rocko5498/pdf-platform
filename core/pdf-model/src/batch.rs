@@ -208,7 +208,7 @@ pub fn execute_pipeline(pipeline: &BatchPipeline) -> Vec<StepResult> {
 }
 
 /// Execute a single batch step. Returns output paths on success.
-fn execute_step(step: &BatchStep) -> Result<Vec<PathBuf>, String> {
+pub fn execute_step(step: &BatchStep) -> Result<Vec<PathBuf>, String> {
     match step {
         BatchStep::Merge { inputs, output } => {
             let paths: Vec<&std::path::Path> = inputs.iter().map(|p| p.as_path()).collect();
@@ -241,19 +241,9 @@ fn execute_step(step: &BatchStep) -> Result<Vec<PathBuf>, String> {
                 .map_err(|e| e.to_string())?;
             Ok(vec![output.clone()])
         }
-        BatchStep::Watermark { input, text, output } => {
-            // Stamp module generates content streams; for now copy the file
-            // and note that full page injection requires coordinator wiring.
-            std::fs::copy(input, output)
-                .map_err(|e| format!("copy failed: {e}"))?;
-            eprintln!("Watermark '{text}' applied to {}", output.display());
-            Ok(vec![output.clone()])
-        }
-        BatchStep::BatesNumber { input, start: _, width: _, output } => {
-            std::fs::copy(input, output)
-                .map_err(|e| format!("copy failed: {e}"))?;
-            Ok(vec![output.clone()])
-        }
+        BatchStep::Watermark { .. } | BatchStep::BatesNumber { .. } => Err(
+            "stamp steps require the coordinator-backed CLI executor".into(),
+        ),
     }
 }
 
@@ -312,23 +302,14 @@ mod tests {
     }
 
     #[test]
-    fn batch_watermark_copies_file() {
-        let dir = std::env::temp_dir().join("pdf_platform_batch_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let src = dir.join("src.pdf");
-        let out = dir.join("stamped.pdf");
-        std::fs::write(&src, b"fake pdf content").unwrap();
-
+    fn batch_watermark_requires_coordinator_executor() {
         let step = BatchStep::Watermark {
-            input: src.clone(),
+            input: "src.pdf".into(),
             text: "CONFIDENTIAL".into(),
-            output: out.clone(),
+            output: "stamped.pdf".into(),
         };
-        let result = execute_step(&step).unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(out.exists());
-        assert_eq!(std::fs::read(&out).unwrap(), b"fake pdf content");
-        let _ = std::fs::remove_dir_all(&dir);
+        let error = execute_step(&step).unwrap_err();
+        assert!(error.contains("coordinator"), "got: {error}");
     }
 
     #[test]

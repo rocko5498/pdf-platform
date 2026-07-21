@@ -10,10 +10,11 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use pdf_model::command::CommandGroup;
+use pdf_model::command::{CommandGroup, SetObjectCommand};
 use pdf_model::journal::UndoJournal;
 use pdf_model::overlay::CowOverlay;
 use pdf_model::organize::{build_delete_pages_group, build_rotate_pages_group};
+use pdf_model::stamp::{Stamp, StampPosition};
 use pdf_write::IncrementalWriter;
 use protocol::inspect::StructuralSummary;
 use text_extract::TextExtractionService;
@@ -136,7 +137,13 @@ impl DocumentCoordinator {
         let mut session = WorkerSession::spawn_with_document(worker_exe, brokered)?;
 
         let summary = session.inspect()?;
-        let next_obj_num = summary.page_count + 3; // catalog + pages + last page
+        let next_obj_num = summary
+            .original_offsets
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
         let sidecar = Self::compute_sidecar_path(doc_path);
 
         Ok(Self {
@@ -521,6 +528,54 @@ impl DocumentCoordinator {
         ).map_err(|e| SessionError::Protocol(e))?;
 
         self.apply_command_group(group)
+    }
+
+    /// Apply the same text stamp to every page as one undoable edit. [FR-BATCH-1, M6]
+    pub fn apply_stamp(&mut self, stamp: &Stamp) -> Result<(), SessionError> {
+        let pages = self.stamp_page_objects()?;
+        let stamps = vec![stamp.clone(); pages.len()];
+        let (group, next_obj_num) = build_stamp_group(&pages, &stamps, self.next_obj_num)?;
+        self.apply_command_group(group)?;
+        self.next_obj_num = next_obj_num;
+        Ok(())
+    }
+
+    /// Apply sequential Bates numbers to every page as one undoable edit. [FR-BATCH-1, M6]
+    pub fn apply_bates(
+        &mut self,
+        start: u32,
+        width: usize,
+        position: StampPosition,
+        font_size: f32,
+    ) -> Result<(), SessionError> {
+        let pages = self.stamp_page_objects()?;
+        let stamps = (0..pages.len())
+            .map(|index| Stamp {
+                text: pdf_model::stamp::bates_number(start, index as u32, width),
+                position,
+                font_size,
+                ..Stamp::default()
+            })
+            .collect::<Vec<_>>();
+        let (group, next_obj_num) = build_stamp_group(&pages, &stamps, self.next_obj_num)?;
+        self.apply_command_group(group)?;
+        self.next_obj_num = next_obj_num;
+        Ok(())
+    }
+
+    fn stamp_page_objects(&mut self) -> Result<Vec<(u32, Vec<u8>)>, SessionError> {
+        let pages_obj_num = self.find_pages_object()?;
+        let pages_bytes = self.session.get_object(pages_obj_num)?;
+        let page_refs = self.parse_kid_references(&String::from_utf8_lossy(&pages_bytes));
+        if page_refs.len() != self.summary.page_count as usize {
+            return Err(SessionError::Protocol(
+                "stamping nested page trees is not yet supported".into(),
+            ));
+        }
+        page_refs
+            .into_iter()
+            .map(|obj_num| self.session.get_object(obj_num).map(|bytes| (obj_num, bytes)))
+            .collect()
     }
 
     /// Find the Pages parent object number by reading the catalog. [SDS §3.1]
@@ -1080,6 +1135,83 @@ impl DocumentCoordinator {
     }
 }
 
+fn build_stamp_group(
+    pages: &[(u32, Vec<u8>)],
+    stamps: &[Stamp],
+    next_obj_num: u32,
+) -> Result<(CommandGroup, u32), SessionError> {
+    if pages.len() != stamps.len() {
+        return Err(SessionError::Protocol("page/stamp count mismatch".into()));
+    }
+
+    let font_obj_num = next_obj_num;
+    let mut group = CommandGroup::new("Stamp pages");
+    group.push(Box::new(SetObjectCommand {
+        obj_num: font_obj_num,
+        new_bytes: format!(
+            "{font_obj_num} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+        )
+        .into_bytes(),
+        old_bytes: None,
+    }));
+
+    for (index, ((page_obj_num, page_bytes), stamp)) in pages.iter().zip(stamps).enumerate() {
+        let content_obj_num = font_obj_num + 1 + index as u32;
+        let (width, height) = parse_media_box(page_bytes)?;
+        let stream = pdf_model::stamp::generate_stamp_stream(stamp, width, height);
+        let stream_obj = format!(
+            "{content_obj_num} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+            stream.len(),
+            String::from_utf8_lossy(&stream)
+        )
+        .into_bytes();
+        let patched_page = pdf_model::page_patch::inject_content_ref_and_font(
+            page_bytes,
+            content_obj_num,
+            font_obj_num,
+            "FStamp",
+        )
+        .map_err(SessionError::Protocol)?;
+
+        group.push(Box::new(SetObjectCommand {
+            obj_num: *page_obj_num,
+            new_bytes: patched_page,
+            old_bytes: Some(page_bytes.clone()),
+        }));
+        group.push(Box::new(SetObjectCommand {
+            obj_num: content_obj_num,
+            new_bytes: stream_obj,
+            old_bytes: None,
+        }));
+    }
+
+    Ok((group, font_obj_num + 1 + pages.len() as u32))
+}
+
+fn parse_media_box(page_bytes: &[u8]) -> Result<(f32, f32), SessionError> {
+    let text = String::from_utf8_lossy(page_bytes);
+    let start = text
+        .find("/MediaBox")
+        .ok_or_else(|| SessionError::Protocol("page has no explicit /MediaBox".into()))?;
+    let open = start
+        + text[start..]
+            .find('[')
+            .ok_or_else(|| SessionError::Protocol("malformed /MediaBox".into()))?;
+    let close = open
+        + text[open..]
+            .find(']')
+            .ok_or_else(|| SessionError::Protocol("malformed /MediaBox".into()))?;
+    let values = text[open + 1..close]
+        .split_whitespace()
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionError::Protocol("malformed /MediaBox".into()))?;
+    if values.len() != 4 || values[2] <= values[0] || values[3] <= values[1] {
+        return Err(SessionError::Protocol("malformed /MediaBox".into()));
+    }
+    Ok((values[2] - values[0], values[3] - values[1]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,6 +1315,27 @@ mod tests {
         assert!(meta.len() > 0);
 
         fs::remove_file(&save_path).ok();
+    }
+
+    #[test]
+    fn stamp_group_writes_page_font_and_content_objects() {
+        let page = b"3 0 obj\n<< /Type /Page /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>\nendobj\n".to_vec();
+        let stamps = vec![pdf_model::stamp::Stamp {
+            text: "CONFIDENTIAL".into(),
+            ..pdf_model::stamp::Stamp::default()
+        }];
+
+        let (group, next) = build_stamp_group(&[(3, page)], &stamps, 20).unwrap();
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+
+        assert_eq!(next, 22);
+        assert!(String::from_utf8_lossy(overlay.get_object(3).unwrap())
+            .contains("/Contents [4 0 R 21 0 R]"));
+        assert!(String::from_utf8_lossy(overlay.get_object(20).unwrap())
+            .contains("/BaseFont /Helvetica"));
+        assert!(String::from_utf8_lossy(overlay.get_object(21).unwrap())
+            .contains("CONFIDENTIAL"));
     }
 
     #[test]

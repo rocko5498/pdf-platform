@@ -611,8 +611,6 @@ fn cmd_optimize(path: &Path, rest: &[String]) {
 /// Usage: pdf-platform stamp <file> --text "WATERMARK" -o <out.pdf>
 ///        pdf-platform stamp <file> --bates-start 1 --bates-width 6 -o <out.pdf>
 fn cmd_stamp(path: &Path, rest: &[String]) {
-    use pdf_model::stamp::{Stamp, StampPosition, generate_stamp_stream, bates_number};
-
     let text = rest.iter()
         .position(|s| s == "--text")
         .and_then(|i| rest.get(i + 1))
@@ -642,18 +640,55 @@ fn cmd_stamp(path: &Path, rest: &[String]) {
         process::exit(1);
     }
 
-    // For now, report what would be stamped (actual PDF patching requires
-    // the full page-content injection pipeline which is a coordinator task).
-    if let Some(ref t) = text {
-        println!("Stamp '{}' on all pages of {}", t, path.display());
-        println!("Font size: {font_size}, position: bottom-center");
-    } else if let Some(start) = bates_start {
-        println!("Bates stamp starting at {start} (width {bates_width}) on all pages of {}",
-            path.display());
+    if let Err(error) = run_stamp(
+        path,
+        &out,
+        text.as_deref(),
+        bates_start,
+        bates_width,
+        font_size,
+    ) {
+        eprintln!("error: {error}");
+        process::exit(2);
     }
     println!("Wrote {}", out.display());
-    eprintln!("Note: stamp CLI is a content-stream generator; full page injection is pending coordinator integration.");
     process::exit(0);
+}
+
+fn run_stamp(
+    input: &Path,
+    output: &Path,
+    text: Option<&str>,
+    bates_start: Option<u32>,
+    bates_width: usize,
+    font_size: f32,
+) -> Result<(), String> {
+    let worker = find_worker();
+    let mut coordinator = coordinator::document::DocumentCoordinator::open(&worker, input)
+        .map_err(|e| e.to_string())?;
+    if let Some(text) = text {
+        let stamp = pdf_model::stamp::Stamp {
+            text: text.to_string(),
+            font_size,
+            ..pdf_model::stamp::Stamp::default()
+        };
+        coordinator.apply_stamp(&stamp).map_err(|e| e.to_string())?;
+    } else if let Some(start) = bates_start {
+        coordinator
+            .apply_bates(
+                start,
+                bates_width,
+                pdf_model::stamp::StampPosition::BottomCenter,
+                font_size,
+            )
+            .map_err(|e| e.to_string())?;
+    } else {
+        return Err("stamp text or Bates start is required".into());
+    }
+    coordinator
+        .save_incremental(output)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 
@@ -1338,7 +1373,7 @@ fn extract_xref_offsets(_bytes: &[u8]) -> Vec<(u32, u64)> {
 /// Pipeline file format: one step per section, type=merge/split/etc.
 /// See `pdf_model::batch::BatchPipeline::serialize()` for the format.
 fn cmd_batch(pipeline_path: &Path) {
-    use pdf_model::batch::{BatchPipeline, BatchStep, execute_pipeline};
+    use pdf_model::batch::BatchPipeline;
 
     if !pipeline_path.exists() {
         eprintln!("error: pipeline file not found: {}", pipeline_path.display());
@@ -1436,7 +1471,7 @@ fn cmd_batch(pipeline_path: &Path) {
     }
 
     println!("Executing pipeline '{}' ({} steps)...", pipeline.name, pipeline.step_count());
-    let results = execute_pipeline(&pipeline);
+    let results = execute_cli_pipeline(&pipeline);
 
     let mut all_ok = true;
     for (i, result) in results.iter().enumerate() {
@@ -1805,4 +1840,67 @@ fn read_sidecar_info(sidecar_path: &Path, doc_path: &Path) -> Result<SidecarInfo
         group_count,
         group_names,
     })
+}
+
+fn execute_cli_pipeline(
+    pipeline: &pdf_model::batch::BatchPipeline,
+) -> Vec<pdf_model::batch::StepResult> {
+    use pdf_model::batch::{BatchStep, StepResult};
+
+    let mut results = Vec::new();
+    for step in &pipeline.steps {
+        let started = std::time::Instant::now();
+        let result = match step {
+            BatchStep::Watermark { input, text, output } => run_stamp(
+                input,
+                output,
+                Some(text),
+                None,
+                6,
+                10.0,
+            )
+            .map(|()| vec![output.clone()]),
+            BatchStep::BatesNumber {
+                input,
+                start,
+                width,
+                output,
+            } => run_stamp(input, output, None, Some(*start), *width, 10.0)
+                .map(|()| vec![output.clone()]),
+            _ => pdf_model::batch::execute_step(step),
+        };
+        let success = result.is_ok();
+        results.push(StepResult {
+            success,
+            outputs: result.as_ref().cloned().unwrap_or_default(),
+            message: result.err().unwrap_or_else(|| "ok".into()),
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+        if !success {
+            break;
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+
+    #[test]
+    fn run_stamp_writes_incremental_stamp_objects() {
+        let worker = find_worker();
+        let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/corpus-diff/fixtures/valid-1page.pdf");
+        if !worker.exists() || !input.exists() {
+            eprintln!("skipping: build worker-main and provide corpus fixture");
+            return;
+        }
+        let output = std::env::temp_dir().join("pdf-platform-cli-stamp-test.pdf");
+        run_stamp(&input, &output, Some("CONFIDENTIAL"), None, 6, 10.0).unwrap();
+        let bytes = std::fs::read(&output).unwrap();
+        assert!(bytes.windows(b"CONFIDENTIAL".len()).any(|w| w == b"CONFIDENTIAL"));
+        assert!(bytes.len() > std::fs::metadata(&input).unwrap().len() as usize);
+        std::fs::remove_file(output).ok();
+    }
 }
