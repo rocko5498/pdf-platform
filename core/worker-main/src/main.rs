@@ -298,6 +298,37 @@ fn validate_utility_inputs(
     Ok(())
 }
 
+fn execute_ocr_job(
+    job: &UtilityJobCommand,
+    shmem_file: &File,
+    engine: &dyn ocr_bridge::OcrEngine,
+) -> Result<Vec<u8>, String> {
+    let [UtilityJobInput::Inline(request), UtilityJobInput::SharedMemory { offset, length, .. }] =
+        job.inputs.as_slice()
+    else {
+        return Err("OCR requires request metadata and one shared-memory raster".into());
+    };
+    let region_len = usize::try_from(
+        shmem_file
+            .metadata()
+            .map_err(|error| format!("OCR shared-memory metadata failed: {error}"))?
+            .len(),
+    )
+    .map_err(|_| "OCR shared-memory region is too large".to_string())?;
+    let map = map_shmem_file(shmem_file, region_len)
+        .map_err(|error| format!("OCR shared-memory map failed: {error}"))?;
+    let start = usize::try_from(*offset).map_err(|_| "OCR raster offset is too large")?;
+    let raster_len = usize::try_from(*length).map_err(|_| "OCR raster length is too large")?;
+    let end = start
+        .checked_add(raster_len)
+        .ok_or_else(|| "OCR raster range overflow".to_string())?;
+    let raster = map
+        .get(start..end)
+        .ok_or_else(|| "OCR raster range is out of bounds".to_string())?;
+    ocr_bridge::execute_utility_ocr(engine, request, raster)
+        .map_err(|error| format!("OCR execution failed: {error:?}"))
+}
+
 // ---------------------------------------------------------------------------
 // Typed command handlers
 // ---------------------------------------------------------------------------
@@ -974,4 +1005,78 @@ fn fill_tile_smoke(file: &File) -> Result<Vec<u8>, String> {
         row: 0,
     };
     Ok(encode_tile_ready(&desc))
+}
+
+#[cfg(test)]
+mod utility_ocr_tests {
+    use super::*;
+    use ocr_bridge::{
+        decode_utility_result, encode_utility_request, OcrEngine, OcrPageResult, OcrUtilityRequest,
+        PreprocessOptions,
+    };
+    use sandbox::shmem::SharedRegion;
+
+    struct FixtureEngine;
+
+    impl OcrEngine for FixtureEngine {
+        fn recognize(
+            &self,
+            _raster: &[u8],
+            _width: u32,
+            _height: u32,
+            page_index: u32,
+            _options: &PreprocessOptions,
+        ) -> OcrPageResult {
+            OcrPageResult {
+                page_index,
+                blocks: Vec::new(),
+                full_text: "worker fixture".into(),
+                average_confidence: 0.3,
+                had_existing_text: false,
+                orientation_correction: 0.0,
+                success: true,
+                error: None,
+            }
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "fixture"
+        }
+    }
+
+    #[test]
+    fn worker_reads_only_declared_raster_for_injected_engine() {
+        let mut region = SharedRegion::create(32).unwrap();
+        region.as_mut_slice()[8..24].fill(7);
+        region.flush().unwrap();
+        let request = OcrUtilityRequest {
+            page_index: 4,
+            width: 2,
+            height: 2,
+            language: "eng".into(),
+            options: PreprocessOptions::default(),
+        };
+        let job = UtilityJobCommand {
+            correlation_id: 1,
+            job_id: 2,
+            operation: "ocr".into(),
+            inputs: vec![
+                UtilityJobInput::Inline(encode_utility_request(&request).unwrap()),
+                UtilityJobInput::SharedMemory {
+                    grant_id: [1; 16],
+                    offset: 8,
+                    length: 16,
+                },
+            ],
+        };
+
+        let output = execute_ocr_job(&job, region.file(), &FixtureEngine).unwrap();
+        let result = decode_utility_result(&output).unwrap();
+        assert_eq!(result.page_index, 4);
+        assert_eq!(result.full_text, "worker fixture");
+    }
 }

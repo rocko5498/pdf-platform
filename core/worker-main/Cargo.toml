@@ -23,6 +23,7 @@ sandbox       = { path = "../sandbox" }
 protocol      = { path = "../protocol" }
 diagnostics   = { path = "../diagnostics" }
 pdf-model     = { path = "../pdf-model" }
+ocr-bridge    = { path = "../ocr-bridge" }
 base64        = "0.22"
 
 [dev-dependencies]

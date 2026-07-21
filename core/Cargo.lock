@@ -3505,6 +3505,7 @@ dependencies = [
  "engine-stub",
  "jobs",
  "memmap2",
+ "ocr-bridge",
  "pdf-cos",
  "pdf-model",
  "protocol",

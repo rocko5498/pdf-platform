@@ -140,6 +140,47 @@ pub enum OcrUtilityCodecError {
     InvalidUtf8,
 }
 
+/// Failure while executing a validated OCR request through an injected engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcrUtilityExecutionError {
+    /// Request or result bytes failed bounded codec validation.
+    Codec(OcrUtilityCodecError),
+    /// The shared-memory raster length does not match its declared geometry.
+    RasterLengthMismatch,
+    /// The selected recognition backend is unavailable.
+    EngineUnavailable,
+    /// The backend returned a result for a different page.
+    PageIdentityMismatch,
+}
+
+/// Execute one bounded OCR request without granting the engine document access.
+pub fn execute_utility_ocr(
+    engine: &dyn OcrEngine,
+    request_bytes: &[u8],
+    raster: &[u8],
+) -> Result<Vec<u8>, OcrUtilityExecutionError> {
+    let request = decode_utility_request(request_bytes).map_err(OcrUtilityExecutionError::Codec)?;
+    let expected_length = usize::try_from(u64::from(request.width) * u64::from(request.height) * 4)
+        .map_err(|_| OcrUtilityExecutionError::RasterLengthMismatch)?;
+    if raster.len() != expected_length {
+        return Err(OcrUtilityExecutionError::RasterLengthMismatch);
+    }
+    if !engine.is_available() {
+        return Err(OcrUtilityExecutionError::EngineUnavailable);
+    }
+    let result = engine.recognize(
+        raster,
+        request.width,
+        request.height,
+        request.page_index,
+        &request.options,
+    );
+    if result.page_index != request.page_index {
+        return Err(OcrUtilityExecutionError::PageIdentityMismatch);
+    }
+    encode_utility_result(&result).map_err(OcrUtilityExecutionError::Codec)
+}
+
 /// Encode bounded OCR request metadata for a utility job inline input.
 pub fn encode_utility_request(
     request: &OcrUtilityRequest,
@@ -960,6 +1001,60 @@ fn deflate_store(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FixtureEngine;
+
+    impl OcrEngine for FixtureEngine {
+        fn recognize(
+            &self,
+            _raster: &[u8],
+            _width: u32,
+            _height: u32,
+            page_index: u32,
+            _options: &PreprocessOptions,
+        ) -> OcrPageResult {
+            OcrPageResult {
+                page_index,
+                blocks: Vec::new(),
+                full_text: "fixture".into(),
+                average_confidence: 0.4,
+                had_existing_text: false,
+                orientation_correction: 0.0,
+                success: true,
+                error: None,
+            }
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "fixture"
+        }
+    }
+
+    #[test]
+    fn utility_execution_invokes_injected_engine() {
+        let request = OcrUtilityRequest {
+            page_index: 5,
+            width: 2,
+            height: 2,
+            language: "eng".into(),
+            options: PreprocessOptions::default(),
+        };
+        let output = execute_utility_ocr(
+            &FixtureEngine,
+            &encode_utility_request(&request).unwrap(),
+            &[0; 16],
+        )
+        .unwrap();
+
+        let result = decode_utility_result(&output).unwrap();
+        assert_eq!(result.page_index, 5);
+        assert_eq!(result.full_text, "fixture");
+        assert_eq!(result.average_confidence, 0.4);
+    }
 
     #[test]
     fn normalized_result_round_trips_for_utility_ipc() {
