@@ -14,8 +14,21 @@ Each snapshot stores every `JobSpec` field plus one state: pending, running, com
 
 ## Scope boundary
 
-This slice provides the durable format and load/append API. Scheduler-driven checkpoint timing and utility-worker retry policy remain separate integration work and are not claimed here.
+The durable format, scheduler-driven checkpoint timing, and restart restoration are included.
+Utility-worker IPC and crash retry policy remain separate integration work and are not claimed here.
 
 ## Tests
 
 Round-trip all fields/states, load the latest of multiple snapshots, recover past a torn trailing frame, reject an unsupported version, enforce bounds, and convert running to pending on restore.
+# Scheduler integration
+
+The scheduler actor owns the durable mirror so job events and persisted states have one
+ordering authority. `new_persistent` loads the newest committed snapshot before worker
+startup, rejects a restored live set larger than the configured bound, and schedules only
+unfinished jobs. Completed dependencies count as satisfied; failed or cancelled dependencies
+cause their unfinished dependants to fail without execution.
+
+The actor appends a snapshot when a graph is accepted and whenever a job enters running or a
+terminal state. Runtime write failures are observable `PersistenceFailed` events; they never
+masquerade as successful persistence or change an executor result. IDs remain unique for the
+lifetime of a persistence log, including terminal jobs, to keep recovery unambiguous.

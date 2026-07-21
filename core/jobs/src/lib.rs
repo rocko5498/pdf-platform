@@ -5,7 +5,7 @@
 pub mod persistence;
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -13,6 +13,9 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
+use std::{path::Path, path::PathBuf};
+
+use persistence::{JobSnapshot, PersistedJobState, PersistenceError};
 
 /// Stable identifier for one job within a graph.
 pub type JobId = u64;
@@ -198,6 +201,11 @@ pub enum JobEvent {
         /// Job identifier.
         job: JobId,
     },
+    /// A durable queue checkpoint could not be written.
+    PersistenceFailed {
+        /// Human-readable persistence failure detail.
+        message: String,
+    },
 }
 
 /// Context supplied to a job executor.
@@ -230,6 +238,10 @@ pub enum SchedulerError {
     ZeroCapacity,
     /// A worker or scheduler thread could not be created.
     ThreadSpawn(String),
+    /// Durable queue state could not be loaded.
+    Persistence(PersistenceError),
+    /// Restored unfinished work exceeds the configured live-job bound.
+    RestoreExceedsCapacity,
 }
 
 /// Job submission error.
@@ -299,6 +311,7 @@ pub struct JobScheduler {
     control: Sender<Control>,
     events: Mutex<Receiver<JobEvent>>,
     tokens: Arc<Mutex<HashMap<JobId, CancellationToken>>>,
+    persistent_ids: Option<Arc<Mutex<HashSet<JobId>>>>,
     reservations: Arc<AtomicUsize>,
     capacity: usize,
     scheduler_thread: Option<JoinHandle<()>>,
@@ -310,6 +323,53 @@ impl JobScheduler {
     where
         F: Fn(JobSpec, JobContext) -> Result<(), String> + Send + Sync + 'static,
     {
+        Self::create(worker_count, capacity, executor, None, None)
+    }
+
+    /// Create a scheduler that checkpoints transitions and restores unfinished jobs.
+    pub fn new_persistent<F>(
+        worker_count: usize,
+        capacity: usize,
+        path: impl AsRef<Path>,
+        executor: F,
+    ) -> Result<Self, SchedulerError>
+    where
+        F: Fn(JobSpec, JobContext) -> Result<(), String> + Send + Sync + 'static,
+    {
+        let path = path.as_ref().to_path_buf();
+        let restored = persistence::load_latest(&path).map_err(SchedulerError::Persistence)?;
+        let live = restored
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .graph()
+                    .jobs()
+                    .iter()
+                    .filter(|job| {
+                        matches!(
+                            snapshot.state(job.id),
+                            Some(PersistedJobState::Pending | PersistedJobState::Running)
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if live > capacity {
+            return Err(SchedulerError::RestoreExceedsCapacity);
+        }
+        Self::create(worker_count, capacity, executor, Some(path), restored)
+    }
+
+    fn create<F>(
+        worker_count: usize,
+        capacity: usize,
+        executor: F,
+        persistence_path: Option<PathBuf>,
+        restored: Option<JobSnapshot>,
+    ) -> Result<Self, SchedulerError>
+    where
+        F: Fn(JobSpec, JobContext) -> Result<(), String> + Send + Sync + 'static,
+    {
         if worker_count == 0 || capacity == 0 {
             return Err(SchedulerError::ZeroCapacity);
         }
@@ -318,7 +378,33 @@ impl JobScheduler {
         let (event_tx, event_rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::channel();
         let tokens = Arc::new(Mutex::new(HashMap::new()));
-        let reservations = Arc::new(AtomicUsize::new(0));
+        let restored_live = restored
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .graph()
+                    .jobs()
+                    .iter()
+                    .filter(|job| snapshot.state(job.id) == Some(PersistedJobState::Pending))
+                    .map(|job| job.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let persistent_ids = persistence_path.as_ref().map(|_| {
+            Arc::new(Mutex::new(
+                restored
+                    .as_ref()
+                    .map(|snapshot| snapshot.graph().jobs().iter().map(|job| job.id).collect())
+                    .unwrap_or_default(),
+            ))
+        });
+        {
+            let mut map = tokens.lock().expect("job token lock poisoned");
+            for id in &restored_live {
+                map.insert(*id, CancellationToken::new());
+            }
+        }
+        let reservations = Arc::new(AtomicUsize::new(restored_live.len()));
         let thread_tokens = tokens.clone();
         let thread_reservations = reservations.clone();
         let scheduler_thread = std::thread::Builder::new()
@@ -332,6 +418,8 @@ impl JobScheduler {
                     thread_tokens,
                     thread_reservations,
                     init_tx,
+                    persistence_path,
+                    restored,
                 )
             })
             .map_err(|error| SchedulerError::ThreadSpawn(error.to_string()))?;
@@ -350,6 +438,7 @@ impl JobScheduler {
             control: control_tx,
             events: Mutex::new(event_rx),
             tokens,
+            persistent_ids,
             reservations,
             capacity,
             scheduler_thread: Some(scheduler_thread),
@@ -362,6 +451,12 @@ impl JobScheduler {
         let job_count = jobs.len();
         let job_ids = jobs.iter().map(|job| job.id).collect::<Vec<_>>();
         {
+            if let Some(ids) = &self.persistent_ids {
+                let ids = ids.lock().expect("persistent job id lock poisoned");
+                if let Some(job) = jobs.iter().find(|job| ids.contains(&job.id)) {
+                    return Err(SubmitError::DuplicateJob(job.id));
+                }
+            }
             let mut tokens = self.tokens.lock().expect("job token lock poisoned");
             if let Some(job) = jobs.iter().find(|job| tokens.contains_key(&job.id)) {
                 return Err(SubmitError::DuplicateJob(job.id));
@@ -370,12 +465,22 @@ impl JobScheduler {
             for job in jobs {
                 tokens.insert(job.id, CancellationToken::new());
             }
+            if let Some(ids) = &self.persistent_ids {
+                ids.lock()
+                    .expect("persistent job id lock poisoned")
+                    .extend(job_ids.iter().copied());
+            }
         }
         if self.control.send(Control::Submit(graph)).is_err() {
             self.reservations.fetch_sub(job_count, Ordering::AcqRel);
             let mut tokens = self.tokens.lock().expect("job token lock poisoned");
             for job in job_ids {
                 tokens.remove(&job);
+                if let Some(ids) = &self.persistent_ids {
+                    ids.lock()
+                        .expect("persistent job id lock poisoned")
+                        .remove(&job);
+                }
             }
             return Err(SubmitError::Closed);
         }
@@ -443,6 +548,7 @@ fn reserve(counter: &AtomicUsize, capacity: usize, amount: usize) -> Result<(), 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scheduler_loop(
     worker_count: usize,
     executor: Arc<Executor>,
@@ -451,6 +557,8 @@ fn scheduler_loop(
     tokens: Arc<Mutex<HashMap<JobId, CancellationToken>>>,
     reservations: Arc<AtomicUsize>,
     initialized: Sender<Result<(), String>>,
+    persistence_path: Option<PathBuf>,
+    restored: Option<JobSnapshot>,
 ) {
     let (work_tx, work_rx) = mpsc::channel::<Option<Work>>();
     let work_rx = Arc::new(Mutex::new(work_rx));
@@ -486,6 +594,76 @@ fn scheduler_loop(
     let mut sequence = 0usize;
     let mut running = 0usize;
     let mut shutting_down = false;
+    let mut durable = persistence_path.map(|path| DurableQueue::new(path, restored));
+
+    if let Some(snapshot) = durable.as_ref().and_then(|queue| queue.restored.as_ref()) {
+        let mut blocked = Vec::new();
+        for spec in snapshot.graph().jobs() {
+            if snapshot.state(spec.id) != Some(PersistedJobState::Pending) {
+                continue;
+            }
+            let failed_dependency = spec.dependencies.iter().any(|id| {
+                matches!(
+                    snapshot.state(*id),
+                    Some(PersistedJobState::Failed | PersistedJobState::Cancelled)
+                )
+            });
+            let remaining = spec
+                .dependencies
+                .iter()
+                .filter(|id| snapshot.state(**id) == Some(PersistedJobState::Pending))
+                .count();
+            for dependency in &spec.dependencies {
+                if snapshot.state(*dependency) == Some(PersistedJobState::Pending) {
+                    dependants.entry(*dependency).or_default().push(spec.id);
+                }
+            }
+            if failed_dependency {
+                blocked.push(spec.id);
+            } else if remaining == 0 {
+                ready.push(Ready {
+                    priority: spec.priority,
+                    sequence,
+                    job: spec.id,
+                });
+                sequence += 1;
+            }
+            pending.insert(
+                spec.id,
+                Pending {
+                    spec: spec.clone(),
+                    remaining,
+                    blocked: failed_dependency,
+                },
+            );
+            let _ = events.send(JobEvent::Queued { job: spec.id });
+        }
+        for id in blocked {
+            if let Some(queue) = durable.as_mut() {
+                queue.states.insert(id, PersistedJobState::Failed);
+                queue.checkpoint(&events);
+            }
+            let _ = events.send(JobEvent::Failed {
+                job: id,
+                message: "dependency did not complete".into(),
+            });
+            finish_job(
+                id,
+                false,
+                &mut pending,
+                &dependants,
+                &mut ready,
+                &mut sequence,
+                &events,
+                &tokens,
+                &reservations,
+                &mut durable,
+            );
+        }
+    }
+    if let Some(queue) = durable.as_mut() {
+        queue.restored = None;
+    }
 
     loop {
         while let Ok(done) = done_rx.try_recv() {
@@ -502,6 +680,19 @@ fn scheduler_loop(
                 JobEvent::Completed { job: done.job }
             };
             let _ = events.send(event);
+            if let Some(queue) = durable.as_mut() {
+                queue.states.insert(
+                    done.job,
+                    if done.cancelled {
+                        PersistedJobState::Cancelled
+                    } else if success {
+                        PersistedJobState::Completed
+                    } else {
+                        PersistedJobState::Failed
+                    },
+                );
+                queue.checkpoint(&events);
+            }
             finish_job(
                 done.job,
                 success,
@@ -512,11 +703,19 @@ fn scheduler_loop(
                 &events,
                 &tokens,
                 &reservations,
+                &mut durable,
             );
         }
 
         match controls.recv_timeout(Duration::from_millis(2)) {
             Ok(Control::Submit(graph)) if !shutting_down => {
+                if let Some(queue) = durable.as_mut() {
+                    for spec in graph.jobs() {
+                        queue.jobs.push(spec.clone());
+                        queue.states.insert(spec.id, PersistedJobState::Pending);
+                    }
+                    queue.checkpoint(&events);
+                }
                 for spec in graph.into_jobs() {
                     let _ = events.send(JobEvent::Queued { job: spec.id });
                     for dependency in &spec.dependencies {
@@ -573,6 +772,7 @@ fn scheduler_loop(
                     &events,
                     &tokens,
                     &reservations,
+                    &mut durable,
                 );
                 continue;
             }
@@ -584,6 +784,10 @@ fn scheduler_loop(
                 .is_ok()
             {
                 running += 1;
+                if let Some(queue) = durable.as_mut() {
+                    queue.states.insert(item.job, PersistedJobState::Running);
+                    queue.checkpoint(&events);
+                }
             }
         }
 
@@ -637,6 +841,7 @@ fn finish_job(
     events: &Sender<JobEvent>,
     tokens: &Arc<Mutex<HashMap<JobId, CancellationToken>>>,
     reservations: &Arc<AtomicUsize>,
+    durable: &mut Option<DurableQueue>,
 ) {
     if pending.remove(&job).is_none() {
         return;
@@ -663,6 +868,10 @@ fn finish_job(
         }
     }
     for dependant in blocked {
+        if let Some(queue) = durable.as_mut() {
+            queue.states.insert(dependant, PersistedJobState::Failed);
+            queue.checkpoint(events);
+        }
         let _ = events.send(JobEvent::Failed {
             job: dependant,
             message: "dependency did not complete".into(),
@@ -677,7 +886,45 @@ fn finish_job(
             events,
             tokens,
             reservations,
+            durable,
         );
+    }
+}
+
+struct DurableQueue {
+    path: PathBuf,
+    jobs: Vec<JobSpec>,
+    states: HashMap<JobId, PersistedJobState>,
+    restored: Option<JobSnapshot>,
+}
+
+impl DurableQueue {
+    fn new(path: PathBuf, restored: Option<JobSnapshot>) -> Self {
+        let (jobs, states) = restored
+            .clone()
+            .map(|snapshot| {
+                let (graph, states) = snapshot.into_parts();
+                (graph.into_jobs(), states)
+            })
+            .unwrap_or_default();
+        Self {
+            path,
+            jobs,
+            states,
+            restored,
+        }
+    }
+
+    fn checkpoint(&self, events: &Sender<JobEvent>) {
+        let result = JobGraph::new(self.jobs.clone())
+            .map_err(PersistenceError::Graph)
+            .and_then(|graph| JobSnapshot::new(graph, self.states.clone()))
+            .and_then(|snapshot| persistence::append_snapshot(&self.path, &snapshot));
+        if let Err(error) = result {
+            let _ = events.send(JobEvent::PersistenceFailed {
+                message: format!("{error:?}"),
+            });
+        }
     }
 }
 
@@ -835,6 +1082,109 @@ mod tests {
             }
         }
         scheduler.shutdown();
+    }
+
+    #[test]
+    fn persistent_scheduler_restores_only_unfinished_jobs() {
+        use persistence::{append_snapshot, load_latest, JobSnapshot, PersistedJobState};
+        use std::collections::HashMap;
+
+        let path = temp_path();
+        let graph = JobGraph::new(vec![job(1), job(2).depends_on(1)]).unwrap();
+        append_snapshot(
+            &path,
+            &JobSnapshot::new(
+                graph,
+                HashMap::from([
+                    (1, PersistedJobState::Completed),
+                    (2, PersistedJobState::Pending),
+                ]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let seen = ran.clone();
+        let scheduler = JobScheduler::new_persistent(1, 4, &path, move |spec, _| {
+            seen.lock().unwrap().push(spec.id);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(terminal_events(&scheduler, 1), 1);
+        scheduler.shutdown();
+        assert_eq!(*ran.lock().unwrap(), vec![2]);
+        assert_eq!(
+            load_latest(&path).unwrap().unwrap().state(2),
+            Some(PersistedJobState::Completed)
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn persistent_scheduler_rejects_restore_over_capacity() {
+        use persistence::{append_snapshot, JobSnapshot, PersistedJobState};
+        use std::collections::HashMap;
+
+        let path = temp_path();
+        let graph = JobGraph::new(vec![job(1), job(2)]).unwrap();
+        append_snapshot(
+            &path,
+            &JobSnapshot::new(
+                graph,
+                HashMap::from([
+                    (1, PersistedJobState::Pending),
+                    (2, PersistedJobState::Pending),
+                ]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let result = JobScheduler::new_persistent(1, 1, &path, |_spec, _| Ok(()));
+        assert!(matches!(
+            result,
+            Err(SchedulerError::RestoreExceedsCapacity)
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn persistent_scheduler_fails_dependant_of_failed_restored_job() {
+        use persistence::{append_snapshot, JobSnapshot, PersistedJobState};
+        use std::collections::HashMap;
+
+        let path = temp_path();
+        append_snapshot(
+            &path,
+            &JobSnapshot::new(
+                JobGraph::new(vec![job(1), job(2).depends_on(1)]).unwrap(),
+                HashMap::from([
+                    (1, PersistedJobState::Failed),
+                    (2, PersistedJobState::Pending),
+                ]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let scheduler = JobScheduler::new_persistent(1, 2, &path, |_spec, _| {
+            panic!("blocked job must not execute")
+        })
+        .unwrap();
+        assert_eq!(terminal_events(&scheduler, 1), 1);
+        scheduler.shutdown();
+        assert_eq!(
+            persistence::load_latest(&path).unwrap().unwrap().state(2),
+            Some(PersistedJobState::Failed)
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    fn temp_path() -> std::path::PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "pdf-platform-scheduler-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     fn terminal_events(scheduler: &JobScheduler, expected: usize) -> usize {

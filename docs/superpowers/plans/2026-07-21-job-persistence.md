@@ -31,3 +31,9 @@
 ### Task 3: Honest status documentation
 
 - [x] Update the tracker to distinguish format completion from scheduler checkpoint integration.
+# Scheduler checkpoint integration
+
+- [x] Add failing tests for restored unfinished jobs, completed dependency handling, capacity, and
+  automatic terminal checkpoints.
+- [x] Add a persistent scheduler constructor and actor-owned durable state mirror.
+- [x] Surface checkpoint failures as diagnostics and verify focused plus workspace test strata.

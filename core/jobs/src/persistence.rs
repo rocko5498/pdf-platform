@@ -62,6 +62,10 @@ impl JobSnapshot {
     pub fn state(&self, job: JobId) -> Option<PersistedJobState> {
         self.states.get(&job).copied()
     }
+
+    pub(crate) fn into_parts(self) -> (JobGraph, HashMap<JobId, PersistedJobState>) {
+        (self.graph, self.states)
+    }
 }
 
 /// Job persistence failure.
