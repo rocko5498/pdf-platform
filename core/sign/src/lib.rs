@@ -357,6 +357,41 @@ pub fn validate_signature(
     }
 }
 
+/// Refuse to report `Valid` when post-signing change analysis had nothing to
+/// examine. [FR-SIG-1, PRIN-6, MET-FEAT-6]
+///
+/// [`validate_signature`] decides "no illegal post-signing changes" from the
+/// cross-reference data it is handed. A caller that cannot supply that data
+/// (because xref extraction is unimplemented, or the revision history could
+/// not be read) passes empty slices, and every change check then trivially
+/// passes: `analyze_docmdp_changes` finds nothing, and `xref_changed` is false
+/// over an empty iterator. The verdict falls through to `Valid`.
+///
+/// That is a false valid. A ByteRange hash proves only that the *signed* bytes
+/// are intact; illegal post-signing edits arrive as an appended incremental
+/// update, which leaves that hash matching, and the xref/DocMDP analysis is
+/// what catches them. Callers without that evidence pass
+/// `evidence_available: false` to convert such a verdict to `Indeterminate`.
+///
+/// This only ever moves `Valid` to `Indeterminate`. `Invalid` is never
+/// softened: a proven failure stays a failure regardless of missing evidence.
+pub fn require_change_evidence(
+    report: ValidationReport,
+    evidence_available: bool,
+) -> ValidationReport {
+    if evidence_available || report.status != SignatureStatus::Valid {
+        return report;
+    }
+    ValidationReport {
+        status: SignatureStatus::Indeterminate,
+        explanation: "Signed bytes are intact, but post-signing changes could not be \
+                      examined (no cross-reference data was available), so this \
+                      signature cannot be reported as valid"
+            .to_string(),
+        ..report
+    }
+}
+
 // ---------------------------------------------------------------------------
 // M10: PKCS#11 hardware token signing [FR-SIG-3, SDS §2.8]
 // ---------------------------------------------------------------------------
@@ -746,6 +781,64 @@ mod tests {
         let h1 = hash_byte_ranges(file, &[0, 4]);
         let h2 = hash_byte_ranges(file, &[5, 4]);
         assert_ne!(h1, h2, "different ranges should produce different hashes");
+    }
+
+    fn report_with(status: SignatureStatus) -> ValidationReport {
+        ValidationReport {
+            status,
+            explanation: "original explanation".into(),
+            signature: SignatureInfo {
+                name: String::new(),
+                location: String::new(),
+                reason: String::new(),
+                date: String::new(),
+                filter: String::new(),
+                sub_filter: String::new(),
+                byte_range: vec![0, 4],
+                contents: vec![1, 2, 3],
+                docmdp_level: None,
+                byte_offset: 0,
+                obj_num: 1,
+                page_index: None,
+            },
+            post_signing_changes: Vec::new(),
+            signer_trusted: false,
+            integrity_check_passed: true,
+            hash_match: true,
+            validation_time: 0,
+        }
+    }
+
+    #[test]
+    fn valid_becomes_indeterminate_when_no_change_evidence_was_available() {
+        // A ByteRange hash only proves the signed bytes are intact. Illegal
+        // post-signing edits arrive as an appended incremental update, which
+        // leaves that hash matching. Claiming "no illegal post-signing
+        // changes" without having examined any is a false valid.
+        let report = require_change_evidence(report_with(SignatureStatus::Valid), false);
+        assert_eq!(report.status, SignatureStatus::Indeterminate);
+        assert!(
+            report.explanation.contains("post-signing"),
+            "must say what could not be checked: {}",
+            report.explanation
+        );
+    }
+
+    #[test]
+    fn valid_is_left_alone_when_change_evidence_was_available() {
+        let report = require_change_evidence(report_with(SignatureStatus::Valid), true);
+        assert_eq!(report.status, SignatureStatus::Valid);
+        assert_eq!(report.explanation, "original explanation");
+    }
+
+    #[test]
+    fn an_invalid_verdict_is_never_softened_by_missing_evidence() {
+        let report = require_change_evidence(report_with(SignatureStatus::Invalid), false);
+        assert_eq!(
+            report.status,
+            SignatureStatus::Invalid,
+            "missing evidence must never upgrade a proven failure"
+        );
     }
 
     #[test]

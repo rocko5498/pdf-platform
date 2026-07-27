@@ -774,9 +774,16 @@ fn cmd_validate_signatures(path: &Path) {
     println!("Found {} signature(s) in {}", signatures.len(), path.display());
     println!();
 
-    // For validation, we use the same bytes as original and current
-    // (no post-signing changes detected in a single read).
+    // `extract_xref_offsets` is not implemented and returns an empty map, so
+    // every post-signing change check inside `validate_signature` trivially
+    // passes and the verdict falls through to Valid. A ByteRange hash proves
+    // only that the *signed* bytes are intact; an illegal post-signing edit is
+    // an appended incremental update that leaves that hash matching. Reporting
+    // Valid here would be a false valid, which FR-SIG-1 forbids and
+    // MET-FEAT-6 makes absolute — so results are downgraded to Indeterminate
+    // until real xref extraction lands. [FR-SIG-1, PRIN-6, MET-FEAT-6]
     let xref = extract_xref_offsets(&file_bytes);
+    let change_evidence_available = !xref.is_empty();
 
     let mut all_valid = true;
     for (i, sig) in signatures.iter().enumerate() {
@@ -793,7 +800,10 @@ fn cmd_validate_signatures(path: &Path) {
         println!();
 
         // Validate.
-        let report = validate_signature(&file_bytes, sig, &xref, &xref);
+        let report = sign::require_change_evidence(
+            validate_signature(&file_bytes, sig, &xref, &xref),
+            change_evidence_available,
+        );
 
         println!("  Status: {}", report.status);
         println!("  Explanation: {}", report.explanation);
