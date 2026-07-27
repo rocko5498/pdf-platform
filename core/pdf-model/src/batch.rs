@@ -270,19 +270,23 @@ fn execute_step(
             optimize(input, output, prof)?;
             Ok(vec![output.clone()])
         }
-        BatchStep::Watermark { input, text, output } => {
-            // Stamp module generates content streams; for now copy the file
-            // and note that full page injection requires coordinator wiring.
-            std::fs::copy(input, output)
-                .map_err(|e| format!("copy failed: {e}"))?;
-            eprintln!("Watermark '{text}' applied to {}", output.display());
-            Ok(vec![output.clone()])
-        }
-        BatchStep::BatesNumber { input, start: _, width: _, output } => {
-            std::fs::copy(input, output)
-                .map_err(|e| format!("copy failed: {e}"))?;
-            Ok(vec![output.clone()])
-        }
+        // These two previously copied the input to the output and reported
+        // success, so a batch run emitted an unstamped file and called it
+        // stamped. `stamp` generates content streams but cannot inject them
+        // into a page; that is a coordinator mutation path (ADR-013). Until
+        // it is wired through, refusing with a reason is the required
+        // behaviour: correctness before capability, and never a false
+        // success. [PRIN-1, PRIN-6, GR-8, UX-ERR-3, FR-STAMP]
+        BatchStep::Watermark { text, .. } => Err(format!(
+            "watermark '{text}' not applied: batch stamping needs the \
+             coordinator page injection path, which is not wired up. \
+             Refusing rather than writing an unstamped file."
+        )),
+        BatchStep::BatesNumber { start, width, .. } => Err(format!(
+            "Bates numbering from {start} (width {width}) not applied: batch \
+             stamping needs the coordinator page injection path, which is not \
+             wired up. Refusing rather than writing an unnumbered file."
+        )),
     }
 }
 
@@ -340,9 +344,17 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Replaces `batch_watermark_copies_file`, which asserted that watermarking
+    // produced a byte-identical copy — i.e. it locked in a false success. A
+    // step that cannot stamp must refuse and leave no misleading artifact.
+    // [PRIN-1, PRIN-6, GR-8, UX-ERR-3]
+
     #[test]
-    fn batch_watermark_copies_file() {
-        let dir = std::env::temp_dir().join("pdf_platform_batch_test");
+    fn watermark_refuses_instead_of_emitting_an_unstamped_copy() {
+        let dir = std::env::temp_dir().join("pdf_platform_batch_watermark");
+        // Clear first: a previous failing run panics before its cleanup, and
+        // a stale artifact would mask exactly what this test checks.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let src = dir.join("src.pdf");
         let out = dir.join("stamped.pdf");
@@ -353,10 +365,43 @@ mod tests {
             text: "CONFIDENTIAL".into(),
             output: out.clone(),
         };
-        let result = execute_step(&step, &default_optimize).unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(out.exists());
-        assert_eq!(std::fs::read(&out).unwrap(), b"fake pdf content");
+        let error = execute_step(&step, &default_optimize)
+            .expect_err("an unimplemented stamp must not report success");
+        assert!(
+            error.contains("page injection"),
+            "the refusal must say why: {error}"
+        );
+        assert!(
+            !out.exists(),
+            "a refused step must not leave an unstamped file behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bates_number_refuses_instead_of_emitting_an_unnumbered_copy() {
+        let dir = std::env::temp_dir().join("pdf_platform_batch_bates");
+        // Clear first: a previous failing run panics before its cleanup, and
+        // a stale artifact would mask exactly what this test checks.
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("src.pdf");
+        let out = dir.join("numbered.pdf");
+        std::fs::write(&src, b"fake pdf content").unwrap();
+
+        let step = BatchStep::BatesNumber {
+            input: src.clone(),
+            start: 1,
+            width: 6,
+            output: out.clone(),
+        };
+        let error = execute_step(&step, &default_optimize)
+            .expect_err("an unimplemented stamp must not report success");
+        assert!(
+            error.contains("page injection"),
+            "the refusal must say why: {error}"
+        );
+        assert!(!out.exists(), "a refused step must leave no artifact");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

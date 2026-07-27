@@ -651,18 +651,25 @@ fn cmd_stamp(path: &Path, rest: &[String]) {
         process::exit(1);
     }
 
-    // For now, report what would be stamped (actual PDF patching requires
-    // the full page-content injection pipeline which is a coordinator task).
+    // This previously printed "Wrote <out>" and exited 0 without ever opening
+    // the input or creating the output — a flat false success. Page-content
+    // injection is a coordinator mutation path (ADR-013) that is not wired up
+    // here, so the command must refuse and say so rather than claim a file it
+    // did not write. [PRIN-1, PRIN-6, GR-8, UX-ERR-3, FR-STAMP]
     if let Some(ref t) = text {
-        println!("Stamp '{}' on all pages of {}", t, path.display());
-        println!("Font size: {font_size}, position: bottom-center");
+        eprintln!("error: cannot stamp '{t}' on {}", path.display());
     } else if let Some(start) = bates_start {
-        println!("Bates stamp starting at {start} (width {bates_width}) on all pages of {}",
-            path.display());
+        eprintln!(
+            "error: cannot apply Bates numbering from {start} (width {bates_width}) to {}",
+            path.display()
+        );
     }
-    println!("Wrote {}", out.display());
-    eprintln!("Note: stamp CLI is a content-stream generator; full page injection is pending coordinator integration.");
-    process::exit(0);
+    eprintln!(
+        "The stamp module generates content streams (font size {font_size}), but injecting \
+         them into pages requires the coordinator mutation path, which is not wired up yet."
+    );
+    eprintln!("No file was written to {}.", out.display());
+    process::exit(1);
 }
 
 
