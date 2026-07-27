@@ -1,0 +1,12 @@
+[package]
+name        = "check-ui-registry"
+description = "ADR-032 conformance gate: the shortcut/menu registry is the interface-stability contract, and no shortcut may be bound in C++ source. [ADR-032, ADR-030, DS-CONV-4, RQA-1, RQA-2]"
+version.workspace = true
+edition.workspace = true
+workspace = "../../core"
+
+[dependencies]
+# DEP-1: MIT OR Apache-2.0 (allowlisted); already present in core/Cargo.lock via
+# existing Tier-1 crates, so no new supply-chain surface. Exit seam: only this
+# crate parses the registry, so swapping parsers touches one file.
+toml = "0.8"

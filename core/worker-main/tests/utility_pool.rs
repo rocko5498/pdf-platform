@@ -212,7 +212,11 @@ fn ocr_job_reaches_the_dispatch_handler_not_the_unsupported_fallback() {
     // worker's real OCR engine resolves, it must not be the "unsupported
     // operation" fallback that a missing match arm would produce.
     loop {
-        match scheduler.recv_event_timeout(Duration::from_secs(10)) {
+        // Must exceed UtilityPool::response_timeout (30s), or this races the
+        // pool and reports "timed out" for a job the pool would have failed
+        // honestly. Debug-build OCR preprocessing is megapixel work in
+        // unoptimized loops, so 10s was not enough. [ADR-022]
+        match scheduler.recv_event_timeout(Duration::from_secs(60)) {
             Some(JobEvent::Completed { job: 21 }) => break,
             Some(JobEvent::Failed { job: 21, message }) => {
                 assert!(

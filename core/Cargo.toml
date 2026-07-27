@@ -29,6 +29,7 @@ members = [
     "cli",
     # Dev/CI tooling
     "../tools/corpus-diff",
+    "../tools/check-ui-registry",
     "benchmarks",
 ]
 

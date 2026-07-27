@@ -127,7 +127,11 @@ fn ocr_dispatch_reaches_render_recognize_and_decode() {
 
     let mut dispatch_failed_message = None;
     loop {
-        match scheduler.recv_event_timeout(Duration::from_secs(20)) {
+        // Must exceed UtilityPool::response_timeout (30s), or this races the
+        // pool and reports "timed out" for a job the pool would have failed
+        // honestly. Debug-build OCR preprocessing is megapixel work in
+        // unoptimized loops, so 20s was not enough. [ADR-022]
+        match scheduler.recv_event_timeout(Duration::from_secs(60)) {
             Some(JobEvent::Completed { job: 1 }) => break,
             Some(JobEvent::Failed { job: 1, message }) => {
                 dispatch_failed_message = Some(message);
@@ -243,7 +247,11 @@ fn ocr_job_is_idempotent_and_retries_after_simulated_worker_loss() {
         .unwrap();
 
     loop {
-        match scheduler.recv_event_timeout(Duration::from_secs(20)) {
+        // Must exceed UtilityPool::response_timeout (30s), or this races the
+        // pool and reports "timed out" for a job the pool would have failed
+        // honestly. Debug-build OCR preprocessing is megapixel work in
+        // unoptimized loops, so 20s was not enough. [ADR-022]
+        match scheduler.recv_event_timeout(Duration::from_secs(60)) {
             Some(JobEvent::Completed { job: 1 }) | Some(JobEvent::Failed { job: 1, .. }) => break,
             Some(_) => {}
             None => panic!("timed out waiting for the retried ocr job"),
