@@ -1,0 +1,8 @@
+[package]
+name        = "check-citations"
+description = "G-1 traceability gate: every FR/NFR/ADR/DS/MET citation in source must name an identifier that actually exists in the canonical docs. [G-1, AI-2, NFR-MAINT-2]"
+version.workspace = true
+edition.workspace = true
+workspace = "../../core"
+
+# No dependencies: std only.

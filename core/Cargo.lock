@@ -251,6 +251,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "check-citations"
+version = "0.1.0"
+
+[[package]]
 name = "check-ui-registry"
 version = "0.1.0"
 dependencies = [

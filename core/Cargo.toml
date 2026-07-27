@@ -30,6 +30,7 @@ members = [
     # Dev/CI tooling
     "../tools/corpus-diff",
     "../tools/check-ui-registry",
+    "../tools/check-citations",
     "benchmarks",
 ]
 
