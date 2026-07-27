@@ -31,13 +31,46 @@ unsafe impl Sync for PdfiumEngine {}
 static INIT: Once = Once::new();
 static mut PDFIUM_PTR: *const Pdfium = std::ptr::null();
 
+/// Retry a fallible bind with linear backoff, returning the last error.
+///
+/// Binding PDFium is not reliably idempotent across processes on a cold
+/// cache: when several sandboxed workers start at once, `LoadLibraryExW`
+/// on the shared `pdfium.dll` can fail with `ERROR_SHARING_VIOLATION` (32)
+/// even though the file is complete and no process holds it open. Observed
+/// as `fault_injection` passing 8/8 serially but 5/8 in parallel. A worker
+/// that fails here aborts, which the coordinator can only report as
+/// "transport disconnected". [ADR-022, ADR-005]
+fn retry_bind<T, E>(
+    attempts: u32,
+    delay: std::time::Duration,
+    mut bind: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut last = None;
+    for attempt in 0..attempts.max(1) {
+        match bind() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                last = Some(error);
+                if attempt + 1 < attempts {
+                    std::thread::sleep(delay * (attempt + 1));
+                }
+            }
+        }
+    }
+    Err(last.expect("at least one attempt always runs"))
+}
+
 fn pdfium() -> &'static Pdfium {
     // SAFETY: INIT ensures this runs exactly once. The pointer is written
     // before any reader can see it (Once::call_once is a barrier).
     unsafe {
         INIT.call_once(|| {
-            let pdfium = pdfium_auto::bind_pdfium_silent()
-                .expect("failed to initialize PDFium");
+            let pdfium = retry_bind(
+                5,
+                std::time::Duration::from_millis(40),
+                pdfium_auto::bind_pdfium_silent,
+            )
+            .expect("failed to initialize PDFium");
             let leaked = Box::leak(Box::new(pdfium));
             PDFIUM_PTR = leaked as *const Pdfium;
         });
@@ -419,6 +452,50 @@ fn build_line(line_index: u32, chars: &[(char, f32, f32, f32, f32)]) -> TextLine
         width: x2 - x,
         height: y2 - y,
         spans,
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::retry_bind;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    #[test]
+    fn returns_immediately_when_the_first_attempt_succeeds() {
+        let calls = Cell::new(0);
+        let result: Result<u8, ()> = retry_bind(5, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Ok(7)
+        });
+        assert_eq!(result, Ok(7));
+        assert_eq!(calls.get(), 1, "a successful bind must not be retried");
+    }
+
+    #[test]
+    fn retries_a_transient_failure_until_it_succeeds() {
+        let calls = Cell::new(0);
+        let result: Result<u8, &str> = retry_bind(5, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err("sharing violation")
+            } else {
+                Ok(1)
+            }
+        });
+        assert_eq!(result, Ok(1));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn gives_up_after_the_attempt_budget_and_reports_the_last_error() {
+        let calls = Cell::new(0);
+        let result: Result<u8, u32> = retry_bind(4, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Err(calls.get())
+        });
+        assert_eq!(calls.get(), 4, "must not exceed its attempt budget");
+        assert_eq!(result, Err(4), "must surface the final error, not the first");
     }
 }
 
