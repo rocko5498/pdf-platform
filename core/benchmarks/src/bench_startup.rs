@@ -67,7 +67,7 @@ fn bench_cold_start(c: &mut Criterion) {
                 let start = Instant::now();
                 let mut child = spawn_worker_with_attachments(
                     &worker,
-                    &SpawnAttachments { doc: Some(&doc_file), shmem: Some(region.file()), password: None },
+                    &SpawnAttachments { doc: Some(&doc_file), shmem: Some(region.file()), output: None, password: None },
                     &[],
                 )
                 .unwrap();
@@ -119,7 +119,7 @@ fn bench_first_page(c: &mut Criterion) {
                 let start = Instant::now();
                 let mut child = spawn_worker_with_attachments(
                     &worker,
-                    &SpawnAttachments { doc: Some(&doc_file), shmem: Some(region.file()), password: None },
+                    &SpawnAttachments { doc: Some(&doc_file), shmem: Some(region.file()), output: None, password: None },
                     &[],
                 )
                 .unwrap();
@@ -174,7 +174,7 @@ fn bench_cold_start_to_first_pixel(c: &mut Criterion) {
                 let region = SharedRegion::create(TILE_RGBA8_BYTES).unwrap();
                 let mut child = spawn_worker_with_attachments(
                     &worker,
-                    &SpawnAttachments { doc: Some(&doc_file), shmem: Some(region.file()), password: None },
+                    &SpawnAttachments { doc: Some(&doc_file), shmem: Some(region.file()), output: None, password: None },
                     &[],
                 )
                 .unwrap();

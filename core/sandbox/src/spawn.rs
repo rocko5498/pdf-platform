@@ -36,6 +36,10 @@ pub const ENV_DOC_HANDLE: &str = "PDF_PLATFORM_DOC_HANDLE";
 pub const ENV_SHMEM_FD: &str = "PDF_PLATFORM_SHMEM_FD";
 /// Windows: inherited shared-memory HANDLE as decimal integer.
 pub const ENV_SHMEM_HANDLE: &str = "PDF_PLATFORM_SHMEM_HANDLE";
+/// Unix: inherited broker-created output FD.
+pub const ENV_OUTPUT_FD: &str = "PDF_PLATFORM_OUTPUT_FD";
+/// Windows: inherited broker-created output HANDLE.
+pub const ENV_OUTPUT_HANDLE: &str = "PDF_PLATFORM_OUTPUT_HANDLE";
 /// Password for encrypted documents (UTF-8, passed as env var).
 pub const ENV_DOC_PASSWORD: &str = "PDF_PLATFORM_DOC_PASSWORD";
 
@@ -47,6 +51,8 @@ pub struct SpawnAttachments<'a> {
     pub doc: Option<&'a File>,
     /// Shared tile buffer file.
     pub shmem: Option<&'a File>,
+    /// Broker-created candidate output file.
+    pub output: Option<&'a File>,
     /// Password for encrypted documents (passed as env var, not FD).
     pub password: Option<&'a str>,
 }
@@ -56,6 +62,7 @@ impl<'a> Default for SpawnAttachments<'a> {
         Self {
             doc: None,
             shmem: None,
+            output: None,
             password: None,
         }
     }
@@ -97,6 +104,7 @@ pub fn spawn_utility_worker_with_shmem(worker_exe: &Path, shmem: &File) -> io::R
         &SpawnAttachments {
             doc: None,
             shmem: Some(shmem),
+            output: None,
             password: None,
         },
         &[],
@@ -118,6 +126,28 @@ pub fn spawn_utility_worker_with_attachments(
         &SpawnAttachments {
             doc: Some(doc),
             shmem: Some(shmem),
+            output: None,
+            password,
+        },
+        &[],
+        SpawnPriority::UtilityLow,
+    )
+}
+
+/// Spawn a low-priority utility worker with source, shared-memory, and candidate handles.
+pub fn spawn_utility_worker_with_io(
+    worker_exe: &Path,
+    doc: &File,
+    shmem: &File,
+    output: &File,
+    password: Option<&str>,
+) -> io::Result<WorkerChild> {
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments {
+            doc: Some(doc),
+            shmem: Some(shmem),
+            output: Some(output),
             password,
         },
         &[],
@@ -150,6 +180,7 @@ pub fn spawn_worker_with_file(
         &SpawnAttachments {
             doc: Some(doc),
             shmem: None,
+            output: None,
             password,
         },
         extra_env,
@@ -210,6 +241,22 @@ pub fn adopt_shmem_file() -> io::Result<Option<File>> {
     #[cfg(windows)]
     {
         return windows::adopt_file_from_env(ENV_SHMEM_HANDLE);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(None)
+    }
+}
+
+/// Adopt the inherited broker-created output file, if attached.
+pub fn adopt_output_file() -> io::Result<Option<File>> {
+    #[cfg(unix)]
+    {
+        return unix::adopt_file_from_env(ENV_OUTPUT_FD);
+    }
+    #[cfg(windows)]
+    {
+        return windows::adopt_file_from_env(ENV_OUTPUT_HANDLE);
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -352,6 +399,7 @@ mod unix {
             .env_remove(ENV_IPC_PIPE)
             .env_remove(ENV_DOC_HANDLE)
             .env_remove(ENV_SHMEM_HANDLE)
+            .env_remove(ENV_OUTPUT_HANDLE)
             .env_remove("PDF_PLATFORM_DOC_PATH");
         apply_extra_env(&mut cmd, extra_env);
 
@@ -364,6 +412,11 @@ mod unix {
             set_inherited_fd(&mut cmd, ENV_SHMEM_FD, file)?;
         } else {
             cmd.env_remove(ENV_SHMEM_FD);
+        }
+        if let Some(file) = attachments.output {
+            set_inherited_fd(&mut cmd, ENV_OUTPUT_FD, file)?;
+        } else {
+            cmd.env_remove(ENV_OUTPUT_FD);
         }
         if let Some(pw) = attachments.password {
             cmd.env(ENV_DOC_PASSWORD, pw);
@@ -471,6 +524,7 @@ mod windows {
             .env_remove(ENV_IPC_SOCK)
             .env_remove(ENV_DOC_FD)
             .env_remove(ENV_SHMEM_FD)
+            .env_remove(ENV_OUTPUT_FD)
             .env_remove("PDF_PLATFORM_DOC_PATH");
         apply_extra_env(&mut cmd, extra_env);
 
@@ -483,6 +537,11 @@ mod windows {
             set_inherited_handle(&mut cmd, ENV_SHMEM_HANDLE, file)?;
         } else {
             cmd.env_remove(ENV_SHMEM_HANDLE);
+        }
+        if let Some(file) = attachments.output {
+            set_inherited_handle(&mut cmd, ENV_OUTPUT_HANDLE, file)?;
+        } else {
+            cmd.env_remove(ENV_OUTPUT_HANDLE);
         }
         if let Some(pw) = attachments.password {
             cmd.env(ENV_DOC_PASSWORD, pw);

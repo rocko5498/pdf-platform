@@ -152,6 +152,7 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
         &SpawnAttachments {
             doc: Some(&doc_file),
             shmem: Some(region.file()),
+            output: None,
             password: pw,
         },
         &[],
