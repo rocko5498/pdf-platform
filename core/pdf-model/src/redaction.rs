@@ -355,7 +355,17 @@ pub fn verify_redaction(
                 }
             }
         } else {
-            items_confirmed += 1;
+            // No extracted text for this page. This previously counted as an
+            // item "confirmed removed" — absence of evidence taken as proof.
+            // SDS §3.3.1 requires verification to re-extract and assert
+            // absence; with nothing to inspect, nothing can be asserted, and a
+            // redaction verifier must never pass by default.
+            // [FR-RED-3, FR-RED-4, MET-FEAT-5, PRIN-6, GR-8]
+            risks.push(format!(
+                "Page {}: could not verify removal — no extracted text was \
+                 available to re-inspect after redaction",
+                removal.page_index
+            ));
         }
 
         // Check serialized output bytes for remaining redacted text.
@@ -591,6 +601,39 @@ mod tests {
         let result = verify_redaction(&removals, &text_model, None);
         assert!(result.passed);
         assert!(result.remaining_risks.is_empty());
+    }
+
+    #[test]
+    fn verification_cannot_pass_without_evidence_for_a_redacted_page() {
+        // The `else` branch counted a missing text-model entry as an item
+        // "confirmed removed" — absence of evidence treated as proof. In the
+        // real path this fired for every page: the coordinator invalidates the
+        // text cache when it applies the redaction group, so the map it then
+        // hands here is always empty, and verification passed vacuously.
+        // Redaction correctness is an absolute metric.
+        // [FR-RED-3, FR-RED-4, MET-FEAT-5, SDS §3.3.1, PRIN-6, GR-8]
+        let removals = vec![RemovalRecord {
+            page_index: 0,
+            rect: Rect::new(10.0, 20.0, 100.0, 50.0),
+            removed: vec![RemovedContent::Text {
+                char_count: 6,
+                text_sample: "secret".into(),
+            }],
+        }];
+
+        let result = verify_redaction(&removals, &HashMap::new(), None);
+        assert!(
+            !result.passed,
+            "no evidence must never verify as removed: {result:?}"
+        );
+        assert!(
+            result
+                .remaining_risks
+                .iter()
+                .any(|r| r.to_lowercase().contains("could not")),
+            "the risk must say verification was not possible: {:?}",
+            result.remaining_risks
+        );
     }
 
     #[test]

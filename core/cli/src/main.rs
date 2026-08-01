@@ -749,7 +749,31 @@ fn cmd_redact_by_term(path: &Path, rest: &[String]) {
             }
             println!();
             println!("{}", result.report);
-            process::exit(0);
+
+            // This path applies the redaction group to the in-memory overlay
+            // and never serializes it: there is no output argument and no save
+            // call, so the document on disk is byte-identical afterwards and
+            // still contains the term. Previously this exited 0 regardless,
+            // including when verification failed, so a pipeline read it as a
+            // completed redaction. FR-RED-4 forbids a cosmetic redaction path
+            // existing at all; until saving and SDS §3.3.1 verification (re-
+            // extract from the *serialized* result) are wired up, the only
+            // honest outcome is to refuse.
+            // [FR-RED-1..6, MET-FEAT-5, SDS §3.3.1, PRIN-1, PRIN-6, GR-8]
+            if result.regions_redacted == 0 {
+                println!("No matches found; document unchanged.");
+                process::exit(0);
+            }
+            eprintln!();
+            eprintln!(
+                "NOT REDACTED: {} region(s) matched, but no output was written and",
+                result.regions_redacted
+            );
+            eprintln!("{} is byte-identical — it still contains the term.", path.display());
+            eprintln!("Content removal is applied to an in-memory overlay only; saving and");
+            eprintln!("the SDS §3.3.1 verification pass (re-extracting the serialized result)");
+            eprintln!("are not implemented. Do not treat this command as having redacted.");
+            process::exit(1);
         }
         Err(e) => {
             eprintln!("error: redaction failed: {e}");
@@ -1369,12 +1393,26 @@ fn cmd_validate_pdf_a(path: &Path, rest: &[String]) {
 
     let result = validate_pdf_a(&file_bytes, level);
 
+    // Finding a violation proves non-conformance, so that verdict is sound.
+    // The absence of findings is NOT conformance: `validate_pdf_a` is a set of
+    // byte-pattern heuristics (it greps for `x:xmpm`, `/Info`,
+    // `/OutputIntents`, a transparency group) and parses no objects, so it
+    // cannot see most of ISO 19005 — encryption, embedded JavaScript and
+    // external references are all prohibited by PDF/A and none are checked.
+    // Printing "CONFORMANT" here declared a conformance level the product had
+    // not established, which FR-STD-5 and CMP-STD-4 forbid outright and
+    // MET-FEAT-3 makes absolute. A real claim requires a recognized validator
+    // (veraPDF, CMP-STD-2). [FR-STD-5, CMP-STD-4, MET-FEAT-3, PRIN-6]
+    println!("Level:  {}", result.target_level);
     if result.conforms {
-        println!("Status: CONFORMANT");
-        println!("Level:  {}", result.target_level);
+        println!("Status: NO VIOLATIONS DETECTED");
+        println!();
+        println!("This is NOT a conformance determination. These are heuristic");
+        println!("byte-pattern checks, not ISO 19005 validation; most PDF/A rules");
+        println!("are not examined. Confirm with a recognized validator (veraPDF)");
+        println!("before claiming conformance.");
     } else {
-        println!("Status: NON-CONFORMANT");
-        println!("Level:  {}", result.target_level);
+        println!("Status: NON-CONFORMANT (violations found)");
     }
 
     if !result.warnings.is_empty() {
@@ -1393,9 +1431,15 @@ fn cmd_validate_pdf_a(path: &Path, rest: &[String]) {
         }
     }
 
+    // Exit 0 = no violations detected by these heuristics (usable for pipeline
+    // gating, FR-STD-6); exit 1 = violations found. Neither is a conformance
+    // claim. [FR-STD-5, FR-STD-6, CMP-STD-4]
     if result.conforms && result.errors.is_empty() {
         println!();
-        println!("Document passes {} validation.", result.target_level);
+        println!(
+            "No {} violations detected by the heuristic checks.",
+            result.target_level
+        );
         process::exit(0);
     } else {
         eprintln!();

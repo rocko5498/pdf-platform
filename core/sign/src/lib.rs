@@ -633,6 +633,19 @@ pub struct PdfAMetadata {
 ///
 /// Checks: metadata, fonts, transparency, output intents, and other
 /// PDF/A requirements. Returns a detailed result.
+/// Heuristic PDF/A pre-check. **Not** an ISO 19005 conformance determination.
+///
+/// This searches for byte patterns (`x:xmpm`, `/Info`, `/OutputIntents`, a
+/// transparency group) and parses no objects. It therefore cannot see most of
+/// the standard: encryption, embedded JavaScript and external references are
+/// all prohibited by PDF/A and none are examined, and PDF/A-1b's mandatory
+/// OutputIntent is currently only a warning.
+///
+/// A finding proves non-conformance. The **absence** of findings proves
+/// nothing, so `conforms == true` must never be presented to a user as
+/// conformance — FR-STD-5 and CMP-STD-4 forbid declaring a level the product
+/// has not established, and MET-FEAT-3 makes that absolute. Real claims
+/// require a recognized validator (veraPDF, CMP-STD-2).
 pub fn validate_pdf_a(
     file_bytes: &[u8],
     target_level: PdfALevel,
