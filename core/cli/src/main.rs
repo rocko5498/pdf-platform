@@ -417,11 +417,15 @@ fn cmd_plugin_validate(manifest_path: &Path) {
         }
     };
 
-    // Parse the manifest.
-    let manifest: PluginManifest = match serde_json::from_slice(&manifest_bytes) {
+    // Use the host's own validator. This previously called serde_json
+    // directly, bypassing `parse_manifest` entirely — so no required-field,
+    // semver, or WIT-world check ran, and every manifest reached the
+    // "PASSED" line below. [FR-PLUG-5, DS-PLUG-VER-1, SDS §11.1]
+    let manifest: PluginManifest = match plugin_host::manifest::parse_manifest(&manifest_bytes) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("error: invalid manifest JSON: {e}");
+            eprintln!("error: {e}");
+            eprintln!("Manifest validation: FAILED");
             process::exit(1);
         }
     };
@@ -436,10 +440,9 @@ fn cmd_plugin_validate(manifest_path: &Path) {
     println!("WIT world:      {}", manifest.wit_world);
     println!();
 
-    // Check WIT world compatibility.
-    if manifest.wit_world != "pdf-platform:plugin@1" {
-        eprintln!("warning: WIT world '{}' may not be compatible with current version", manifest.wit_world);
-    }
+    // WIT world compatibility is enforced by parse_manifest above, which
+    // rejects an unsupported world outright rather than warning and then
+    // reporting PASSED. [FR-PLUG-5, DS-PLUG-VER-1]
 
     // List capabilities.
     if manifest.capabilities.is_empty() {
