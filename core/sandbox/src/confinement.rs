@@ -24,6 +24,8 @@ pub enum ConfinementError {
     Platform(String),
     /// The confinement mechanism is not available on this platform.
     Unsupported(String),
+    /// This build requires enforcement but no reviewed backend is present.
+    BackendUnavailable(&'static str),
     /// A report combined state and active-filter evidence inconsistently.
     InvalidReport(String),
 }
@@ -33,6 +35,9 @@ impl fmt::Display for ConfinementError {
         match self {
             Self::Platform(msg) => write!(f, "confinement error: {msg}"),
             Self::Unsupported(msg) => write!(f, "confinement unsupported: {msg}"),
+            Self::BackendUnavailable(platform) => {
+                write!(f, "enforced confinement backend unavailable for {platform}")
+            }
             Self::InvalidReport(msg) => write!(f, "invalid confinement report: {msg}"),
         }
     }
@@ -152,6 +157,51 @@ impl ConfinementReport {
     }
 }
 
+trait PlatformConfinement {
+    fn install(&self) -> Result<Vec<String>, ConfinementError>;
+}
+
+struct UnavailableBackend {
+    platform: &'static str,
+}
+
+impl PlatformConfinement for UnavailableBackend {
+    fn install(&self) -> Result<Vec<String>, ConfinementError> {
+        Err(ConfinementError::BackendUnavailable(self.platform))
+    }
+}
+
+/// Proof that the selected platform backend installed all required filters.
+#[derive(Debug)]
+pub struct ActiveConfinement {
+    report: ConfinementReport,
+}
+
+impl ActiveConfinement {
+    /// Return the validated active-filter report.
+    pub fn report(&self) -> &ConfinementReport {
+        &self.report
+    }
+
+    /// Consume the proof and return its validated report.
+    pub fn into_report(self) -> ConfinementReport {
+        self.report
+    }
+}
+
+fn install_with<B: PlatformConfinement>(
+    backend: &B,
+) -> Result<ActiveConfinement, ConfinementError> {
+    let report = ConfinementReport {
+        platform: std::env::consts::OS,
+        state: ConfinementState::Enforced,
+        profile_lines: backend.install()?,
+        filters_active: true,
+    };
+    report.validate()?;
+    Ok(ActiveConfinement { report })
+}
+
 fn preinstall_status(state: ConfinementState) -> &'static str {
     match state {
         ConfinementState::Advisory => "STATUS: would apply (not yet enforced)",
@@ -222,27 +272,35 @@ pub fn confinement_report() -> ConfinementReport {
 /// Apply OS-specific sandbox confinement to the current process (child side).
 ///
 /// Called at the start of worker-main `main()`, before adopting any handles.
-pub fn lockdown_worker() -> Result<(), ConfinementError> {
+pub fn lockdown_worker() -> Result<ConfinementReport, ConfinementError> {
     let report = confinement_report();
+    log_report("worker", &report);
+
+    match report.state {
+        ConfinementState::Advisory => Ok(report),
+        ConfinementState::EnforcementPending => install_with(&UnavailableBackend {
+            platform: report.platform,
+        })
+        .map(ActiveConfinement::into_report),
+        ConfinementState::Enforced => Err(ConfinementError::InvalidReport(
+            "pre-install report cannot already be enforced".into(),
+        )),
+    }
+}
+
+fn log_report(prefix: &str, report: &ConfinementReport) {
+    let label = match report.state {
+        ConfinementState::Advisory => "ADVISORY",
+        ConfinementState::EnforcementPending => "PENDING",
+        ConfinementState::Enforced => "ENFORCED",
+    };
     for line in &report.profile_lines {
-        eprintln!("worker: [ADVISORY] {line}");
+        eprintln!("{prefix}: [{label}] {line}");
     }
     eprintln!(
-        "worker: confinement mode={:?} filters_active={}",
+        "{prefix}: confinement state={:?} filters_active={}",
         report.state, report.filters_active
     );
-
-    // Enforcement path deliberately absent until review package is signed.
-    // Do not add silent env-based enablement of real filters here.
-    match report.state {
-        ConfinementState::Advisory => Ok(()),
-        ConfinementState::EnforcementPending | ConfinementState::Enforced => {
-            // Placeholder: real filters would apply here post-review.
-            Err(ConfinementError::Unsupported(
-                "Enforced mode not enabled in this build — complete security review first".into(),
-            ))
-        }
-    }
 }
 
 /// Apply OS-specific restrictions to a child process from the parent side.
@@ -250,9 +308,7 @@ pub fn confine_child(_child: &std::process::Child) -> Result<(), ConfinementErro
     #[cfg(target_os = "windows")]
     {
         let report = confinement_report();
-        for line in &report.profile_lines {
-            eprintln!("parent: [ADVISORY] {line}");
-        }
+        log_report("parent", &report);
         Ok(())
     }
 
@@ -266,6 +322,46 @@ pub fn confine_child(_child: &std::process::Child) -> Result<(), ConfinementErro
 mod tests {
     use super::*;
 
+    struct SuccessfulBackend;
+
+    impl PlatformConfinement for SuccessfulBackend {
+        fn install(&self) -> Result<Vec<String>, ConfinementError> {
+            Ok(vec!["test filters installed".into()])
+        }
+    }
+
+    struct FailingBackend;
+
+    impl PlatformConfinement for FailingBackend {
+        fn install(&self) -> Result<Vec<String>, ConfinementError> {
+            Err(ConfinementError::Platform("test rejection".into()))
+        }
+    }
+
+    #[test]
+    fn successful_backend_is_the_only_path_to_active_report() {
+        let active = install_with(&SuccessfulBackend).expect("backend succeeds");
+        let report = active.report();
+        assert_eq!(report.state, ConfinementState::Enforced);
+        assert!(report.filters_active);
+        report.validate().expect("active report is valid");
+    }
+
+    #[test]
+    fn backend_failure_is_not_downgraded_to_advisory() {
+        let error = install_with(&FailingBackend).expect_err("failure must propagate");
+        assert!(matches!(error, ConfinementError::Platform(_)));
+    }
+
+    #[cfg(feature = "enforced-confinement")]
+    #[test]
+    fn enforced_build_without_platform_backend_fails_closed() {
+        assert!(matches!(
+            lockdown_worker(),
+            Err(ConfinementError::BackendUnavailable(_))
+        ));
+    }
+
     #[test]
     fn requested_state_matches_compile_time_policy() {
         #[cfg(not(feature = "enforced-confinement"))]
@@ -275,14 +371,12 @@ mod tests {
         assert_eq!(requested_state(), ConfinementState::EnforcementPending);
     }
 
+    #[cfg(not(feature = "enforced-confinement"))]
     #[test]
-    fn lockdown_worker_runs_advisory() {
-        let result = lockdown_worker();
-        assert!(
-            result.is_ok(),
-            "advisory lockdown should succeed: {result:?}"
-        );
-        assert_eq!(requested_state(), ConfinementState::Advisory);
+    fn advisory_startup_returns_inactive_report() {
+        let report = lockdown_worker().expect("advisory startup succeeds");
+        assert_eq!(report.state, ConfinementState::Advisory);
+        assert!(!report.filters_active);
     }
 
     #[test]
