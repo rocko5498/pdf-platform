@@ -31,6 +31,40 @@ unsafe impl Sync for PdfiumEngine {}
 static INIT: Once = Once::new();
 static mut PDFIUM_PTR: *const Pdfium = std::ptr::null();
 
+/// Fraction of private-use codepoints above which extraction is suspect.
+const PUA_UNRELIABLE_RATIO: f32 = 0.10;
+
+/// Judge whether extracted page text can be trusted. [FR-SRCH-5, ADR-019 §4]
+///
+/// `reliable` was hard-coded `true`, so the honesty mechanism ADR-019 §4
+/// requires — flagging pages whose text layer is unreliable instead of letting
+/// them be "silently searched wrong" — never fired.
+///
+/// Detects the two signatures of a missing or lying ToUnicode CMap that
+/// survive into extracted text: U+FFFD replacement characters (a codepoint
+/// that could not be mapped at all), and a high proportion of Private Use Area
+/// codepoints (a subset font extracting as raw glyph ids, which looks like
+/// text and searches wrong).
+///
+/// This is deliberately conservative and does not claim to catch every
+/// pathology — a font that lies *plausibly* still extracts as ordinary
+/// characters and cannot be caught here. It replaces an unconditional claim of
+/// reliability with a real, if partial, check.
+fn text_is_reliable(text: &str) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    if text.contains('\u{FFFD}') {
+        return false;
+    }
+    let total = text.chars().count();
+    let private_use = text
+        .chars()
+        .filter(|c| matches!(*c, '\u{E000}'..='\u{F8FF}'))
+        .count();
+    (private_use as f32 / total as f32) < PUA_UNRELIABLE_RATIO
+}
+
 /// Retry a fallible bind with linear backoff, returning the last error.
 ///
 /// Binding PDFium is not reliably idempotent across processes on a cold
@@ -409,12 +443,24 @@ impl Extract for PdfiumEngine {
 
         let char_count = char_data.len() as u32;
 
+        // Was hard-coded `true`, so no page was ever flagged and the ADR-019 §4
+        // honesty path could not fire. [FR-SRCH-5]
+        let page_text: String = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reliable = text_is_reliable(&page_text);
+
         Ok(PageTextModel {
             page_index,
             lines,
-            reliable: true, // TODO: detect unreliable ToUnicode maps
+            reliable,
             char_count,
-            has_structure: false, // TODO: detect tagged structure
+            // Still unimplemented, but conservative: claiming "no structure"
+            // understates the document rather than promising accessible
+            // reading order that was never verified. [DS-CANVAS-A11Y-4]
+            has_structure: false,
         })
     }
 
@@ -452,6 +498,43 @@ fn build_line(line_index: u32, chars: &[(char, f32, f32, f32, f32)]) -> TextLine
         width: x2 - x,
         height: y2 - y,
         spans,
+    }
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::text_is_reliable;
+
+    #[test]
+    fn ordinary_text_is_reliable() {
+        assert!(text_is_reliable("The quick brown fox jumps over the lazy dog."));
+    }
+
+    #[test]
+    fn a_replacement_character_marks_the_page_unreliable() {
+        // U+FFFD in extracted PDF text means a codepoint could not be mapped —
+        // in practice a missing or broken ToUnicode CMap.
+        assert!(!text_is_reliable("Invoice total: \u{FFFD}\u{FFFD}\u{FFFD}"));
+    }
+
+    #[test]
+    fn heavy_private_use_area_output_marks_the_page_unreliable() {
+        // A subset font with no ToUnicode commonly extracts as PUA glyph ids:
+        // it looks like text and searches wrong. [ADR-019 §4]
+        assert!(!text_is_reliable("\u{E000}\u{E001}\u{E002}\u{E003}\u{E004}"));
+    }
+
+    #[test]
+    fn an_incidental_private_use_glyph_does_not_condemn_a_good_page() {
+        let mostly_fine = format!("{}\u{E000}", "a".repeat(200));
+        assert!(text_is_reliable(&mostly_fine));
+    }
+
+    #[test]
+    fn an_empty_page_is_not_reported_as_unreliable() {
+        // No text is a legitimate state (an image-only scan), not a decoding
+        // failure — OCR is the answer there, not a reliability warning.
+        assert!(text_is_reliable(""));
     }
 }
 
