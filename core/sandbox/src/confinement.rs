@@ -24,6 +24,8 @@ pub enum ConfinementError {
     Platform(String),
     /// The confinement mechanism is not available on this platform.
     Unsupported(String),
+    /// A report combined state and active-filter evidence inconsistently.
+    InvalidReport(String),
 }
 
 impl fmt::Display for ConfinementError {
@@ -31,6 +33,7 @@ impl fmt::Display for ConfinementError {
         match self {
             Self::Platform(msg) => write!(f, "confinement error: {msg}"),
             Self::Unsupported(msg) => write!(f, "confinement unsupported: {msg}"),
+            Self::InvalidReport(msg) => write!(f, "invalid confinement report: {msg}"),
         }
     }
 }
@@ -105,8 +108,8 @@ pub const LINUX_SYSCALL_DENYLIST: &[&str] = &[
 pub struct ConfinementReport {
     /// Operating system target.
     pub platform: &'static str,
-    /// Advisory vs enforced.
-    pub mode: ConfinementState,
+    /// Advisory, pending installation, or proven enforced.
+    pub state: ConfinementState,
     /// Human-readable summary lines (what would be / is applied).
     pub profile_lines: Vec<String>,
     /// True only when OS filters are actually installed.
@@ -114,27 +117,52 @@ pub struct ConfinementReport {
 }
 
 impl ConfinementReport {
+    /// Reject any report that claims active filters without proven enforcement.
+    pub fn validate(&self) -> Result<(), ConfinementError> {
+        if self.filters_active != (self.state == ConfinementState::Enforced) {
+            return Err(ConfinementError::InvalidReport(format!(
+                "state={:?} filters_active={}",
+                self.state, self.filters_active
+            )));
+        }
+        Ok(())
+    }
+
     /// Format for CLI / diagnostics panel.
     pub fn display_text(&self) -> String {
         let mut out = format!(
-            "platform={}\nmode={:?}\nfilters_active={}\n",
-            self.platform, self.mode, self.filters_active
+            "platform={}\nstate={:?}\nfilters_active={}\n",
+            self.platform, self.state, self.filters_active
         );
         for line in &self.profile_lines {
             out.push_str("  ");
             out.push_str(line);
             out.push('\n');
         }
-        if self.mode == ConfinementState::Advisory {
-            out.push_str("NOTE: Advisory only — see docs/security/confinement-review-package.md\n");
+        match self.state {
+            ConfinementState::Advisory => out.push_str(
+                "NOTE: Advisory only — see docs/security/confinement-review-package.md\n",
+            ),
+            ConfinementState::EnforcementPending => {
+                out.push_str("NOTE: Enforcement requested; OS filters are not active yet\n")
+            }
+            ConfinementState::Enforced => {}
         }
         out
     }
 }
 
+fn preinstall_status(state: ConfinementState) -> &'static str {
+    match state {
+        ConfinementState::Advisory => "STATUS: would apply (not yet enforced)",
+        ConfinementState::EnforcementPending => "STATUS: enforcement pending platform installation",
+        ConfinementState::Enforced => "STATUS: active",
+    }
+}
+
 /// Build a report of the intended profile for this OS (no side effects).
 pub fn confinement_report() -> ConfinementReport {
-    let mode = requested_state();
+    let state = requested_state();
     #[cfg(target_os = "linux")]
     {
         let mut lines: Vec<String> = vec![
@@ -145,12 +173,10 @@ pub fn confinement_report() -> ConfinementReport {
             format!("seccomp deny: {}", LINUX_SYSCALL_DENYLIST.join(", ")),
             "seccomp default: KILL (fail-closed after review)".into(),
         ];
-        if mode == ConfinementState::Advisory {
-            lines.insert(0, "STATUS: would apply (not yet enforced)".into());
-        }
+        lines.insert(0, preinstall_status(state).into());
         return ConfinementReport {
             platform: "linux",
-            mode,
+            state,
             profile_lines: lines,
             filters_active: false, // never true until Enforced ships
         };
@@ -159,9 +185,9 @@ pub fn confinement_report() -> ConfinementReport {
     {
         return ConfinementReport {
             platform: "windows",
-            mode,
+            state,
             profile_lines: vec![
-                "STATUS: would apply (not yet enforced)".into(),
+                preinstall_status(state).into(),
                 "AppContainer profile (restricted capabilities)".into(),
                 "Job object: KILL_ON_JOB_CLOSE, memory + CPU caps".into(),
                 "Allowed handles: IPC pipe, document file, shmem".into(),
@@ -173,9 +199,9 @@ pub fn confinement_report() -> ConfinementReport {
     {
         return ConfinementReport {
             platform: "macos",
-            mode,
+            state,
             profile_lines: vec![
-                "STATUS: would apply (not yet enforced)".into(),
+                preinstall_status(state).into(),
                 "sandbox_init: deny network + filesystem except inherited".into(),
                 "allow: mach IPC, memory management".into(),
             ],
@@ -186,7 +212,7 @@ pub fn confinement_report() -> ConfinementReport {
     {
         ConfinementReport {
             platform: "unknown",
-            mode,
+            state,
             profile_lines: vec!["no confinement implementation".into()],
             filters_active: false,
         }
@@ -203,12 +229,12 @@ pub fn lockdown_worker() -> Result<(), ConfinementError> {
     }
     eprintln!(
         "worker: confinement mode={:?} filters_active={}",
-        report.mode, report.filters_active
+        report.state, report.filters_active
     );
 
     // Enforcement path deliberately absent until review package is signed.
     // Do not add silent env-based enablement of real filters here.
-    match report.mode {
+    match report.state {
         ConfinementState::Advisory => Ok(()),
         ConfinementState::EnforcementPending | ConfinementState::Enforced => {
             // Placeholder: real filters would apply here post-review.
@@ -260,16 +286,45 @@ mod tests {
     }
 
     #[test]
-    fn report_never_claims_filters_active_while_advisory() {
-        let r = confinement_report();
-        assert_eq!(r.mode, ConfinementState::Advisory);
-        assert!(
-            !r.filters_active,
-            "must not claim active filters before review"
-        );
-        let text = r.display_text();
-        assert!(text.contains("Advisory") || text.contains("ADVISORY") || text.contains("mode="));
-        assert!(!r.profile_lines.is_empty());
+    fn advisory_report_rejects_active_filters() {
+        let report = ConfinementReport {
+            platform: "test",
+            state: ConfinementState::Advisory,
+            profile_lines: vec!["test profile".into()],
+            filters_active: true,
+        };
+
+        assert!(matches!(
+            report.validate(),
+            Err(ConfinementError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn pending_report_is_inactive_and_never_claims_sandboxing() {
+        let report = ConfinementReport {
+            platform: "test",
+            state: ConfinementState::EnforcementPending,
+            profile_lines: vec!["test profile".into()],
+            filters_active: false,
+        };
+
+        report
+            .validate()
+            .expect("pending report is internally valid");
+        let text = report.display_text().to_ascii_lowercase();
+        assert!(!text.contains("sandboxed"));
+        assert!(text.contains("pending"));
+    }
+
+    #[test]
+    fn platform_report_matches_requested_state_before_installation() {
+        let report = confinement_report();
+        assert_eq!(report.state, requested_state());
+        assert!(!report.filters_active);
+        report
+            .validate()
+            .expect("pre-install report must be honest");
     }
 
     #[test]
