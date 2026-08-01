@@ -19,5 +19,6 @@ sign        = { path = "../sign" }
 ocr-bridge  = { path = "../ocr-bridge" }
 plugin-host = { path = "../plugin-host" }
 search      = { path = "../search" }
+text-extract = { path = "../text-extract" }
 plugin-sdk  = { path = "../../plugin-sdk", package = "pdf-platform-plugin-sdk" }
 serde_json  = "1"

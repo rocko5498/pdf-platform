@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use engine_api::extract::{Extract, ExtractError, PageTextModel};
 
+pub mod compare;
+
 /// Cache key for a page's text model: (page_index, revision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CacheKey {

@@ -1456,6 +1456,12 @@ fn cmd_validate_pdf_a(path: &Path, rest: &[String]) {
 /// Shows page-by-page comparison with added/removed/changed content.
 fn cmd_compare(path1: &Path, path2: &Path) {
     use coordinator::document::DocumentCoordinator;
+    use text_extract::compare::{diff_lines, DiffQuality, LineDiff};
+
+    // Set when any page exceeded the alignment bound, so the summary can say
+    // the result is no longer reflow-resilient instead of implying it is.
+    // [GR-7, FR-CMP-3, PRIN-6]
+    let mut fell_back = false;
 
     // Open both documents.
     let worker = find_worker();
@@ -1519,26 +1525,27 @@ fn cmd_compare(path1: &Path, path2: &Path) {
         pages_with_diffs += 1;
         println!("Page {}:", page + 1);
 
-        // Simple line-by-line diff.
+        // Align by longest common subsequence rather than pairing lines by
+        // index. Index pairing reported every line after an insertion as
+        // changed — the "raw positional diff" FR-CMP-3 rules out in favour of
+        // meaningful change detection. [FR-CMP-3]
         let lines1: Vec<&str> = text1.lines().collect();
         let lines2: Vec<&str> = text2.lines().collect();
+        let (ops, quality) = diff_lines(&lines1, &lines2);
+        if quality == DiffQuality::PositionalFallback {
+            fell_back = true;
+        }
 
-        let max_lines = lines1.len().max(lines2.len());
-        for i in 0..max_lines {
-            let l1 = lines1.get(i).copied().unwrap_or("");
-            let l2 = lines2.get(i).copied().unwrap_or("");
-
-            if l1 != l2 {
-                if l1.is_empty() {
-                    println!("  + {}", l2);
+        for op in &ops {
+            match op {
+                LineDiff::Same(_) => {}
+                LineDiff::Removed(line) => {
+                    println!("  - {line}");
                     total_diffs += 1;
-                } else if l2.is_empty() {
-                    println!("  - {}", l1);
+                }
+                LineDiff::Added(line) => {
+                    println!("  + {line}");
                     total_diffs += 1;
-                } else {
-                    println!("  - {}", l1);
-                    println!("  + {}", l2);
-                    total_diffs += 2;
                 }
             }
         }
@@ -1550,6 +1557,11 @@ fn cmd_compare(path1: &Path, path2: &Path) {
     println!("  Pages compared: {}", max_pages);
     println!("  Pages with differences: {}", pages_with_diffs);
     println!("  Total line changes: {}", total_diffs);
+    if fell_back {
+        println!();
+        println!("Note: at least one page exceeded the alignment bound, so its lines");
+        println!("were paired by position. Those results are not reflow-resilient.");
+    }
 
     let _ = coord1.close();
     let _ = coord2.close();

@@ -343,6 +343,7 @@ dependencies = [
  "search",
  "serde_json",
  "sign",
+ "text-extract",
 ]
 
 [[package]]
