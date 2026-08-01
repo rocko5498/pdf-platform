@@ -4,6 +4,10 @@ description = "Per-OS worker confinement + WorkerTransport impls. [ADR-008, ADR-
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+enforced-confinement = []
+
 [dependencies]
 protocol    = { path = "../protocol" }
 diagnostics = { path = "../diagnostics" }

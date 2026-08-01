@@ -13,7 +13,7 @@
 //! `docs/security/confinement-review-package.md` and enforcement is enabled
 //! via an explicit feature (not yet on by default).
 //!
-//! Never claim "sandboxed" while [`ConfinementMode::Advisory`].
+//! Never claim "sandboxed" while [`ConfinementState::Advisory`].
 
 use std::fmt;
 
@@ -39,19 +39,25 @@ impl std::error::Error for ConfinementError {}
 
 /// Whether OS filters are actually applied. [ADR-016]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfinementMode {
+pub enum ConfinementState {
     /// Log intended profile; do not fail closed. Default until human review.
     Advisory,
+    /// This build requires a reviewed OS backend before worker startup.
+    EnforcementPending,
     /// Apply filters; failure is fatal. Requires review + feature flag.
     Enforced,
 }
 
-/// Current process-wide mode. Always Advisory unless a reviewed build enables
-/// enforcement (no default path to Enforced without human sign-off).
-pub fn current_mode() -> ConfinementMode {
-    // Explicitly not reading an env override that would silently enable
-    // unreviewed filters. Enforcement is a future feature flag after review.
-    ConfinementMode::Advisory
+/// Confinement state requested by this build; no runtime override exists.
+pub const fn requested_state() -> ConfinementState {
+    #[cfg(feature = "enforced-confinement")]
+    {
+        ConfinementState::EnforcementPending
+    }
+    #[cfg(not(feature = "enforced-confinement"))]
+    {
+        ConfinementState::Advisory
+    }
 }
 
 /// Documented Linux syscall allowlist (intent). [ADR-016, SDS §12.2]
@@ -100,7 +106,7 @@ pub struct ConfinementReport {
     /// Operating system target.
     pub platform: &'static str,
     /// Advisory vs enforced.
-    pub mode: ConfinementMode,
+    pub mode: ConfinementState,
     /// Human-readable summary lines (what would be / is applied).
     pub profile_lines: Vec<String>,
     /// True only when OS filters are actually installed.
@@ -119,10 +125,8 @@ impl ConfinementReport {
             out.push_str(line);
             out.push('\n');
         }
-        if self.mode == ConfinementMode::Advisory {
-            out.push_str(
-                "NOTE: Advisory only — see docs/security/confinement-review-package.md\n",
-            );
+        if self.mode == ConfinementState::Advisory {
+            out.push_str("NOTE: Advisory only — see docs/security/confinement-review-package.md\n");
         }
         out
     }
@@ -130,7 +134,7 @@ impl ConfinementReport {
 
 /// Build a report of the intended profile for this OS (no side effects).
 pub fn confinement_report() -> ConfinementReport {
-    let mode = current_mode();
+    let mode = requested_state();
     #[cfg(target_os = "linux")]
     {
         let mut lines: Vec<String> = vec![
@@ -141,7 +145,7 @@ pub fn confinement_report() -> ConfinementReport {
             format!("seccomp deny: {}", LINUX_SYSCALL_DENYLIST.join(", ")),
             "seccomp default: KILL (fail-closed after review)".into(),
         ];
-        if mode == ConfinementMode::Advisory {
+        if mode == ConfinementState::Advisory {
             lines.insert(0, "STATUS: would apply (not yet enforced)".into());
         }
         return ConfinementReport {
@@ -205,8 +209,8 @@ pub fn lockdown_worker() -> Result<(), ConfinementError> {
     // Enforcement path deliberately absent until review package is signed.
     // Do not add silent env-based enablement of real filters here.
     match report.mode {
-        ConfinementMode::Advisory => Ok(()),
-        ConfinementMode::Enforced => {
+        ConfinementState::Advisory => Ok(()),
+        ConfinementState::EnforcementPending | ConfinementState::Enforced => {
             // Placeholder: real filters would apply here post-review.
             Err(ConfinementError::Unsupported(
                 "Enforced mode not enabled in this build — complete security review first".into(),
@@ -237,16 +241,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requested_state_matches_compile_time_policy() {
+        #[cfg(not(feature = "enforced-confinement"))]
+        assert_eq!(requested_state(), ConfinementState::Advisory);
+
+        #[cfg(feature = "enforced-confinement")]
+        assert_eq!(requested_state(), ConfinementState::EnforcementPending);
+    }
+
+    #[test]
     fn lockdown_worker_runs_advisory() {
         let result = lockdown_worker();
-        assert!(result.is_ok(), "advisory lockdown should succeed: {result:?}");
-        assert_eq!(current_mode(), ConfinementMode::Advisory);
+        assert!(
+            result.is_ok(),
+            "advisory lockdown should succeed: {result:?}"
+        );
+        assert_eq!(requested_state(), ConfinementState::Advisory);
     }
 
     #[test]
     fn report_never_claims_filters_active_while_advisory() {
         let r = confinement_report();
-        assert_eq!(r.mode, ConfinementMode::Advisory);
+        assert_eq!(r.mode, ConfinementState::Advisory);
         assert!(
             !r.filters_active,
             "must not claim active filters before review"
