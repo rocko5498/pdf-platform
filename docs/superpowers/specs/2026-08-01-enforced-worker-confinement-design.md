@@ -1,9 +1,9 @@
 # Enforced Worker Confinement Design
 
-**Date:** 2026-08-01  
-**Milestone:** M0 — foundations and walking skeleton  
-**Status:** Approved implementation direction; security-critical drafts remain human-gated  
-**Supersedes:** `docs/superpowers/specs/2026-07-13-confinement-design.md`  
+**Date:** 2026-08-01
+**Milestone:** M0 — foundations and walking skeleton
+**Status:** Approved implementation direction; security-critical drafts remain human-gated
+**Supersedes:** `docs/superpowers/specs/2026-07-13-confinement-design.md`
 **Citations:** ADR-008, ADR-016, ADR-020, ADR-022, SDS §3.1, SDS §12.2, SDS §14 M0, IG AI-4..6, IG CR-Z, GR-1, GR-7, GR-8
 
 ## Problem

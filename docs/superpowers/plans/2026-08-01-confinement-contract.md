@@ -31,7 +31,7 @@
 - Produces: `pub const fn requested_state() -> ConfinementState`
 - Consumed by: Task 2 report construction and Task 3 startup policy.
 
-- [ ] **Step 1: Add a test that names the missing build-policy behavior**
+- [x] **Step 1: Add a test that names the missing build-policy behavior**
 
 Add this test beside the existing confinement tests before defining either symbol. It catches accidentally making enforcement runtime-selectable or default-on.
 
@@ -49,7 +49,7 @@ fn requested_state_matches_compile_time_policy() {
 }
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run from `core/`:
 
@@ -60,7 +60,7 @@ cargo test -p sandbox confinement::tests::requested_state_matches_compile_time_p
 
 Expected: compilation fails because `requested_state` and `ConfinementState` do not exist.
 
-- [ ] **Step 3: Add the default-off Cargo feature**
+- [x] **Step 3: Add the default-off Cargo feature**
 
 Insert after the package metadata in `core/sandbox/Cargo.toml`:
 
@@ -70,7 +70,7 @@ default = []
 enforced-confinement = []
 ```
 
-- [ ] **Step 4: Implement the minimum requested-state API**
+- [x] **Step 4: Implement the minimum requested-state API**
 
 Replace `ConfinementMode` and `current_mode()` with:
 
@@ -103,7 +103,7 @@ Temporarily update existing internal references from `current_mode()` to
 `requested_state()` and from `ConfinementMode` to `ConfinementState`; Task 2
 finishes the report semantics.
 
-- [ ] **Step 5: Run default and feature builds and verify GREEN**
+- [x] **Step 5: Run default and feature builds and verify GREEN**
 
 ```powershell
 cargo test -p sandbox confinement::tests::requested_state_matches_compile_time_policy -- --exact
@@ -112,7 +112,7 @@ cargo test -p sandbox --features enforced-confinement confinement::tests::reques
 
 Expected: one test passes in each command.
 
-- [ ] **Step 6: Commit the independently reviewable build-policy change**
+- [x] **Step 6: Commit the independently reviewable build-policy change**
 
 ```powershell
 git add core/sandbox/Cargo.toml core/sandbox/src/confinement.rs
@@ -132,7 +132,7 @@ git commit -m "feat(sandbox): add compile-time confinement request" -m "Cites: A
 - Produces: `ConfinementError::InvalidReport(String)`.
 - Preserves: `confinement_report()` and `display_text()` for CLI consumers.
 
-- [ ] **Step 1: Write failing invariant tests**
+- [x] **Step 1: Write failing invariant tests**
 
 Replace the old `report_never_claims_filters_active_while_advisory` test with these tests. They catch both a false active-filter claim and dishonest user-facing wording.
 
@@ -176,7 +176,7 @@ fn platform_report_matches_requested_state_before_installation() {
 }
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 ```powershell
 cargo test -p sandbox confinement::tests::advisory_report_rejects_active_filters -- --exact
@@ -184,7 +184,7 @@ cargo test -p sandbox confinement::tests::advisory_report_rejects_active_filters
 
 Expected: compilation fails because `state`, `InvalidReport`, and `validate` do not exist yet.
 
-- [ ] **Step 3: Implement typed report validation**
+- [x] **Step 3: Implement typed report validation**
 
 Add the error variant and display arm:
 
@@ -225,7 +225,7 @@ NOTE: Enforcement requested; OS filters are not active yet
 
 Do not append either note for `Enforced`.
 
-- [ ] **Step 4: Make every platform report pre-installation state honestly**
+- [x] **Step 4: Make every platform report pre-installation state honestly**
 
 In `confinement_report()`, set:
 
@@ -238,7 +238,7 @@ Use `state` in every platform-specific `ConfinementReport`, keep
 only for `Advisory`. For `EnforcementPending`, prepend
 `STATUS: enforcement pending platform installation`.
 
-- [ ] **Step 5: Run report tests in both configurations and verify GREEN**
+- [x] **Step 5: Run report tests in both configurations and verify GREEN**
 
 ```powershell
 cargo test -p sandbox report -- --nocapture
@@ -248,7 +248,7 @@ cargo test -p sandbox --features enforced-confinement report -- --nocapture
 Expected: report tests pass in both builds; neither command prints a false
 active-filter claim.
 
-- [ ] **Step 6: Commit the report contract**
+- [x] **Step 6: Commit the report contract**
 
 ```powershell
 git add core/sandbox/src/confinement.rs
@@ -271,7 +271,7 @@ git commit -m "fix(sandbox): make confinement reports stateful and honest" -m "C
 - Produces: `ConfinementError::BackendUnavailable(&'static str)`.
 - Changes: `lockdown_worker() -> Result<ConfinementReport, ConfinementError>`.
 
-- [ ] **Step 1: Write failing policy tests with narrow test backends**
+- [x] **Step 1: Write failing policy tests with narrow test backends**
 
 Add these inside the existing test module. The doubles replace only the absent
 OS operation; assertions exercise the real shared policy.
@@ -318,7 +318,7 @@ fn enforced_build_without_platform_backend_fails_closed() {
 }
 ```
 
-- [ ] **Step 2: Run the seam test and verify RED**
+- [x] **Step 2: Run the seam test and verify RED**
 
 ```powershell
 cargo test -p sandbox confinement::tests::successful_backend_is_the_only_path_to_active_report -- --exact
@@ -327,7 +327,7 @@ cargo test -p sandbox confinement::tests::successful_backend_is_the_only_path_to
 Expected: compilation fails because `PlatformConfinement` and `install_with`
 do not exist.
 
-- [ ] **Step 3: Implement the private backend seam**
+- [x] **Step 3: Implement the private backend seam**
 
 Add:
 
@@ -379,7 +379,7 @@ Self::BackendUnavailable(platform) => {
 }
 ```
 
-- [ ] **Step 4: Make startup fail closed when the feature is selected**
+- [x] **Step 4: Make startup fail closed when the feature is selected**
 
 Change `lockdown_worker` to return the report:
 
@@ -408,7 +408,7 @@ The existing worker startup already uses `if let Err(e) = lockdown_worker()`
 and exits non-zero, so no production edit to `worker-main/src/main.rs` is
 required.
 
-- [ ] **Step 5: Replace the old advisory startup test**
+- [x] **Step 5: Replace the old advisory startup test**
 
 Use configuration-specific assertions:
 
@@ -424,7 +424,7 @@ fn advisory_startup_returns_inactive_report() {
 
 Keep `enforced_build_without_platform_backend_fails_closed` from Step 1.
 
-- [ ] **Step 6: Run all sandbox tests in both configurations**
+- [x] **Step 6: Run all sandbox tests in both configurations**
 
 ```powershell
 cargo test -p sandbox -- --test-threads=1
@@ -434,7 +434,7 @@ cargo test -p sandbox --features enforced-confinement -- --test-threads=1
 Expected: all sandbox tests pass in both commands. The enforced command proves
 that a missing backend is an error, not an advisory success.
 
-- [ ] **Step 7: Commit the fail-closed seam**
+- [x] **Step 7: Commit the fail-closed seam**
 
 ```powershell
 git add core/sandbox/src/confinement.rs
@@ -453,7 +453,7 @@ git commit -m "feat(sandbox): fail closed without reviewed OS backend" -m "Cites
 - Documents the exact state after Tasks 1–3.
 - Does not enable an OS backend or change milestone status.
 
-- [ ] **Step 1: Update the review package truthfully**
+- [x] **Step 1: Update the review package truthfully**
 
 Change the current-mode table to state:
 
@@ -468,24 +468,26 @@ Add `2026-08-01-enforced-worker-confinement-design.md` as the governing design
 and list Linux, Windows, and macOS backends as three separate unsigned review
 items.
 
-- [ ] **Step 2: Mark completed plan checkboxes**
+- [x] **Step 2: Mark completed plan checkboxes**
 
 Change each executed `- [ ]` in this plan to `- [x]`. Do not mark a step until
 its command has produced the expected result.
 
-- [ ] **Step 3: Run formatting and targeted verification**
+- [x] **Step 3: Run formatting and targeted verification**
 
 ```powershell
-cargo fmt --all -- --check
+rustfmt --edition 2021 --check sandbox/src/confinement.rs
 cargo test -p sandbox -- --test-threads=1
 cargo test -p sandbox --features enforced-confinement -- --test-threads=1
 cargo test -p worker-main --no-fail-fast -- --test-threads=1
 ```
 
-Expected: all commands exit zero. Pre-existing compiler warnings may remain;
-record them without claiming pristine output.
+Expected: all commands exit zero. Formatting is intentionally scoped to the
+changed Rust file because `main` has repository-wide pre-existing rustfmt
+drift. Pre-existing compiler warnings may remain; record them without claiming
+pristine output.
 
-- [ ] **Step 4: Run the full workspace verification**
+- [x] **Step 4: Run the full workspace verification and record baseline failures**
 
 ```powershell
 cargo test --workspace --no-fail-fast -- --test-threads=1
@@ -495,7 +497,17 @@ Expected: exit zero. If the command exceeds the execution window, record it as
 incomplete and retain the successful targeted evidence; do not claim a full
 workspace pass.
 
-- [ ] **Step 5: Inspect the final diff for scope and honesty**
+**Observed 2026-08-01:** the full command completed with three failing targets.
+Two coordinator targets initially failed because their test helpers ignore
+`CARGO_TARGET_DIR` and looked only under the linked worktree; after adding a
+local `core/target` junction to the shared cache, those 23 tests passed (8
+fault-injection + 15 pipeline). The remaining `ocr-bridge` failure is the
+pre-existing zero-dimension subtraction overflow documented in the handoff and
+fixed only on the divergent jobs branch. A follow-up
+`cargo test --workspace --exclude ocr-bridge --no-fail-fast -- --test-threads=1`
+completed with exit zero. This plan does not claim a full workspace pass.
+
+- [x] **Step 5: Inspect the final diff for scope and honesty**
 
 ```powershell
 git diff --check main...HEAD
@@ -507,7 +519,7 @@ Expected: only the sandbox contract, its tests, the approved design/plan, and
 the review package differ from `main`; no canonical ADR/SDS/PRD/DS file is
 modified.
 
-- [ ] **Step 6: Commit the review-package evidence**
+- [x] **Step 6: Commit the review-package evidence**
 
 ```powershell
 git add docs/security/confinement-review-package.md docs/superpowers/plans/2026-08-01-confinement-contract.md
