@@ -370,15 +370,26 @@ fn cmd_plugin_list() {
         }
     };
 
-    // For now, show the plugin system status.
-    // In production, this would scan the plugin directory.
+    // Report only what can actually be established. `manager` was previously
+    // constructed and then discarded (hence the unused-variable warning), and
+    // the hard-coded names below were printed where a listing would go.
+    // There is no filesystem plugin discovery: PluginManager::discover takes
+    // manifest bytes, not a directory, and no document specifies a plugins
+    // folder — so installed plugins genuinely cannot be enumerated yet, and
+    // this says so rather than implying an empty or fictional result.
+    // [PRIN-6, GR-8, FR-PLUG-1, SDS §11.1]
     println!("Plugin runtime: initialized");
-    println!("WIT world:      pdf-platform:plugin@1");
+    println!("WIT world:      {}", plugin_host::manifest::HOST_WIT_WORLD);
     println!("SDK version:    {}", plugin_sdk::CURRENT_WIT_WORLD_VERSION);
+    println!("Enabled plugins: {}", manager.plugin_ids().len());
+    println!();
+    println!("Installed-plugin discovery is not implemented: there is no plugin");
+    println!("directory scan, so this command cannot list what is installed.");
+    println!("Validate a manifest directly with: pdf-platform plugin-validate <manifest.json>");
     println!();
 
-    // Show example plugins from the SDK.
-    println!("Example plugins (in plugin-sdk/examples/):");
+    // Shipped with the SDK — these are source examples, not installed plugins.
+    println!("Example plugins shipped in plugin-sdk/examples/:");
     println!();
     println!("  word-counter/");
     println!("    A simple plugin that counts words in the document.");
