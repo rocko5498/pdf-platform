@@ -9,7 +9,14 @@
 //         this boundary; ownership does not straddle languages. [ADR-004, ADR-027]
 #![allow(static_mut_refs)] // single-threaded Qt main thread; multi-doc later
 
-use std::os::windows::io::AsRawHandle;
+// NOTE: `use std::os::windows::io::AsRawHandle;` was here, ungated and unused.
+// `std::os::windows` does not exist on Linux or macOS, so it failed the build
+// on two of the three platforms CI covers — `main` has been red since
+// 2026-07-21 with `error[E0433]: cannot find 'windows' in 'os'`. The two other
+// Windows-only imports in this workspace (sandbox/spawn.rs, sandbox/transport.rs)
+// sit inside `#[cfg(windows)] mod windows` blocks, which is the correct
+// pattern. Nothing in this file calls `as_raw_handle`, so the import is simply
+// deleted rather than gated. [CMP-XPLAT-1, ADR-029]
 
 use pdf_model::annotation::{
     Annotation, AnnotationStore, AnnotationType, Color, Rect, TextMarkupKind,
