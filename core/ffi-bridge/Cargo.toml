@@ -3,6 +3,7 @@ name        = "ffi-bridge"
 description = "Sole Rust↔Qt FFI boundary. cxx-generated bridge. [ADR-004, ADR-025]"
 version.workspace = true
 edition.workspace = true
+license.workspace     = true
 build = "build.rs"
 
 [lib]

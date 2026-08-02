@@ -4,6 +4,7 @@ description = "Wasmtime WASM plugin execution + Z0 control plane. [ADR-014, ADR-
 version.workspace = true
 edition.workspace = true
 
+license.workspace     = true
 [dependencies]
 protocol    = { path = "../protocol" }
 serde       = { version = "1", features = ["derive"] }

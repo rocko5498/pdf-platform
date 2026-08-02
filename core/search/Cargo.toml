@@ -4,6 +4,7 @@ description = "In-doc find + opt-in local Tantivy cross-doc index. STUB — M2. 
 version.workspace = true
 edition.workspace = true
 
+license.workspace     = true
 [dependencies]
 pdf-types    = { path = "../pdf-types" }
 text-extract = { path = "../text-extract" }

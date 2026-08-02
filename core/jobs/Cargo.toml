@@ -4,5 +4,6 @@ description = "Declarative job DAG scheduler, priority classes, cancel tokens. S
 version.workspace = true
 edition.workspace = true
 
+license.workspace     = true
 [dependencies]
 protocol = { path = "../protocol" }

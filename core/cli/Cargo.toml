@@ -4,6 +4,7 @@ description = "Headless CLI client of the coordinator. Proves shell has no privi
 version.workspace = true
 edition.workspace = true
 
+license.workspace     = true
 [[bin]]
 name = "pdf-platform"
 path = "src/main.rs"

@@ -4,6 +4,7 @@ description = "Incremental-append + full-rewrite serializers. STUB — M3. [ADR-
 version.workspace = true
 edition.workspace = true
 
+license.workspace     = true
 [dependencies]
 pdf-types = { path = "../pdf-types" }
 pdf-cos   = { path = "../pdf-cos" }

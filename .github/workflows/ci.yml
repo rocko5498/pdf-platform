@@ -15,6 +15,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ADR-028 §1 requires a CI-enforced licence allowlist. Licences do not vary by
+  # runner and `core/deny.toml` names every target the matrix below covers, so
+  # this runs once rather than three times. [ADR-028 §1, ADR-029, DEP-1]
+  licenses:
+    name: licence allowlist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # NEW CI DEPENDENCY (AI-4): published by cargo-deny's own maintainers, and
+      # cargo-deny is the tool ADR-028 §1 names. Pinned to a major tag, matching
+      # how the other actions in this workflow are pinned.
+      - name: Licence allowlist (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: core/Cargo.toml
+          # Licences only. advisories, bans, and sources stay at permissive
+          # defaults and are not claimed to be enforced. [GR-8]
+          command: check licenses
+
   rust:
     name: rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

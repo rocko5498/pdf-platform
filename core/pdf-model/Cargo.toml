@@ -4,6 +4,7 @@ description = "Semantic façades, Commands, UndoJournal. STUB — M3. [ADR-006, 
 version.workspace = true
 edition.workspace = true
 
+license.workspace     = true
 [dependencies]
 pdf-types = { path = "../pdf-types" }
 pdf-cos   = { path = "../pdf-cos" }

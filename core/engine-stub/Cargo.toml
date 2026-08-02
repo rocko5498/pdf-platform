@@ -4,5 +4,6 @@ description = "Stub rasterize engine producing test patterns. M0 walking skeleto
 version.workspace = true
 edition.workspace = true
 
+license.workspace     = true
 [dependencies]
 engine-api = { path = "../engine-api" }

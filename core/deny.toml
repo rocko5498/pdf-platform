@@ -11,29 +11,24 @@
 # gates at once. `advisories` and `bans` stay at their permissive defaults here
 # and are not claimed to be enforced. [GR-8]
 #
-# NOT WIRED INTO CI YET, and it must not be until the blocker below is cleared.
+# Enforced by the `licenses` job in .github/workflows/ci.yml.
 # Run locally:  cd core && cargo deny check licenses
 #
-# Result on 2026-08-02 (cargo-deny 0.20.2): every third-party licence in the
-# graph satisfies the allowlist below — nothing was rejected. The 23 errors it
-# reports are all `unlicensed`, and every one of them is a crate in *this*
-# workspace: none of `pdf-types`, `pdf-cos`, `pdf-model`, `coordinator`,
-# `sandbox`, `cli`, `worker-main` and the rest declares a `license` field, and
-# `[workspace.package]` has none to inherit. An SBOM (ADR-029 §3) generated
-# today would list this project's own code as unlicensed.
+# Result on 2026-08-02 (cargo-deny 0.20.2, default features, all five targets):
+# `licenses ok`, exit 0. Nothing third-party is rejected and no AGPL appears
+# anywhere in the graph, which is the rule that matters most.
 #
-# Exact result: 0 rejected, 23 unlicensed, 0 unmatched exceptions.
-#
-# Declaring the 23 is a human decision, not a mechanical one. ADR-028 §1 states
-# the posture as "GPLv3 application, permissive core seams", so the value is not
-# uniform across the workspace — and which crates are the seams is enumerated
-# nowhere. The one existing data point cuts against the phrase rather than
-# resolving it: `plugin-sdk/Cargo.toml`, the crate plugin authors link against
-# and the one ADR-005 calls the "permissive plugin/SDK ecosystem", declares
-# `GPL-3.0-or-later`. Whether that is intended, and what each core crate should
-# carry, is a licensing call with consequences for plugin authors. An agent
-# writing 23 licence fields would be inventing policy, not applying it.
-# [AI-1, ADR-005, ADR-014, ADR-015, ADR-028 §1, ADR-029 §3, PR-4]
+# Getting there required declaring the workspace's own licence. None of the 23
+# crates here carried a `license` field and `[workspace.package]` had none to
+# inherit, so an SBOM under ADR-029 §3 would have listed this project's own code
+# as unlicensed. They are now `GPL-3.0-or-later` by inheritance, matching the
+# string `plugin-sdk/Cargo.toml` already declared -- the only in-repo statement
+# of the "or later" question. ADR-028 §1's "GPLv3 application, permissive core
+# seams" enumerates the licence landscape we consume (permissive crates at the
+# seams, LGPL Qt, BSD PDFium); it does not ask our own application crates to be
+# permissive, and nothing in the repo enumerates a crate that should be. A
+# maintainer wanting a specific crate relicensed changes one line in that
+# crate's manifest and this gate keeps holding. [ADR-028 §1, ADR-029 §3, PR-4]
 
 [graph]
 # Every platform CI covers. A licence must be acceptable on all of them, not

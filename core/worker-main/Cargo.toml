@@ -4,6 +4,7 @@ description = "Z1 worker process binary. Sandboxed; hosts the engine backend. [A
 version.workspace = true
 edition.workspace = true
 
+license.workspace     = true
 [[bin]]
 name = "worker"
 path = "src/main.rs"
