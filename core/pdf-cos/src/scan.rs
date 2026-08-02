@@ -63,8 +63,14 @@ pub fn scan_file(file: &std::fs::File) -> Result<DocumentStructure, ScanError> {
     scan_bytes(&map)
 }
 
-/// Scan raw PDF bytes. Exposed for testing without file I/O.
-pub(crate) fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
+/// Scan raw PDF bytes.
+///
+/// Public so the corrupt-file corpus and randomised sweeps can drive the parser
+/// directly. ADR-022 T-4 requires code reachable by untrusted document bytes to
+/// be fuzz-targeted, and routing every case through a temp file makes a sweep of
+/// any useful size impractical. This is the same code path `scan_file` runs
+/// after mmapping, so nothing is bypassed. [ADR-022, T-4, SDS §12.6]
+pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
     let mut leniency = Vec::new();
 
     if !data.starts_with(b"%PDF-") {
