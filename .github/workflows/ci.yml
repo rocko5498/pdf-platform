@@ -33,7 +33,11 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # v4 targets Node 20, which GitHub deprecated and now force-runs on
+        # Node 24 while emitting a warning annotation on every job. v5 is the
+        # release that moved to Node 24, so it is the smallest bump that
+        # actually removes the warning. [ADR-029 §5]
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
