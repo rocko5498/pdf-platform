@@ -845,8 +845,23 @@ fn cmd_validate_signatures(path: &Path) {
 
         println!("  Status: {}", report.status);
         println!("  Explanation: {}", report.explanation);
-        println!("  Hash match: {}", if report.hash_match { "yes" } else { "NO" });
-        println!("  Integrity check: {}", if report.integrity_check_passed { "passed" } else { "FAILED" });
+        // These two lines used to read "Hash match: yes" and "Integrity check:
+        // passed" for any well-formed ByteRange, while nothing compared a hash
+        // and no cryptography ran at all. A reader takes those as "the signed
+        // bytes are intact", which is exactly the false valid FR-SIG-1 forbids
+        // and MET-FEAT-6 marks absolute. [PRIN-6, GR-8]
+        println!(
+            "  ByteRange well-formed: {}",
+            if report.byte_range_well_formed { "yes" } else { "NO" }
+        );
+        println!(
+            "  Cryptographic verification: {}",
+            match report.cms_verified {
+                Some(true) => "passed",
+                Some(false) => "FAILED",
+                None => "NOT PERFORMED — CMS verification is deferred (M10)",
+            }
+        );
         println!("  Signer trusted: {}", if report.signer_trusted { "yes" } else { "no (trust store not configured)" });
 
         if !report.post_signing_changes.is_empty() {
