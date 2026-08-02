@@ -3,8 +3,7 @@ name        = "pdf-cos"
 description = "COS object store, xref, filter pipeline, leniency ledger. [ADR-006, ADR-025]"
 version.workspace = true
 edition.workspace = true
-
-license.workspace     = true
+license.workspace = true
 [dependencies]
 pdf-types   = { path = "../pdf-types" }
 diagnostics = { path = "../diagnostics" }

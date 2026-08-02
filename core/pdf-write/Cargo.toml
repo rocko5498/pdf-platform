@@ -3,8 +3,7 @@ name        = "pdf-write"
 description = "Incremental-append + full-rewrite serializers. STUB — M3. [ADR-012]"
 version.workspace = true
 edition.workspace = true
-
-license.workspace     = true
+license.workspace = true
 [dependencies]
 pdf-types = { path = "../pdf-types" }
 pdf-cos   = { path = "../pdf-cos" }

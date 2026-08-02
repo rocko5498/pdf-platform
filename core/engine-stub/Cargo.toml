@@ -3,7 +3,6 @@ name        = "engine-stub"
 description = "Stub rasterize engine producing test patterns. M0 walking skeleton. [ADR-005]"
 version.workspace = true
 edition.workspace = true
-
-license.workspace     = true
+license.workspace = true
 [dependencies]
 engine-api = { path = "../engine-api" }
