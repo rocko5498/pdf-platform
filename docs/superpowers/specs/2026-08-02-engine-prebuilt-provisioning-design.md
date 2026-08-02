@@ -82,12 +82,36 @@ partially written library through `exists()` binds a truncated file; a worker wh
 mapping is rewritten underneath it dies without stderr. Both present to the
 coordinator as `transport disconnected`.
 
-Evidence: run `30738219376` on `e8913bd` failed on Ubuntu with two
-`coordinator/tests/fault_injection.rs` failures; **re-running the identical commit
-with no change passed**. Local verification never caught it because every local run
-used `--test-threads=1`, which serialises the race away. `retry_bind` (PR #15) gives
-5 attempts over 400 ms total, far short of a cold multi-MB download, so it narrows
-the window without closing it.
+Evidence, in three parts.
+
+**1. Non-determinism.** Run `30738219376` on `e8913bd` failed on Ubuntu with two
+`coordinator/tests/fault_injection.rs` failures; **re-running the identical commit with
+no change passed**. Local verification never caught it because every local run used
+`--test-threads=1`, which serialises the race away.
+
+**2. The mechanism, observed directly.** Run `30739814518`, Windows job, on a branch
+off `main` (which does not carry PR #15's `retry_bind`): four worker processes panicked
+inside the same millisecond, and four of eight fault-injection tests failed.
+
+```
+thread 'main' panicked at engine-pdfium\src\backend.rs:40:18:
+failed to initialize PDFium: Bind {
+  path: "C:\\Users\\runneradmin\\AppData\\Local\\pdf2md\\pdfium-7690\\pdfium.dll",
+  reason: "LoadLibraryError(LoadLibraryExW { source: 32 })" }
+```
+
+`source: 32` is `ERROR_SHARING_VIOLATION`. The cache path already existed, so this is
+not a truncated file — it is concurrent `LoadLibraryExW` against a library another
+process is writing, which is exactly what unpacking straight onto the final path with
+no lock produces. The `.expect()` at `backend.rs:40` turns that into a worker abort,
+which the coordinator can only report as `transport disconnected`.
+
+**3. It is not platform-specific.** The same race produced the Ubuntu failure and this
+Windows one. Any claim that this is a Linux quirk is wrong.
+
+`retry_bind` (PR #15) gives 5 attempts over 400 ms total, far short of a cold multi-MB
+download, so it narrows the window without closing it — and it leaves the `.expect()`
+abort in place for when the retries are exhausted.
 
 ---
 
