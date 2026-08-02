@@ -5,7 +5,8 @@ Update when a criterion is proven by test, bench, or audited demo.
 
 | Milestone | Criterion | Status | Evidence |
 |---|---|---|---|
-| **M0** | Tile via bridge+IPC+shmem | **Met** | worker tests, shell canvas |
+| **M0** | Tile via bridge+IPC+shmem | **Rust path met; 3-OS criterion NOT met** | Worker/bridge tests run on all three OSes in CI. The *shell canvas* half does not: `.github/workflows/ci.yml` contains no CMake, no Qt and no shell build — its only `shell` match is `shell: pwsh`, a step selector — so the tile has been seen end-to-end only in the Windows human smoke test on the row below. AGENTS §11 words this criterion as "Tile rendered through real bridge+IPC+shmem **on all 3 OSes**" |
+| **M0** | Shell QTest coverage (ADR-003) | **Not started** | ADR-003 requires "widget code carries QTest coverage for input→command translation (the shell's one testable responsibility, wired into ADR-022 CI)", and ADR-029 §1 lists a "shell QTest suite" in the PR pipeline. `find shell -name '*test*'` returns nothing and no workflow builds the shell. The shell's single mandated test stratum has no implementation [ADR-003, ADR-022, ADR-029 §1, T-8] |
 | **M0** | Kill-worker respawn | **Met** | `session_death.rs` |
 | **M0** | Corpus-diff + CI | **Met** | GitHub Actions |
 | **M0** | Cold-start / first-page budgets | **Met** | ~11ms / ~13ms recorded |
