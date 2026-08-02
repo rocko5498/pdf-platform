@@ -44,6 +44,29 @@ bytes, written 2026-07-27, while `third_party/pdfium/prebuilt/` still contains o
 Unverified native code is dlopen'd into the same process that parses untrusted
 documents. That is the supply-chain shape ADR-028 was written against.
 
+### What it drags into the dependency graph
+
+Read from `core/Cargo.lock` and the local registry, not assumed:
+
+- `pdfium-auto` is the **only** dependent of `reqwest` in the workspace. No product
+  `Cargo.toml` mentions it.
+- `reqwest` is in turn the only root of `hyper`, `rustls`, `quinn` (QUIC),
+  `webpki-roots`, and `tokio`. Their dependent chains terminate at `reqwest`.
+- So a full HTTP client, a TLS implementation, a QUIC stack, a bundled root-certificate
+  store, and an **async runtime** are linked into the Z1 worker — the process whose
+  guardrail is that it has no network at all (GR-1), in a product whose guardrail is
+  that nothing transmits without an explicit user action (GR-9).
+- `tokio` in the worker's graph also sits against GR-6, which keeps async runtimes out
+  of the core in favour of threads and channels.
+- A license sweep of all 376 locked packages found **no AGPL anywhere**, so ADR-028's
+  hard rule holds. The single license outside the ADR-028 allowlist is `webpki-roots`
+  (CDLA-Permissive-2.0) — which arrives through this same `reqwest` chain and leaves
+  with it. (`ittapi`/`ittapi-sys` are `GPL-2.0-only OR BSD-3-Clause` via wasmtime; the
+  BSD-3 option keeps them compliant, and a `deny.toml` should elect it explicitly.)
+
+Removing the runtime download is therefore not only a guardrail repair — it deletes the
+entire network stack from the linked graph of an offline-first product.
+
 ### It also blocks M0 independently
 
 `sandbox::confinement`'s seccomp policy denies `socket`, `connect`, `bind`, `listen`,
