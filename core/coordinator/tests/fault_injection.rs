@@ -103,6 +103,14 @@ fn fault_inject_worker_kill_preserves_state() {
     assert_eq!(after.page_count, before.page_count);
     assert_eq!(after.has_acroform, before.has_acroform);
     assert_eq!(after.has_xfa, before.has_xfa);
+    // page_count/has_acroform/has_xfa all come from the mmap-based COS scan and
+    // survive even when the respawned worker failed to load an engine.
+    // page_dimensions come from the engine, so they are what actually proves the
+    // respawn restored a working worker rather than a degraded one. [GR-8, SDS §10.1]
+    assert_eq!(
+        after.page_dimensions, before.page_dimensions,
+        "respawned worker lost its engine"
+    );
 
     session.send(b"quit").expect("quit");
     let _ = session.poll(Duration::from_secs(2));
