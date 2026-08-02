@@ -7,8 +7,11 @@ name: ci
 on:
   push:
     branches: [main]
+  # No base-branch filter. Restricting this to `branches: [main]` meant a PR
+  # targeting any other branch received no CI at all, so stacked work merged
+  # into an intermediate branch was never gated — the opposite of ADR-029 §1,
+  # which gates the PR pipeline, not one destination. [ADR-029]
   pull_request:
-    branches: [main]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
