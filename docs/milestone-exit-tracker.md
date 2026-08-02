@@ -6,7 +6,7 @@ Update when a criterion is proven by test, bench, or audited demo.
 | Milestone | Criterion | Status | Evidence |
 |---|---|---|---|
 | **M0** | Tile via bridge+IPC+shmem | **Met** | worker tests, shell canvas |
-| **M0** | Kill-worker respawn | **Met** | `session_death.rs` |
+| **M0** | Kill-worker respawn | **Met** | `session_death.rs`; `fault_inject_worker_kill_preserves_state` now also asserts `page_dimensions`. Until 2026-08-02 the respawned worker lost its engine to a shared file offset and every assertion still passed, because they read only mmap-derived fields |
 | **M0** | Corpus-diff + CI | **Met** | GitHub Actions |
 | **M0** | Cold-start / first-page budgets | **Met** | ~11ms / ~13ms recorded |
 | **M0** | Sandbox confinement | **Advisory + review package** | `docs/security/confinement-review-package.md`; `confinement_report()`; no silent enforce |
