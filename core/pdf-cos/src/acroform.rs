@@ -484,8 +484,16 @@ fn parse_ref_array_bytes(data: &[u8]) -> Vec<u32> {
     let mut out = Vec::new();
     while i < data.len() && data[i] != b']' {
         skip_ws(data, &mut i);
-        if data[i] == b']' {
-            break;
+        // `skip_ws` can advance `i` to `data.len()`, so the loop's bounds check
+        // no longer holds here. Indexing directly panicked on an unterminated
+        // ref array with trailing whitespace — a `/Kids [3 0 R ` whose closing
+        // bracket is gone. This parses untrusted document bytes in the Z1
+        // worker, so the panic aborts the worker and surfaces to the
+        // coordinator only as "transport disconnected".
+        // [PRIN-1, T-4, GR-1, GR-8]
+        match data.get(i) {
+            None | Some(&b']') => break,
+            _ => {}
         }
         let Some(n) = parse_uint(data, &mut i) else {
             i += 1;
