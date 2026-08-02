@@ -133,14 +133,20 @@ pub(crate) fn find_startxref(data: &[u8]) -> Option<usize> {
     const NEEDLE: &[u8] = b"startxref";
     let search_start = data.len().saturating_sub(1024);
     let tail = &data[search_start..];
-    // Find last occurrence of NEEDLE
-    let mut last = None;
-    for i in 0..=tail.len().saturating_sub(NEEDLE.len()) {
-        if &tail[i..i + NEEDLE.len()] == NEEDLE {
-            last = Some(i);
-        }
-    }
-    let pos = last?;
+    // Find the last occurrence of NEEDLE.
+    //
+    // This was a manual loop over `0..=tail.len().saturating_sub(NEEDLE.len())`.
+    // The saturating_sub was there to avoid an underflow, but the range is
+    // inclusive, so for any input shorter than the needle it still ran once
+    // with i = 0 and sliced `tail[0..9]` out of a shorter slice — a panic on a
+    // document of fewer than nine bytes. `scan_file` parses untrusted document
+    // bytes inside the Z1 worker, so that panic aborts the worker and the
+    // coordinator can only report it as "transport disconnected".
+    //
+    // `windows` yields nothing when the slice is shorter than the window, which
+    // is the behaviour the guard was reaching for.
+    // [PRIN-1, T-4, GR-1, GR-8]
+    let pos = tail.windows(NEEDLE.len()).rposition(|w| w == NEEDLE)?;
     let mut i = pos + NEEDLE.len();
     while i < tail.len() && matches!(tail[i], b' ' | b'\r' | b'\n') {
         i += 1;
