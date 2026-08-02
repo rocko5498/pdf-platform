@@ -977,14 +977,33 @@ impl DocumentCoordinator {
         self.apply_command_group(group)
             .map_err(|e| SessionError::Protocol(format!("apply redaction: {e}")))?;
 
-        // Step 4: Metadata scrubbing.
-        // (Metadata scrubbing is applied during save, not to the in-memory overlay.)
+        // Step 4: Metadata scrubbing — NOT PERFORMED, here or anywhere.
+        //
+        // The previous note said scrubbing "is applied during save". It is not:
+        // `pdf_model::redaction::scrub_metadata` is `pub`, is covered by three
+        // unit tests, and has no caller anywhere else in the workspace. Nothing
+        // on any path strips document metadata, so a term appearing in /Title,
+        // /Author or /Keywords survives redaction. Reported as not examined
+        // rather than as a scrubbed count of zero. [FR-RED-2, GR-8, PRIN-6]
 
-        // Step 5: Remove overlapping annotations.
-        let mut annotations_removed = 0u32;
-        // Note: annotation removal is done through the annotation store,
-        // which is managed by the coordinator. For now, we count the
-        // annotations that would be removed based on the redaction regions.
+        // Step 5: Remove overlapping annotations — NOT PERFORMED on this path.
+        //
+        // The previous note here said annotation removal goes "through the
+        // annotation store, which is managed by the coordinator". That is not
+        // true: the only `AnnotationStore` in the workspace lives in
+        // `ffi-bridge`, and `DocumentCoordinator` holds no reference to one.
+        // `pdf_model::redaction::remove_annotations_in_region` exists and is
+        // tested, but nothing on this path can call it because the store is on
+        // the other side of a zone boundary.
+        //
+        // So CLI redaction cannot remove an annotation whose contents carry the
+        // redacted term. Reporting that as `0 removed` would state a
+        // measurement that was never taken, so it is reported as not examined
+        // and surfaced as a remaining risk instead. Closing the gap means
+        // deciding where annotation state lives relative to GR-2's single
+        // writer and ADR-013's command path — an architectural decision, not a
+        // local fix. [FR-RED-2, GR-2, GR-8, ADR-013, SDS §3.3.1]
+        let annotations_removed: Option<u32> = None;
 
         // Step 6: Verify by re-extracting.
         let mut text_model = std::collections::HashMap::new();
@@ -998,12 +1017,30 @@ impl DocumentCoordinator {
             }
         }
 
-        let verification = verify_redaction(&removals, &text_model, None);
+        let mut verification = verify_redaction(&removals, &text_model, None);
+
+        // Neither annotations nor metadata were inspected on this path, so the
+        // redaction cannot be certified complete no matter what the text check
+        // found. Redaction completeness is an absolute metric and is never
+        // traded off. [MET-GOV-2, T-9, GR-8, PRIN-6]
+        verification.remaining_risks.push(
+            "Annotations were not examined: this path has no access to the \
+             annotation store, so an annotation overlapping a redacted region \
+             is neither removed nor reported"
+                .to_string(),
+        );
+        verification.remaining_risks.push(
+            "Metadata was not scrubbed: pdf_model::redaction::scrub_metadata has \
+             no caller anywhere outside its own tests, so document metadata that \
+             carries the redacted term is left intact"
+                .to_string(),
+        );
+        verification.passed = false;
 
         // Step 7: Generate report.
         let report = RedactionReport::generate(
             &verification,
-            0, // metadata scrubbed (applied at save time)
+            None, // metadata: never scrubbed on any path, so never measured
             annotations_removed,
             regions.len() as u32,
         );
