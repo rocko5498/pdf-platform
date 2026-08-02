@@ -82,6 +82,18 @@ partially written library through `exists()` binds a truncated file; a worker wh
 mapping is rewritten underneath it dies without stderr. Both present to the
 coordinator as `transport disconnected`.
 
+**This symptom was already on record.** `docs/milestone-exit-tracker.md` on
+`codex/jobs-scheduler` carries an M0/M3 row dated 2026-07-27 — "PDFium parallel-load
+flake (Windows) — **Open defect — not fixed**" — naming the same file and line, the
+same `LoadLibraryExW source: 32`, the same 5/8-parallel versus 8/8-serial split, and
+observing that it is cold-start only and that "CI gets a cold runner every time". It
+closes with "Does not reproduce warm, so it was not diagnosed further and no code
+changed." That row is on an unmerged branch, so it is invisible from `main`.
+
+Nothing below re-discovers that symptom. What is new here is **why** it happens — the
+cold-start correlation is a cache miss, which means a download is in flight — that it is
+not Windows-only, and that the cause is a guardrail breach rather than a flaky test.
+
 Evidence, in three parts.
 
 **1. Non-determinism.** Run `30738219376` on `e8913bd` failed on Ubuntu with two
