@@ -272,7 +272,7 @@ mod tests {
     fn confine_child_noop_on_non_windows() {
         #[cfg(not(target_os = "windows"))]
         {
-            let child = std::process::Command::new("echo").spawn().unwrap();
+            let mut child = std::process::Command::new("echo").spawn().unwrap();
             let result = confine_child(&child);
             assert!(result.is_ok());
             let _ = child.wait();
