@@ -285,10 +285,10 @@ Add a sibling job using the immutable commit for official release `install-qt-ac
           -DBUILD_TESTING=ON
 
       - name: Build shell
-        run: cmake --build build/shell --config Debug
+        run: cmake --build build/shell --config Release
 
       - name: Test shell
-        run: ctest --test-dir build/shell -C Debug --output-on-failure
+        run: ctest --test-dir build/shell -C Release --output-on-failure
 ```
 
 - [x] **Step 3: Validate workflow syntax and local diff hygiene**
@@ -314,7 +314,7 @@ git diff --check
 
 If Qt remains unavailable locally, state that the CMake/QTest proof is pending the CI matrix; do not claim it passed.
 
-- [ ] **Step 5: Commit the implementation**
+- [x] **Step 5: Commit the implementation**
 
 Create a signed commit:
 
@@ -334,7 +334,7 @@ SDS §13.6, SDS §13.7, SDS §14 M0, T-8, GR-3, GR-8
 - Consumes: three completed `shell (<os>)` CI checks.
 - Produces: an evidence-backed tracker row; no M0 completion claim.
 
-- [ ] **Step 1: Run the complete focused verification**
+- [x] **Step 1: Run the complete focused verification**
 
 Run locally:
 
@@ -354,11 +354,11 @@ shell (macos-latest)
 
 Expected: all three configure, compile, and pass `shell.canvas_input`.
 
-- [ ] **Step 2: Preserve the remaining M0 gap**
+- [x] **Step 2: Preserve the remaining M0 gap**
 
 Update the tracker only after the matrix supplies evidence. Record “shell builds + QTest on three OSes” separately from “real PDF rendered end-to-end”; leave the latter partial until a real PDF is opened and a tile is asserted through the shell on all three systems.
 
-- [ ] **Step 3: Review the final diff against exclusions**
+- [x] **Step 3: Review the final diff against exclusions**
 
 Run:
 
@@ -367,4 +367,4 @@ git diff origin/main...HEAD --name-only
 git diff origin/main...HEAD -- core/ffi-bridge shell/bridge core/sandbox
 ```
 
-Expected: no changes under the FFI bridge or sandbox paths. Shell bridge should also be unchanged.
+Expected final exception: one unused platform import is removed from `core/ffi-bridge`, and one Unix-only test binding is made mutable under `core/sandbox`; both are isolated, behavior-neutral commits requiring their respective human owners. `shell/bridge` remains unchanged.

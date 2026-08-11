@@ -5,7 +5,8 @@ Update when a criterion is proven by test, bench, or audited demo.
 
 | Milestone | Criterion | Status | Evidence |
 |---|---|---|---|
-| **M0** | Tile via bridge+IPC+shmem | **Met** | worker tests, shell canvas |
+| **M0** | Tile via bridge+IPC+shmem | **Rust path met; 3-OS shell criterion partial** | Worker/bridge tests run on all three OSes; the real end-to-end Qt shell tile has only a Windows human smoke test. |
+| **M0** | Shell build + input QTest | **Met** | `shell.canvas_input` passed on Ubuntu, Windows, and macOS in [CI run 31467989096](https://github.com/rocko5498/pdf-platform/actions/runs/31467989096). [ADR-003, ADR-026, ADR-029, T-8] |
 | **M0** | Kill-worker respawn | **Met** | `session_death.rs` |
 | **M0** | Corpus-diff + CI | **Met** | GitHub Actions |
 | **M0** | Cold-start / first-page budgets | **Met** | ~11ms / ~13ms recorded |
