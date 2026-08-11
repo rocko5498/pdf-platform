@@ -9,8 +9,6 @@
 //         this boundary; ownership does not straddle languages. [ADR-004, ADR-027]
 #![allow(static_mut_refs)] // single-threaded Qt main thread; multi-doc later
 
-use std::os::windows::io::AsRawHandle;
-
 use pdf_model::annotation::{
     Annotation, AnnotationStore, AnnotationType, Color, Rect, TextMarkupKind,
 };
