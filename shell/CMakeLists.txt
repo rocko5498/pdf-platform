@@ -9,12 +9,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
 qt_standard_project_setup()
 
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Qt6 6.5 REQUIRED COMPONENTS Test)
+endif()
+
 if(NOT DEFINED FFI_BRIDGE_LIB)
     message(FATAL_ERROR "FFI_BRIDGE_LIB must be set to the path of the ffi-bridge static library.")
 endif()
 
 add_library(ffi-bridge STATIC IMPORTED)
 set_target_properties(ffi-bridge PROPERTIES IMPORTED_LOCATION "${FFI_BRIDGE_LIB}")
+if(WIN32)
+    # Reported by `cargo rustc -p ffi-bridge -- --print native-static-libs`.
+    target_link_libraries(ffi-bridge INTERFACE
+        kernel32 ntdll userenv ws2_32 dbghelp
+    )
+endif()
 
 # M1: bridge, panels, a11y, canvas (GPU), app. [SDS §14 M1]
 add_subdirectory(bridge)
@@ -22,3 +33,7 @@ add_subdirectory(panels)
 add_subdirectory(a11y)
 add_subdirectory(canvas)
 add_subdirectory(app)
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

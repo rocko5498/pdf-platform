@@ -22,15 +22,18 @@
 ### Task 1: Remove the dead Windows-only shell path
 
 **Files:**
+- Modify: `shell/CMakeLists.txt`
 - Modify: `shell/canvas/canvas.h`
 - Modify: `shell/canvas/canvas.cc`
 - Modify: `shell/app/CMakeLists.txt`
+- Modify: `shell/panels/CMakeLists.txt`
+- Modify: `shell/panels/search_panel.cc`
 
 **Interfaces:**
 - Consumes: `TileResultFFI::shmem_handle`, already documented as a same-process mapped pointer owned by Rust.
 - Produces: the unchanged `MainWindow::mapShmem(qintptr)` behavior on all operating systems.
 
-- [ ] **Step 1: Prove the legacy section handle is never populated**
+- [x] **Step 1: Prove the legacy section handle is never populated**
 
 Run:
 
@@ -40,7 +43,7 @@ rg -n "shmem_section_|CreateFileMapping|MapViewOfFile" shell
 
 Expected: `shmem_section_` is initialized to null and only checked/cleared; no assignment gives it a live section handle.
 
-- [ ] **Step 2: Delete the unused cleanup state and Win32 calls**
+- [x] **Step 2: Delete the unused cleanup state and Win32 calls**
 
 In `canvas.h`, keep only the mapped pointer:
 
@@ -57,19 +60,23 @@ void MainWindow::mapShmem(qintptr handle) {
 }
 ```
 
-- [ ] **Step 3: Make system-library linkage platform-specific**
+- [x] **Step 3: Make system-library linkage platform-specific**
 
-Keep the Qt and shell targets in the existing `target_link_libraries` call. Move the Windows libraries into:
+Attach Rust's native libraries to the imported target so every consumer inherits them:
 
 ```cmake
 if(WIN32)
-    target_link_libraries(pdf-platform PRIVATE
-        ws2_32 ntdll userenv bcrypt advapi32 kernel32 msvcrt
+    target_link_libraries(ffi-bridge INTERFACE
+        kernel32 ntdll userenv ws2_32 dbghelp
     )
 endif()
 ```
 
-- [ ] **Step 4: Verify the source no longer has unconditional Win32 dependencies**
+- [x] **Step 4: Restore omitted shell sources exposed by the real build**
+
+The first QTest link proved `search_panel.cc/.h` were omitted from `shell-panels`; adding them exposed one uncompiled call to nonexistent `QLineEdit::setPlaceholder`. Add both sources to the target and use Qt's `setPlaceholderText` API.
+
+- [x] **Step 5: Verify the source no longer has unconditional Win32 dependencies**
 
 Run:
 
@@ -91,7 +98,7 @@ Expected: the search returns no matches and `git diff --check` exits 0.
 - Consumes: `CanvasWidget::pageStepRequested`, `zoomStepRequested`, and `scrollDeltaRequested`.
 - Produces: CTest target `shell-canvas-input-test` and test name `shell.canvas_input`.
 
-- [ ] **Step 1: Write the QTest before registering it**
+- [x] **Step 1: Write the QTest before registering it**
 
 Create `canvas_input_test.cc` with one `QObject` test class. Use `QTEST_MAIN`, `QSignalSpy`, and the real `CanvasWidget`. The test cases must assert exact signal counts and arguments:
 
@@ -157,7 +164,7 @@ QTEST_MAIN(CanvasInputTest)
 #include "canvas_input_test.moc"
 ```
 
-- [ ] **Step 2: Run CTest discovery and observe the missing test**
+- [x] **Step 2: Run CTest discovery and observe the missing test**
 
 Run after Qt is available:
 
@@ -167,7 +174,7 @@ ctest --test-dir build/shell -N
 
 Expected before registration: `shell.canvas_input` is absent.
 
-- [ ] **Step 3: Register Qt Test through standard CTest controls**
+- [x] **Step 3: Register Qt Test through standard CTest controls**
 
 In `shell/CMakeLists.txt`, add `include(CTest)`, request `Test` only under `BUILD_TESTING`, and add `tests` after production targets:
 
@@ -192,16 +199,17 @@ target_link_libraries(shell-canvas-input-test PRIVATE shell-canvas Qt6::Test Qt6
 add_test(NAME shell.canvas_input COMMAND shell-canvas-input-test)
 set_tests_properties(shell.canvas_input PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
 )
 ```
 
-- [ ] **Step 4: Build and run the focused test**
+- [x] **Step 4: Build and run the focused test**
 
 Run:
 
 ```powershell
-cmake --build build/shell --config Debug --target shell-canvas-input-test
-ctest --test-dir build/shell -C Debug --output-on-failure -R shell.canvas_input
+cmake --build build/shell --config Release --target shell-canvas-input-test
+ctest --test-dir build/shell -C Release --output-on-failure -R shell.canvas_input
 ```
 
 Expected: one test passes.
@@ -215,7 +223,7 @@ Expected: one test passes.
 - Consumes: Cargo target output `ffi_bridge.lib` on Windows and `libffi_bridge.a` on Unix.
 - Produces: required check `shell (<os>)` for Ubuntu, Windows, and macOS.
 
-- [ ] **Step 1: Confirm the current workflow never builds the shell**
+- [x] **Step 1: Confirm the current workflow never builds the shell**
 
 Run:
 
@@ -225,7 +233,7 @@ rg -n "cmake|ctest|install-qt|shell:" .github/workflows/ci.yml
 
 Expected: no Qt install, CMake configure/build, or CTest command exists; `shell:` appears only as a command interpreter selector.
 
-- [ ] **Step 2: Add the shell matrix job**
+- [x] **Step 2: Add the shell matrix job**
 
 Add a sibling job using the immutable commit for official release `install-qt-action v4.3.1`:
 
@@ -281,7 +289,7 @@ Add a sibling job using the immutable commit for official release `install-qt-ac
         run: ctest --test-dir build/shell -C Debug --output-on-failure
 ```
 
-- [ ] **Step 3: Validate workflow syntax and local diff hygiene**
+- [x] **Step 3: Validate workflow syntax and local diff hygiene**
 
 Run:
 
@@ -292,7 +300,7 @@ git diff --check
 
 If PyYAML is unavailable, use Ruby's standard YAML parser already present on GitHub runners or review with `gh workflow view ci.yml --yaml` after pushing; do not add a project dependency solely for YAML parsing.
 
-- [ ] **Step 4: Run local verifications available on this machine**
+- [x] **Step 4: Run local verifications available on this machine**
 
 Run:
 

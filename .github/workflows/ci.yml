@@ -96,3 +96,58 @@ jobs:
         run: |
           python tools/a11y_audit.py
           python tools/bench/check_p95_gates.py
+
+  shell:
+    name: shell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core -> target
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730 # v4.3.1
+        with:
+          version: 6.8.3
+          cache: true
+
+      - name: Build FFI bridge
+        working-directory: core
+        run: cargo build -p ffi-bridge
+
+      - name: Locate FFI bridge
+        id: ffi
+        shell: pwsh
+        run: |
+          $path = if ($IsWindows) {
+            Join-Path $env:GITHUB_WORKSPACE 'core/target/debug/ffi_bridge.lib'
+          } else {
+            Join-Path $env:GITHUB_WORKSPACE 'core/target/debug/libffi_bridge.a'
+          }
+          if (-not (Test-Path -LiteralPath $path)) { throw "Missing FFI bridge: $path" }
+          "path=$path" >> $env:GITHUB_OUTPUT
+
+      - name: Configure shell
+        run: >-
+          cmake -S shell -B build/shell
+          -DFFI_BRIDGE_LIB=${{ steps.ffi.outputs.path }}
+          -DPDF_PLATFORM_USE_OPENGL=OFF
+          -DBUILD_TESTING=ON
+
+      - name: Build shell
+        run: cmake --build build/shell --config Release
+
+      - name: Test shell
+        run: ctest --test-dir build/shell -C Release --output-on-failure
