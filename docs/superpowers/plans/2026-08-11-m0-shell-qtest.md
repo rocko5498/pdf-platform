@@ -6,7 +6,7 @@
 
 **Architecture:** Delete the unused Win32-only shared-memory cleanup branch while retaining Rust ownership of the normal mapped pointer, conditionally link Windows system libraries, and test the real `CanvasWidget` signals with Qt Test. A separate three-OS CI job builds Cargo's `ffi-bridge`, builds the shell with OpenGL disabled, and runs CTest offscreen.
 
-**Tech Stack:** C++20, Qt 6.8.3 Widgets/Test, CMake/CTest 3.25+, Rust/Cargo, GitHub Actions.
+**Tech Stack:** C++20, Qt 6.10.3 Widgets/Test in CI (6.8.3 local compatibility proof), CMake/CTest 3.25+, Rust/Cargo, GitHub Actions.
 
 ## Global Constraints
 
@@ -258,7 +258,7 @@ Add a sibling job using the immutable commit for official release `install-qt-ac
       - name: Install Qt
         uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730 # v4.3.1
         with:
-          version: 6.8.3
+          version: 6.10.3
           cache: true
 
       - name: Build FFI bridge
