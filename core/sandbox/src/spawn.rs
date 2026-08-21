@@ -343,9 +343,22 @@ mod unix {
     const PRIO_PROCESS: i32 = 0;
     const UTILITY_NICE: i32 = 10;
 
+    // Fixed descriptors the child finds its attachments on. Inheriting a
+    // parent-side FD *number* is not reliable: the number is only meaningful
+    // in the parent, and on macOS the child ended up either without it
+    // (EBADF from `File::metadata`) or with std already owning that number
+    // for its own IPC socket, which aborts the process with an IO-safety
+    // violation the moment both owners drop. Duplicating onto numbers above
+    // stdio that std never hands out removes both failure modes.
+    // [ADR-008, ADR-016, CMP-XPLAT-1, SDS §3.1]
+    const CHILD_DOC_FD: RawFd = 20;
+    const CHILD_SHMEM_FD: RawFd = 21;
+    const CHILD_OUTPUT_FD: RawFd = 22;
+
     extern "C" {
         fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
         fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
     }
 
     fn clear_cloexec(fd: RawFd) -> io::Result<()> {
@@ -362,10 +375,18 @@ mod unix {
         Ok(())
     }
 
-    fn set_inherited_fd(cmd: &mut Command, env_key: &str, file: &File) -> io::Result<()> {
+    /// Record one attachment: the child will see it on `child_fd`.
+    fn set_inherited_fd(
+        cmd: &mut Command,
+        env_key: &str,
+        file: &File,
+        child_fd: RawFd,
+        plan: &mut Vec<(RawFd, RawFd)>,
+    ) -> io::Result<()> {
         let fd = file.as_raw_fd();
         clear_cloexec(fd)?;
-        cmd.env(env_key, fd.to_string());
+        plan.push((fd, child_fd));
+        cmd.env(env_key, child_fd.to_string());
         Ok(())
     }
 
@@ -403,19 +424,7 @@ mod unix {
         // [ADR-008, ADR-016, CMP-XPLAT-1]
         let mut cmd = Command::new(worker_exe);
         let lower_priority = matches!(priority, SpawnPriority::UtilityLow);
-        // SAFETY: the closure runs between fork and exec, where only
-        // async-signal-safe calls are permitted. `setpriority` is a bare
-        // syscall with no allocation, no locks and no libc state; its failure
-        // is deliberately ignored because a worker that could not be niced is
-        // still a correct worker. [UNSAFE-1, UNSAFE-2, GR-8]
-        unsafe {
-            cmd.pre_exec(move || {
-                if lower_priority {
-                    setpriority(PRIO_PROCESS, 0, UTILITY_NICE);
-                }
-                Ok(())
-            });
-        }
+        let mut fd_plan: Vec<(RawFd, RawFd)> = Vec::new();
         cmd.env(ENV_IPC_SOCK, &sock_path)
             .env_remove(ENV_IPC_PIPE)
             .env_remove(ENV_DOC_HANDLE)
@@ -425,17 +434,17 @@ mod unix {
         apply_extra_env(&mut cmd, extra_env);
 
         if let Some(file) = attachments.doc {
-            set_inherited_fd(&mut cmd, ENV_DOC_FD, file)?;
+            set_inherited_fd(&mut cmd, ENV_DOC_FD, file, CHILD_DOC_FD, &mut fd_plan)?;
         } else {
             cmd.env_remove(ENV_DOC_FD);
         }
         if let Some(file) = attachments.shmem {
-            set_inherited_fd(&mut cmd, ENV_SHMEM_FD, file)?;
+            set_inherited_fd(&mut cmd, ENV_SHMEM_FD, file, CHILD_SHMEM_FD, &mut fd_plan)?;
         } else {
             cmd.env_remove(ENV_SHMEM_FD);
         }
         if let Some(file) = attachments.output {
-            set_inherited_fd(&mut cmd, ENV_OUTPUT_FD, file)?;
+            set_inherited_fd(&mut cmd, ENV_OUTPUT_FD, file, CHILD_OUTPUT_FD, &mut fd_plan)?;
         } else {
             cmd.env_remove(ENV_OUTPUT_FD);
         }
@@ -443,6 +452,34 @@ mod unix {
             cmd.env(ENV_DOC_PASSWORD, pw);
         } else {
             cmd.env_remove(ENV_DOC_PASSWORD);
+        }
+
+        // SAFETY: this closure runs in the forked child before exec, where
+        // only async-signal-safe calls are allowed. `dup2` and `setpriority`
+        // are bare syscalls: no allocation, no locks, no libc state. The
+        // captured plan is a plain Vec of integers built before the fork and
+        // only read here. Registering a pre_exec closure at all also keeps
+        // std on fork/exec instead of its posix_spawn fast path, which is
+        // what makes these duplications observable to the child.
+        // A failed `setpriority` is ignored on purpose: a worker that could
+        // not be niced is still a correct worker. A failed `dup2` is not
+        // ignored — the child would otherwise run without the attachment it
+        // was promised. [UNSAFE-1, UNSAFE-2, GR-8]
+        unsafe {
+            cmd.pre_exec(move || {
+                for (source, target) in &fd_plan {
+                    if source == target {
+                        continue;
+                    }
+                    if dup2(*source, *target) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                if lower_priority {
+                    setpriority(PRIO_PROCESS, 0, UTILITY_NICE);
+                }
+                Ok(())
+            });
         }
 
         let child = cmd.spawn().map_err(|e| {
