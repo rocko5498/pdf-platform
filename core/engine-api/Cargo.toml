@@ -3,6 +3,6 @@ name        = "engine-api"
 description = "Engine capability traits. All engine calls go through here. [ADR-005, ADR-025]"
 version.workspace = true
 edition.workspace = true
-
+license.workspace = true
 [dependencies]
 pdf-types = { path = "../pdf-types" }

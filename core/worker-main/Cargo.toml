@@ -3,7 +3,7 @@ name        = "worker-main"
 description = "Z1 worker process binary. Sandboxed; hosts the engine backend. [ADR-008, SDS §2.3]"
 version.workspace = true
 edition.workspace = true
-
+license.workspace = true
 [[bin]]
 name = "worker"
 path = "src/main.rs"

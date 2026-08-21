@@ -37,6 +37,12 @@ members = [
 [workspace.package]
 version   = "0.1.0"
 edition   = "2021"
+# Every crate here is part of the GPLv3 application, not a separately licensed
+# library. The SPDX string matches the one already declared in
+# `plugin-sdk/Cargo.toml`, which is the only in-repo statement of the "or later"
+# question. Without this an SBOM lists this project's own code as unlicensed.
+# [ADR-028 §1, ADR-029 §3, PR-4]
+license   = "GPL-3.0-or-later"
 # MSRV: trailing ~2 stable versions per ADR-027
 rust-version = "1.80"
 

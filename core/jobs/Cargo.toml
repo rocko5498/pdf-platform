@@ -3,7 +3,7 @@ name        = "jobs"
 description = "Bounded declarative job DAG scheduler with priority and cooperative cancellation. [ADR-009]"
 version.workspace = true
 edition.workspace = true
-
+license.workspace = true
 [dependencies]
 protocol = { path = "../protocol" }
 sandbox = { path = "../sandbox" }

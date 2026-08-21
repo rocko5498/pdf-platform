@@ -3,6 +3,7 @@ name        = "engine-pdfium"
 description = "PDFium rasterizer backend. Feature-gated; sandboxed in Z1. [ADR-005, SDS §13.4]"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 build = "build.rs"
 
 [dependencies]

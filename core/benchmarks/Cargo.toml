@@ -3,7 +3,7 @@ name        = "benchmarks"
 description = "Criterion micro-benchmarks for the render pipeline. [ADR-023]"
 version.workspace = true
 edition.workspace = true
-
+license.workspace = true
 [lib]
 name = "benchmarks_lib"
 path = "src/lib.rs"
