@@ -36,6 +36,10 @@ pub const ENV_DOC_HANDLE: &str = "PDF_PLATFORM_DOC_HANDLE";
 pub const ENV_SHMEM_FD: &str = "PDF_PLATFORM_SHMEM_FD";
 /// Windows: inherited shared-memory HANDLE as decimal integer.
 pub const ENV_SHMEM_HANDLE: &str = "PDF_PLATFORM_SHMEM_HANDLE";
+/// Unix: inherited broker-created output FD.
+pub const ENV_OUTPUT_FD: &str = "PDF_PLATFORM_OUTPUT_FD";
+/// Windows: inherited broker-created output HANDLE.
+pub const ENV_OUTPUT_HANDLE: &str = "PDF_PLATFORM_OUTPUT_HANDLE";
 /// Password for encrypted documents (UTF-8, passed as env var).
 pub const ENV_DOC_PASSWORD: &str = "PDF_PLATFORM_DOC_PASSWORD";
 
@@ -47,13 +51,20 @@ pub struct SpawnAttachments<'a> {
     pub doc: Option<&'a File>,
     /// Shared tile buffer file.
     pub shmem: Option<&'a File>,
+    /// Broker-created candidate output file.
+    pub output: Option<&'a File>,
     /// Password for encrypted documents (passed as env var, not FD).
     pub password: Option<&'a str>,
 }
 
 impl<'a> Default for SpawnAttachments<'a> {
     fn default() -> Self {
-        Self { doc: None, shmem: None, password: None }
+        Self {
+            doc: None,
+            shmem: None,
+            output: None,
+            password: None,
+        }
     }
 }
 
@@ -65,9 +76,83 @@ pub struct WorkerChild {
     pub child: Child,
 }
 
+#[derive(Clone, Copy)]
+enum SpawnPriority {
+    Normal,
+    UtilityLow,
+}
+
 /// Spawn `worker_exe` and establish a framed control channel (no attachments).
 pub fn spawn_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
     spawn_worker_with_env(worker_exe, &[])
+}
+
+/// Spawn a utility worker at OS-level below-normal priority. [ADR-009]
+pub fn spawn_utility_worker(worker_exe: &Path) -> io::Result<WorkerChild> {
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments::default(),
+        &[],
+        SpawnPriority::UtilityLow,
+    )
+}
+
+/// Spawn a low-priority utility worker with one inherited shared-memory region.
+pub fn spawn_utility_worker_with_shmem(worker_exe: &Path, shmem: &File) -> io::Result<WorkerChild> {
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments {
+            doc: None,
+            shmem: Some(shmem),
+            output: None,
+            password: None,
+        },
+        &[],
+        SpawnPriority::UtilityLow,
+    )
+}
+
+/// Spawn a low-priority utility worker with brokered document and shared-memory handles.
+///
+/// No document or shared-memory path is exposed to the child. [GR-1, ADR-009]
+pub fn spawn_utility_worker_with_attachments(
+    worker_exe: &Path,
+    doc: &File,
+    shmem: &File,
+    password: Option<&str>,
+) -> io::Result<WorkerChild> {
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments {
+            doc: Some(doc),
+            shmem: Some(shmem),
+            output: None,
+            password,
+        },
+        &[],
+        SpawnPriority::UtilityLow,
+    )
+}
+
+/// Spawn a low-priority utility worker with source, shared-memory, and candidate handles.
+pub fn spawn_utility_worker_with_io(
+    worker_exe: &Path,
+    doc: &File,
+    shmem: &File,
+    output: &File,
+    password: Option<&str>,
+) -> io::Result<WorkerChild> {
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments {
+            doc: Some(doc),
+            shmem: Some(shmem),
+            output: Some(output),
+            password,
+        },
+        &[],
+        SpawnPriority::UtilityLow,
+    )
 }
 
 /// Like [`spawn_worker`], with extra environment variables for the child.
@@ -75,7 +160,12 @@ pub fn spawn_worker_with_env(
     worker_exe: &Path,
     extra_env: &[(&str, &str)],
 ) -> io::Result<WorkerChild> {
-    spawn_impl(worker_exe, &SpawnAttachments::default(), extra_env)
+    spawn_impl(
+        worker_exe,
+        &SpawnAttachments::default(),
+        extra_env,
+        SpawnPriority::Normal,
+    )
 }
 
 /// Spawn worker with an inheritable document file (no path string). [SDS Â§3.1]
@@ -90,9 +180,11 @@ pub fn spawn_worker_with_file(
         &SpawnAttachments {
             doc: Some(doc),
             shmem: None,
+            output: None,
             password,
         },
         extra_env,
+        SpawnPriority::Normal,
     )
 }
 
@@ -102,7 +194,7 @@ pub fn spawn_worker_with_attachments(
     attachments: &SpawnAttachments<'_>,
     extra_env: &[(&str, &str)],
 ) -> io::Result<WorkerChild> {
-    spawn_impl(worker_exe, attachments, extra_env)
+    spawn_impl(worker_exe, attachments, extra_env, SpawnPriority::Normal)
 }
 
 /// Adopt the IPC end inside the worker process.
@@ -156,6 +248,22 @@ pub fn adopt_shmem_file() -> io::Result<Option<File>> {
     }
 }
 
+/// Adopt the inherited broker-created output file, if attached.
+pub fn adopt_output_file() -> io::Result<Option<File>> {
+    #[cfg(unix)]
+    {
+        return unix::adopt_file_from_env(ENV_OUTPUT_FD);
+    }
+    #[cfg(windows)]
+    {
+        return windows::adopt_file_from_env(ENV_OUTPUT_HANDLE);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(None)
+    }
+}
+
 /// Adopt the document password from the environment, if the parent provided one.
 pub fn adopt_password() -> Option<String> {
     std::env::var(ENV_DOC_PASSWORD).ok()
@@ -165,18 +273,19 @@ fn spawn_impl(
     worker_exe: &Path,
     attachments: &SpawnAttachments<'_>,
     extra_env: &[(&str, &str)],
+    priority: SpawnPriority,
 ) -> io::Result<WorkerChild> {
     #[cfg(unix)]
     {
-        return unix::spawn_worker(worker_exe, attachments, extra_env);
+        return unix::spawn_worker(worker_exe, attachments, extra_env, priority);
     }
     #[cfg(windows)]
     {
-        return windows::spawn_worker(worker_exe, attachments, extra_env);
+        return windows::spawn_worker(worker_exe, attachments, extra_env, priority);
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (worker_exe, attachments, extra_env);
+        let _ = (worker_exe, attachments, extra_env, priority);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "spawn_worker unsupported on this OS",
@@ -207,7 +316,10 @@ where
         }
     }
     Err(last.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::ConnectionRefused, "connect retries exhausted")
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connect retries exhausted",
+        )
     }))
 }
 
@@ -220,6 +332,7 @@ mod unix {
     use super::*;
     use crate::transport::UnixWorkerTransport;
     use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::process::CommandExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
 
@@ -227,8 +340,25 @@ mod unix {
     const F_SETFD: i32 = 2;
     const FD_CLOEXEC: i32 = 1;
 
+    const PRIO_PROCESS: i32 = 0;
+    const UTILITY_NICE: i32 = 10;
+
+    // Fixed descriptors the child finds its attachments on. Inheriting a
+    // parent-side FD *number* is not reliable: the number is only meaningful
+    // in the parent, and on macOS the child ended up either without it
+    // (EBADF from `File::metadata`) or with std already owning that number
+    // for its own IPC socket, which aborts the process with an IO-safety
+    // violation the moment both owners drop. Duplicating onto numbers above
+    // stdio that std never hands out removes both failure modes.
+    // [ADR-008, ADR-016, CMP-XPLAT-1, SDS §3.1]
+    const CHILD_DOC_FD: RawFd = 20;
+    const CHILD_SHMEM_FD: RawFd = 21;
+    const CHILD_OUTPUT_FD: RawFd = 22;
+
     extern "C" {
         fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
     }
 
     fn clear_cloexec(fd: RawFd) -> io::Result<()> {
@@ -245,10 +375,18 @@ mod unix {
         Ok(())
     }
 
-    fn set_inherited_fd(cmd: &mut Command, env_key: &str, file: &File) -> io::Result<()> {
+    /// Record one attachment: the child will see it on `child_fd`.
+    fn set_inherited_fd(
+        cmd: &mut Command,
+        env_key: &str,
+        file: &File,
+        child_fd: RawFd,
+        plan: &mut Vec<(RawFd, RawFd)>,
+    ) -> io::Result<()> {
         let fd = file.as_raw_fd();
         clear_cloexec(fd)?;
-        cmd.env(env_key, fd.to_string());
+        plan.push((fd, child_fd));
+        cmd.env(env_key, child_fd.to_string());
         Ok(())
     }
 
@@ -256,6 +394,7 @@ mod unix {
         worker_exe: &Path,
         attachments: &SpawnAttachments<'_>,
         extra_env: &[(&str, &str)],
+        priority: SpawnPriority,
     ) -> io::Result<WorkerChild> {
         let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
         let sock_path: PathBuf = std::env::temp_dir().join(format!(
@@ -274,28 +413,73 @@ mod unix {
         }
         let unlink = Unlink(sock_path.clone());
 
+        // Priority is applied in the forked child, not by exec-ing `nice`.
+        // The wrapper cost a second exec that the inherited shmem/document FDs
+        // had to survive, and on macOS they did not: the utility worker got
+        // EBADF from `File::metadata()` on ENV_SHMEM_FD while Linux passed.
+        // Registering a `pre_exec` closure also keeps std on its fork/exec
+        // path rather than the `posix_spawn` fast path, which is what makes
+        // the cleared FD_CLOEXEC above actually mean inherited. `nice` is also
+        // one less external binary the sandboxed spawn depends on.
+        // [ADR-008, ADR-016, CMP-XPLAT-1]
         let mut cmd = Command::new(worker_exe);
+        let lower_priority = matches!(priority, SpawnPriority::UtilityLow);
+        let mut fd_plan: Vec<(RawFd, RawFd)> = Vec::new();
         cmd.env(ENV_IPC_SOCK, &sock_path)
             .env_remove(ENV_IPC_PIPE)
             .env_remove(ENV_DOC_HANDLE)
             .env_remove(ENV_SHMEM_HANDLE)
+            .env_remove(ENV_OUTPUT_HANDLE)
             .env_remove("PDF_PLATFORM_DOC_PATH");
         apply_extra_env(&mut cmd, extra_env);
 
         if let Some(file) = attachments.doc {
-            set_inherited_fd(&mut cmd, ENV_DOC_FD, file)?;
+            set_inherited_fd(&mut cmd, ENV_DOC_FD, file, CHILD_DOC_FD, &mut fd_plan)?;
         } else {
             cmd.env_remove(ENV_DOC_FD);
         }
         if let Some(file) = attachments.shmem {
-            set_inherited_fd(&mut cmd, ENV_SHMEM_FD, file)?;
+            set_inherited_fd(&mut cmd, ENV_SHMEM_FD, file, CHILD_SHMEM_FD, &mut fd_plan)?;
         } else {
             cmd.env_remove(ENV_SHMEM_FD);
+        }
+        if let Some(file) = attachments.output {
+            set_inherited_fd(&mut cmd, ENV_OUTPUT_FD, file, CHILD_OUTPUT_FD, &mut fd_plan)?;
+        } else {
+            cmd.env_remove(ENV_OUTPUT_FD);
         }
         if let Some(pw) = attachments.password {
             cmd.env(ENV_DOC_PASSWORD, pw);
         } else {
             cmd.env_remove(ENV_DOC_PASSWORD);
+        }
+
+        // SAFETY: this closure runs in the forked child before exec, where
+        // only async-signal-safe calls are allowed. `dup2` and `setpriority`
+        // are bare syscalls: no allocation, no locks, no libc state. The
+        // captured plan is a plain Vec of integers built before the fork and
+        // only read here. Registering a pre_exec closure at all also keeps
+        // std on fork/exec instead of its posix_spawn fast path, which is
+        // what makes these duplications observable to the child.
+        // A failed `setpriority` is ignored on purpose: a worker that could
+        // not be niced is still a correct worker. A failed `dup2` is not
+        // ignored — the child would otherwise run without the attachment it
+        // was promised. [UNSAFE-1, UNSAFE-2, GR-8]
+        unsafe {
+            cmd.pre_exec(move || {
+                for (source, target) in &fd_plan {
+                    if source == target {
+                        continue;
+                    }
+                    if dup2(*source, *target) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                if lower_priority {
+                    setpriority(PRIO_PROCESS, 0, UTILITY_NICE);
+                }
+                Ok(())
+            });
         }
 
         let child = cmd.spawn().map_err(|e| {
@@ -328,10 +512,7 @@ mod unix {
             return Ok(None);
         };
         let fd: RawFd = raw.parse().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("bad {env_key}: {raw}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad {env_key}: {raw}"))
         })?;
         // SAFETY: parent set env to an inheritable FD for this process only.
         let file = unsafe { File::from_raw_fd(fd) };
@@ -348,8 +529,10 @@ mod windows {
     use super::*;
     use crate::transport::{NamedPipeClient, NamedPipeServer};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use std::os::windows::process::CommandExt;
 
     const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -382,6 +565,7 @@ mod windows {
         worker_exe: &Path,
         attachments: &SpawnAttachments<'_>,
         extra_env: &[(&str, &str)],
+        priority: SpawnPriority,
     ) -> io::Result<WorkerChild> {
         let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
         let pipe_name = format!(
@@ -391,10 +575,14 @@ mod windows {
         );
 
         let mut cmd = Command::new(worker_exe);
+        if matches!(priority, SpawnPriority::UtilityLow) {
+            cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+        }
         cmd.env(ENV_IPC_PIPE, &pipe_name)
             .env_remove(ENV_IPC_SOCK)
             .env_remove(ENV_DOC_FD)
             .env_remove(ENV_SHMEM_FD)
+            .env_remove(ENV_OUTPUT_FD)
             .env_remove("PDF_PLATFORM_DOC_PATH");
         apply_extra_env(&mut cmd, extra_env);
 
@@ -407,6 +595,11 @@ mod windows {
             set_inherited_handle(&mut cmd, ENV_SHMEM_HANDLE, file)?;
         } else {
             cmd.env_remove(ENV_SHMEM_HANDLE);
+        }
+        if let Some(file) = attachments.output {
+            set_inherited_handle(&mut cmd, ENV_OUTPUT_HANDLE, file)?;
+        } else {
+            cmd.env_remove(ENV_OUTPUT_HANDLE);
         }
         if let Some(pw) = attachments.password {
             cmd.env(ENV_DOC_PASSWORD, pw);
@@ -432,11 +625,7 @@ mod windows {
                 format!("missing env {ENV_IPC_PIPE}"),
             )
         })?;
-        let client = connect_with_retry(
-            || NamedPipeClient::connect(&pipe_name),
-            50,
-            100,
-        )?;
+        let client = connect_with_retry(|| NamedPipeClient::connect(&pipe_name), 50, 100)?;
         Ok(Box::new(client))
     }
 
@@ -445,10 +634,7 @@ mod windows {
             return Ok(None);
         };
         let as_int: usize = raw.parse().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("bad {env_key}: {raw}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad {env_key}: {raw}"))
         })?;
         let handle = as_int as RawHandle;
         // SAFETY: parent set env to an inheritable HANDLE for this process only.

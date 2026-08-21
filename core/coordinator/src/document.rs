@@ -10,10 +10,11 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use pdf_model::command::CommandGroup;
+use pdf_model::command::{CommandGroup, SetObjectCommand};
 use pdf_model::journal::UndoJournal;
 use pdf_model::overlay::CowOverlay;
 use pdf_model::organize::{build_delete_pages_group, build_rotate_pages_group};
+use pdf_model::stamp::{Stamp, StampPosition};
 use pdf_write::IncrementalWriter;
 use protocol::inspect::StructuralSummary;
 use text_extract::TextExtractionService;
@@ -110,18 +111,6 @@ pub struct SelectionBox {
     pub height: f32,
 }
 
-/// Output from OCR processing a single page. [FR-OCR, M9]
-#[derive(Debug, Clone)]
-pub struct OcrPageOutput {
-    /// 0-based page index.
-    pub page_index: u32,
-    /// The OCR recognition result.
-    pub ocr_result: ocr_bridge::OcrPageResult,
-    /// The invisible text layer content stream.
-    pub text_layer_stream: Vec<u8>,
-}
-
-
 impl DocumentCoordinator {
     /// Open a document and create a coordinator. [SDS §3.1]
     ///
@@ -136,7 +125,13 @@ impl DocumentCoordinator {
         let mut session = WorkerSession::spawn_with_document(worker_exe, brokered)?;
 
         let summary = session.inspect()?;
-        let next_obj_num = summary.page_count + 3; // catalog + pages + last page
+        let next_obj_num = summary
+            .original_offsets
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
         let sidecar = Self::compute_sidecar_path(doc_path);
 
         Ok(Self {
@@ -523,6 +518,54 @@ impl DocumentCoordinator {
         self.apply_command_group(group)
     }
 
+    /// Apply the same text stamp to every page as one undoable edit. [FR-BATCH-1, M6]
+    pub fn apply_stamp(&mut self, stamp: &Stamp) -> Result<(), SessionError> {
+        let pages = self.stamp_page_objects()?;
+        let stamps = vec![stamp.clone(); pages.len()];
+        let (group, next_obj_num) = build_stamp_group(&pages, &stamps, self.next_obj_num)?;
+        self.apply_command_group(group)?;
+        self.next_obj_num = next_obj_num;
+        Ok(())
+    }
+
+    /// Apply sequential Bates numbers to every page as one undoable edit. [FR-BATCH-1, M6]
+    pub fn apply_bates(
+        &mut self,
+        start: u32,
+        width: usize,
+        position: StampPosition,
+        font_size: f32,
+    ) -> Result<(), SessionError> {
+        let pages = self.stamp_page_objects()?;
+        let stamps = (0..pages.len())
+            .map(|index| Stamp {
+                text: pdf_model::stamp::bates_number(start, index as u32, width),
+                position,
+                font_size,
+                ..Stamp::default()
+            })
+            .collect::<Vec<_>>();
+        let (group, next_obj_num) = build_stamp_group(&pages, &stamps, self.next_obj_num)?;
+        self.apply_command_group(group)?;
+        self.next_obj_num = next_obj_num;
+        Ok(())
+    }
+
+    fn stamp_page_objects(&mut self) -> Result<Vec<(u32, Vec<u8>)>, SessionError> {
+        let pages_obj_num = self.find_pages_object()?;
+        let pages_bytes = self.session.get_object(pages_obj_num)?;
+        let page_refs = self.parse_kid_references(&String::from_utf8_lossy(&pages_bytes));
+        if page_refs.len() != self.summary.page_count as usize {
+            return Err(SessionError::Protocol(
+                "stamping nested page trees is not yet supported".into(),
+            ));
+        }
+        page_refs
+            .into_iter()
+            .map(|obj_num| self.session.get_object(obj_num).map(|bytes| (obj_num, bytes)))
+            .collect()
+    }
+
     /// Find the Pages parent object number by reading the catalog. [SDS §3.1]
     fn find_pages_object(&mut self) -> Result<u32, SessionError> {
         // Read the catalog (object 1) to find /Pages reference.
@@ -667,6 +710,37 @@ impl DocumentCoordinator {
     /// Page count from the structural summary.
     pub fn page_count(&self) -> u32 {
         self.summary.page_count
+    }
+
+    /// Next free object number for allocating new objects (annotations, OCR
+    /// text layers, etc). `apply_command_group` does not itself advance this
+    /// — callers that allocate object numbers for a group must call
+    /// [`Self::set_next_obj_num`] afterward, or a second group built in the
+    /// same session will collide with the first's numbers.
+    pub fn next_obj_num(&self) -> u32 {
+        self.next_obj_num
+    }
+
+    /// Advance the next-free-object-number counter (see [`Self::next_obj_num`]).
+    pub fn set_next_obj_num(&mut self, value: u32) {
+        self.next_obj_num = value;
+    }
+
+    /// Resolve a page index to its object number and current serialized
+    /// bytes. [FR-OCR-1]
+    pub fn page_object(&mut self, page_index: u32) -> Result<(u32, Vec<u8>), SessionError> {
+        let pages_obj_num = self.find_pages_object()?;
+        let pages_bytes = self.session.get_object(pages_obj_num)?;
+        let pages_text = String::from_utf8_lossy(&pages_bytes);
+        let kid_refs = self.parse_kid_references(&pages_text);
+        let page_obj_num = *kid_refs.get(page_index as usize).ok_or_else(|| {
+            SessionError::Protocol(format!(
+                "page {page_index} out of range ({} pages)",
+                kid_refs.len()
+            ))
+        })?;
+        let page_bytes = self.session.get_object(page_obj_num)?;
+        Ok((page_obj_num, page_bytes))
     }
 
     /// The document's structural summary.
@@ -958,14 +1032,33 @@ impl DocumentCoordinator {
         self.apply_command_group(group)
             .map_err(|e| SessionError::Protocol(format!("apply redaction: {e}")))?;
 
-        // Step 4: Metadata scrubbing.
-        // (Metadata scrubbing is applied during save, not to the in-memory overlay.)
+        // Step 4: Metadata scrubbing — NOT PERFORMED, here or anywhere.
+        //
+        // The previous note said scrubbing "is applied during save". It is not:
+        // `pdf_model::redaction::scrub_metadata` is `pub`, is covered by three
+        // unit tests, and has no caller anywhere else in the workspace. Nothing
+        // on any path strips document metadata, so a term appearing in /Title,
+        // /Author or /Keywords survives redaction. Reported as not examined
+        // rather than as a scrubbed count of zero. [FR-RED-2, GR-8, PRIN-6]
 
-        // Step 5: Remove overlapping annotations.
-        let mut annotations_removed = 0u32;
-        // Note: annotation removal is done through the annotation store,
-        // which is managed by the coordinator. For now, we count the
-        // annotations that would be removed based on the redaction regions.
+        // Step 5: Remove overlapping annotations — NOT PERFORMED on this path.
+        //
+        // The previous note here said annotation removal goes "through the
+        // annotation store, which is managed by the coordinator". That is not
+        // true: the only `AnnotationStore` in the workspace lives in
+        // `ffi-bridge`, and `DocumentCoordinator` holds no reference to one.
+        // `pdf_model::redaction::remove_annotations_in_region` exists and is
+        // tested, but nothing on this path can call it because the store is on
+        // the other side of a zone boundary.
+        //
+        // So CLI redaction cannot remove an annotation whose contents carry the
+        // redacted term. Reporting that as `0 removed` would state a
+        // measurement that was never taken, so it is reported as not examined
+        // and surfaced as a remaining risk instead. Closing the gap means
+        // deciding where annotation state lives relative to GR-2's single
+        // writer and ADR-013's command path — an architectural decision, not a
+        // local fix. [FR-RED-2, GR-2, GR-8, ADR-013, SDS §3.3.1]
+        let annotations_removed: Option<u32> = None;
 
         // Step 6: Verify by re-extracting.
         let mut text_model = std::collections::HashMap::new();
@@ -979,12 +1072,30 @@ impl DocumentCoordinator {
             }
         }
 
-        let verification = verify_redaction(&removals, &text_model, None);
+        let mut verification = verify_redaction(&removals, &text_model, None);
+
+        // Neither annotations nor metadata were inspected on this path, so the
+        // redaction cannot be certified complete no matter what the text check
+        // found. Redaction completeness is an absolute metric and is never
+        // traded off. [MET-GOV-2, T-9, GR-8, PRIN-6]
+        verification.remaining_risks.push(
+            "Annotations were not examined: this path has no access to the \
+             annotation store, so an annotation overlapping a redacted region \
+             is neither removed nor reported"
+                .to_string(),
+        );
+        verification.remaining_risks.push(
+            "Metadata was not scrubbed: pdf_model::redaction::scrub_metadata has \
+             no caller anywhere outside its own tests, so document metadata that \
+             carries the redacted term is left intact"
+                .to_string(),
+        );
+        verification.passed = false;
 
         // Step 7: Generate report.
         let report = RedactionReport::generate(
             &verification,
-            0, // metadata scrubbed (applied at save time)
+            None, // metadata: never scrubbed on any path, so never measured
             annotations_removed,
             regions.len() as u32,
         );
@@ -998,86 +1109,101 @@ impl DocumentCoordinator {
         })
     }
 
-    /// Render a full page as a raster for OCR processing. [FR-OCR, M9]
-    ///
-    /// Sends a request to the worker to render the page at the specified
-    /// DPI scale and returns the RGBA8 pixel data.
-    pub fn render_page_for_ocr(
-        &mut self,
-        page_index: u32,
-        dpi: u32,
-    ) -> Result<crate::session::PageRasterResult, SessionError> {
-        // Convert DPI to scale factor: scale = dpi / 72 (PDF base unit is 72 DPI).
-        let scale = dpi as f32 / 72.0;
-        self.session.render_page_for_ocr(page_index, scale)
-    }
-
-    /// Run OCR on a page and return the text layer content stream. [FR-OCR, M9]
-    ///
-    /// Renders the page, runs Tesseract OCR, and generates an invisible
-    /// text layer content stream. The caller can apply this to the overlay.
-    pub fn ocr_page(
-        &mut self,
-        page_index: u32,
-        dpi: u32,
-        language: &str,
-    ) -> Result<OcrPageOutput, SessionError> {
-        use ocr_bridge::{TesseractEngine, OcrEngine, PreprocessOptions, generate_text_layer_stream};
-
-        // Step 1: Render the page.
-        let raster = self.render_page_for_ocr(page_index, dpi)?;
-
-        // Step 2: Run OCR.
-        let engine = TesseractEngine::with_config(
-            std::path::PathBuf::from("tesseract"),
-            language,
-        );
-
-        if !engine.is_available() {
-            return Err(SessionError::Protocol(
-                "Tesseract not found — install tesseract-ocr".into()
-            ));
-        }
-
-        let options = PreprocessOptions {
-            deskew: true,
-            despeckle: true,
-            target_dpi: dpi,
-            ocr_pages_with_text: false,
-        };
-
-        let result = engine.recognize(
-            &raster.pixels,
-            raster.width,
-            raster.height,
-            page_index,
-            &options,
-        );
-
-        if !result.success {
-            return Err(SessionError::Protocol(
-                result.error.unwrap_or_else(|| "OCR failed".into())
-            ));
-        }
-
-        // Step 3: Generate text layer.
-        // We need the page height in PDF points. For now, use a reasonable estimate.
-        // A proper implementation would get this from the document structure.
-        let page_height = raster.height as f32 * 72.0 / dpi as f32;
-        let text_layer = generate_text_layer_stream(&result.blocks, page_height);
-
-        Ok(OcrPageOutput {
-            page_index,
-            ocr_result: result,
-            text_layer_stream: text_layer,
-        })
-    }
+    // OCR entry point: `coordinator::ocr::run_ocr_for_page` [ADR-018, FR-OCR-1].
+    //
+    // This used to be `render_page_for_ocr`/`ocr_page` here, but that path ran
+    // Tesseract directly in Z0 (no sandbox — a real ADR-016/018 violation, not
+    // hypothetical) via the base64-over-IPC `RenderPageForOcr` command, which
+    // itself exceeds the transport's frame cap on any realistic page size, and
+    // scaled recognized blocks onto the page without converting out of raster
+    // pixel space first. Zero callers anywhere in the codebase. Removed rather
+    // than fixed in place: `coordinator::ocr::run_ocr_for_page` (this session)
+    // already does this correctly — self-rendering inside the sandboxed
+    // utility pool, no raster crossing IPC, and calling `scale_blocks_to_page`
+    // before generating the text layer.
 
     pub fn close_worker(&mut self) -> Result<(), SessionError> {
         let _ = self.session.send(b"CMD:QUIT\n");
         let _ = self.session.kill_worker();
         Ok(())
     }
+}
+
+fn build_stamp_group(
+    pages: &[(u32, Vec<u8>)],
+    stamps: &[Stamp],
+    next_obj_num: u32,
+) -> Result<(CommandGroup, u32), SessionError> {
+    if pages.len() != stamps.len() {
+        return Err(SessionError::Protocol("page/stamp count mismatch".into()));
+    }
+
+    let font_obj_num = next_obj_num;
+    let mut group = CommandGroup::new("Stamp pages");
+    group.push(Box::new(SetObjectCommand {
+        obj_num: font_obj_num,
+        new_bytes: format!(
+            "{font_obj_num} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+        )
+        .into_bytes(),
+        old_bytes: None,
+    }));
+
+    for (index, ((page_obj_num, page_bytes), stamp)) in pages.iter().zip(stamps).enumerate() {
+        let content_obj_num = font_obj_num + 1 + index as u32;
+        let (width, height) = parse_media_box(page_bytes)?;
+        let stream = pdf_model::stamp::generate_stamp_stream(stamp, width, height);
+        let stream_obj = format!(
+            "{content_obj_num} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+            stream.len(),
+            String::from_utf8_lossy(&stream)
+        )
+        .into_bytes();
+        let patched_page = pdf_model::page_patch::inject_content_ref_and_font(
+            page_bytes,
+            content_obj_num,
+            font_obj_num,
+            "FStamp",
+        )
+        .map_err(SessionError::Protocol)?;
+
+        group.push(Box::new(SetObjectCommand {
+            obj_num: *page_obj_num,
+            new_bytes: patched_page,
+            old_bytes: Some(page_bytes.clone()),
+        }));
+        group.push(Box::new(SetObjectCommand {
+            obj_num: content_obj_num,
+            new_bytes: stream_obj,
+            old_bytes: None,
+        }));
+    }
+
+    Ok((group, font_obj_num + 1 + pages.len() as u32))
+}
+
+fn parse_media_box(page_bytes: &[u8]) -> Result<(f32, f32), SessionError> {
+    let text = String::from_utf8_lossy(page_bytes);
+    let start = text
+        .find("/MediaBox")
+        .ok_or_else(|| SessionError::Protocol("page has no explicit /MediaBox".into()))?;
+    let open = start
+        + text[start..]
+            .find('[')
+            .ok_or_else(|| SessionError::Protocol("malformed /MediaBox".into()))?;
+    let close = open
+        + text[open..]
+            .find(']')
+            .ok_or_else(|| SessionError::Protocol("malformed /MediaBox".into()))?;
+    let values = text[open + 1..close]
+        .split_whitespace()
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionError::Protocol("malformed /MediaBox".into()))?;
+    if values.len() != 4 || values[2] <= values[0] || values[3] <= values[1] {
+        return Err(SessionError::Protocol("malformed /MediaBox".into()));
+    }
+    Ok((values[2] - values[0], values[3] - values[1]))
 }
 
 #[cfg(test)]
@@ -1183,6 +1309,27 @@ mod tests {
         assert!(meta.len() > 0);
 
         fs::remove_file(&save_path).ok();
+    }
+
+    #[test]
+    fn stamp_group_writes_page_font_and_content_objects() {
+        let page = b"3 0 obj\n<< /Type /Page /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>\nendobj\n".to_vec();
+        let stamps = vec![pdf_model::stamp::Stamp {
+            text: "CONFIDENTIAL".into(),
+            ..pdf_model::stamp::Stamp::default()
+        }];
+
+        let (group, next) = build_stamp_group(&[(3, page)], &stamps, 20).unwrap();
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+
+        assert_eq!(next, 22);
+        assert!(String::from_utf8_lossy(overlay.get_object(3).unwrap())
+            .contains("/Contents [4 0 R 21 0 R]"));
+        assert!(String::from_utf8_lossy(overlay.get_object(20).unwrap())
+            .contains("/BaseFont /Helvetica"));
+        assert!(String::from_utf8_lossy(overlay.get_object(21).unwrap())
+            .contains("CONFIDENTIAL"));
     }
 
     #[test]

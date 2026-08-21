@@ -3,7 +3,7 @@ name        = "worker-main"
 description = "Z1 worker process binary. Sandboxed; hosts the engine backend. [ADR-008, SDS §2.3]"
 version.workspace = true
 edition.workspace = true
-
+license.workspace = true
 [[bin]]
 name = "worker"
 path = "src/main.rs"
@@ -23,6 +23,8 @@ sandbox       = { path = "../sandbox" }
 protocol      = { path = "../protocol" }
 diagnostics   = { path = "../diagnostics" }
 pdf-model     = { path = "../pdf-model" }
+ocr-bridge    = { path = "../ocr-bridge" }
+render-pipeline = { path = "../render-pipeline" }
 base64        = "0.22"
 
 [dev-dependencies]
@@ -30,3 +32,4 @@ base64        = "0.22"
 sandbox       = { path = "../sandbox" }
 protocol      = { path = "../protocol" }
 coordinator   = { path = "../coordinator" }
+jobs          = { path = "../jobs" }

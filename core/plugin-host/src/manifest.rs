@@ -153,6 +153,18 @@ pub enum ManifestError {
     },
     /// No capabilities declared (warn, not error — a plugin may be observation-only).
     NoCapabilities,
+    /// The manifest targets a WIT world this host does not implement.
+    ///
+    /// The host offers exactly [`HOST_WIT_WORLD`]; a plugin built against a
+    /// different one cannot be linked, so accepting it would defer a
+    /// guaranteed failure to instantiation time.
+    /// [FR-PLUG-5, DS-PLUG-VER-1, ADR-015, ADR-030, SDS §11.1]
+    IncompatibleWitWorld {
+        /// The world the manifest asked for.
+        declared: String,
+        /// The world this host implements.
+        host: &'static str,
+    },
 }
 
 impl std::fmt::Display for ManifestError {
@@ -164,6 +176,12 @@ impl std::fmt::Display for ManifestError {
                 write!(f, "invalid field '{field}': {reason}")
             }
             Self::NoCapabilities => write!(f, "no capabilities declared"),
+            Self::IncompatibleWitWorld { declared, host } => write!(
+                f,
+                "plugin targets WIT world '{declared}', but this host implements \
+                 '{host}'. Rebuild the plugin against '{host}', or run a host \
+                 version that provides '{declared}'."
+            ),
         }
     }
 }
@@ -179,6 +197,11 @@ pub fn parse_manifest(data: &[u8]) -> Result<PluginManifest, ManifestError> {
 
     Ok(manifest)
 }
+
+/// The WIT world this host implements, and the only one it can link a plugin
+/// against. Must track `plugin-sdk/wit/plugin.wit`'s `package` declaration.
+/// [ADR-015, ADR-030]
+pub const HOST_WIT_WORLD: &str = "pdf-platform:plugin@1";
 
 /// Validate a parsed manifest.
 fn validate_manifest(m: &PluginManifest) -> Result<(), ManifestError> {
@@ -201,6 +224,16 @@ fn validate_manifest(m: &PluginManifest) -> Result<(), ManifestError> {
         return Err(ManifestError::InvalidField {
             field: "version",
             reason: format!("expected semver X.Y.Z, got '{}'", m.version),
+        });
+    }
+
+    // A world this host does not implement cannot be linked, so accepting the
+    // manifest would only defer a certain failure to instantiation time.
+    // [FR-PLUG-5, DS-PLUG-VER-1, SDS §11.1]
+    if m.wit_world != HOST_WIT_WORLD {
+        return Err(ManifestError::IncompatibleWitWorld {
+            declared: m.wit_world.clone(),
+            host: HOST_WIT_WORLD,
         });
     }
 
@@ -340,5 +373,66 @@ mod tests {
         let serialized = serde_json::to_string(&m).unwrap();
         let m2: PluginManifest = serde_json::from_str(&serialized).unwrap();
         assert_eq!(m, m2);
+    }
+
+    fn conformant() -> PluginManifest {
+        PluginManifest {
+            id: "com.example.word-counter".into(),
+            name: "Word Counter".into(),
+            version: "1.0.0".into(),
+            author: "Example".into(),
+            description: "Counts words".into(),
+            wit_world: HOST_WIT_WORLD.into(),
+            capabilities: Vec::new(),
+            panels: Vec::new(),
+            tools: Vec::new(),
+            job_types: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accepts_a_manifest_targeting_the_host_world() {
+        assert!(validate_manifest(&conformant()).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_manifest_targeting_a_different_wit_world() {
+        // The PluginManifest doc comment and SDS §11.1 both say a manifest the
+        // host's WIT world cannot serve is *rejected with a clear
+        // version-mismatch reason*. Only non-emptiness was checked, so a
+        // plugin built against a future world validated clean.
+        // [FR-PLUG-5, DS-PLUG-VER-1, ADR-015, ADR-030]
+        let mut manifest = conformant();
+        manifest.wit_world = "pdf-platform:plugin@2".into();
+        let error = validate_manifest(&manifest)
+            .expect_err("an incompatible world must not validate");
+        assert!(
+            matches!(error, ManifestError::IncompatibleWitWorld { .. }),
+            "{error:?}"
+        );
+        let shown = error.to_string();
+        assert!(
+            shown.contains("pdf-platform:plugin@2") && shown.contains(HOST_WIT_WORLD),
+            "the reason must name both the declared and the supported world: {shown}"
+        );
+    }
+
+    #[test]
+    fn parse_manifest_enforces_the_wit_world_not_just_the_shape() {
+        // cmd_plugin_validate bypassed parse_manifest and called serde
+        // directly, so nothing here ran at all. This pins the entry point.
+        let json = br#"{
+            "id": "com.example.p",
+            "name": "P",
+            "version": "1.0.0",
+            "author": "A",
+            "description": "D",
+            "wit_world": "pdf-platform:plugin@99",
+            "capabilities": []
+        }"#;
+        assert!(matches!(
+            parse_manifest(json),
+            Err(ManifestError::IncompatibleWitWorld { .. })
+        ));
     }
 }

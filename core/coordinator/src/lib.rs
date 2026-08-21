@@ -5,8 +5,10 @@
 
 pub mod broker; // Broker: sole executor of privileged ops [SDS §2.2.6, ADR-016]
 pub mod document; // DocumentCoordinator actor; per-document owned state + channel inbox
+pub mod indexing; // Cross-document index enrollment orchestration [ADR-019 §3, ADR-034]
 pub mod inspect; // Synchronous inspect for CLI diagnostic path [ADR-010, FR-DIAG-2]
 pub mod memory; // CacheGovernor + MemoryGovernor [SDS §2.2.4, ADR-011]
+pub mod ocr; // OCR job scheduling: render + recognize + text-layer Command [ADR-018, SDS §2.5]
 pub mod plugin; // CoordinatorPluginHost: Z0 plugin control plane [SDS §2.2.7, ADR-014]
 pub mod render; // RenderScheduler: viewport → tile requests [SDS §2.2.2]
 pub mod session; // WorkerSession: spawn/poll/death/inspect/respawn [SDS §10.1, §3.1]

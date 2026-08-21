@@ -8,3 +8,4 @@ pub mod layout; // Grid layout, page positioning, viewport state, scale bucketin
 pub mod scheduler; // RenderScheduler: decompose viewport → tile requests, priority ordering
 pub mod scroll; // Scroll physics: velocity tracking, momentum, edge resistance [SDS §6.8]
 pub mod shmem; // shared-memory buffer pool; handle lifecycle [ADR-031]
+pub mod thumbnail; // Engine-neutral bounded thumbnail rendering. [ADR-005, ADR-009]

@@ -3,13 +3,14 @@ name        = "cli"
 description = "Headless CLI client of the coordinator. Proves shell has no privileged capability. [ADR-025, SDS §2.10]"
 version.workspace = true
 edition.workspace = true
-
+license.workspace = true
 [[bin]]
 name = "pdf-platform"
 path = "src/main.rs"
 
 [dependencies]
 coordinator = { path = "../coordinator" }
+jobs        = { path = "../jobs" }
 protocol    = { path = "../protocol" }
 diagnostics = { path = "../diagnostics" }
 sandbox     = { path = "../sandbox" }
@@ -17,5 +18,7 @@ pdf-model   = { path = "../pdf-model" }
 sign        = { path = "../sign" }
 ocr-bridge  = { path = "../ocr-bridge" }
 plugin-host = { path = "../plugin-host" }
+search      = { path = "../search" }
+text-extract = { path = "../text-extract" }
 plugin-sdk  = { path = "../../plugin-sdk", package = "pdf-platform-plugin-sdk" }
 serde_json  = "1"

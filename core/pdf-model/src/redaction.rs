@@ -342,20 +342,50 @@ pub fn verify_redaction(
                                 items_confirmed += 1;
                             }
                         }
-                        RemovedContent::Annotation { .. } => {
-                            items_confirmed += 1;
+                        // Only the text arm above re-inspects anything. These
+                        // counted themselves as "confirmed removed" without
+                        // looking — the same absence-of-evidence-as-proof the
+                        // text arm was fixed for, left in place for everything
+                        // that is not text. SDS §3.3.1 requires verification to
+                        // assert absence; nothing here can.
+                        // [FR-RED-3, FR-RED-4, MET-FEAT-5, PRIN-6, GR-8]
+                        RemovedContent::Annotation { ann_id, ann_type } => {
+                            risks.push(format!(
+                                "Page {}: could not verify removal of annotation \
+                                 {ann_id} ({ann_type}) — no annotation \
+                                 re-inspection is performed",
+                                removal.page_index
+                            ));
                         }
-                        RemovedContent::Image { .. } => {
-                            items_confirmed += 1;
+                        RemovedContent::Image { obj_num } => {
+                            risks.push(format!(
+                                "Page {}: could not verify removal of image object \
+                                 {obj_num} — no image re-inspection is performed",
+                                removal.page_index
+                            ));
                         }
-                        _ => {
-                            items_confirmed += 1;
+                        other => {
+                            risks.push(format!(
+                                "Page {}: could not verify removal of {other:?} — \
+                                 no re-inspection is performed for this content kind",
+                                removal.page_index
+                            ));
                         }
                     }
                 }
             }
         } else {
-            items_confirmed += 1;
+            // No extracted text for this page. This previously counted as an
+            // item "confirmed removed" — absence of evidence taken as proof.
+            // SDS §3.3.1 requires verification to re-extract and assert
+            // absence; with nothing to inspect, nothing can be asserted, and a
+            // redaction verifier must never pass by default.
+            // [FR-RED-3, FR-RED-4, MET-FEAT-5, PRIN-6, GR-8]
+            risks.push(format!(
+                "Page {}: could not verify removal — no extracted text was \
+                 available to re-inspect after redaction",
+                removal.page_index
+            ));
         }
 
         // Check serialized output bytes for remaining redacted text.
@@ -520,17 +550,29 @@ fn regions_overlap(a: &Rect, b: &Rect) -> bool {
 pub struct RedactionReport {
     pub passed: bool,
     pub verification: VerificationResult,
-    pub metadata_scrubbed: u32,
-    pub annotations_removed: u32,
+    /// Metadata fields scrubbed, or `None` when metadata was never examined.
+    /// A signed report must not render "not looked at" as "zero found".
+    /// [PRIN-6, GR-8, FR-RED-4]
+    pub metadata_scrubbed: Option<u32>,
+    /// Annotations removed, or `None` when annotations were never examined.
+    pub annotations_removed: Option<u32>,
     pub content_patches: u32,
     pub report_text: String,
+}
+
+/// Render a count that may not have been measured at all.
+fn count_or_not_examined(value: Option<u32>) -> String {
+    match value {
+        Some(n) => n.to_string(),
+        None => "not examined".to_string(),
+    }
 }
 
 impl RedactionReport {
     pub fn generate(
         verification: &VerificationResult,
-        metadata_scrubbed: u32,
-        annotations_removed: u32,
+        metadata_scrubbed: Option<u32>,
+        annotations_removed: Option<u32>,
         content_patches: u32,
     ) -> Self {
         let report_text = format!(
@@ -542,8 +584,8 @@ impl RedactionReport {
              Content stream patches: {}\n\
              {}\n",
             if verification.passed { "PASSED" } else { "FAILED" },
-            metadata_scrubbed,
-            annotations_removed,
+            count_or_not_examined(metadata_scrubbed),
+            count_or_not_examined(annotations_removed),
             content_patches,
             verification.report,
         );
@@ -561,6 +603,66 @@ impl RedactionReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A redaction verifier must not treat an unexamined item as removed.
+    /// The text arm was fixed to stop counting absence of evidence as proof;
+    /// the annotation and image arms still did exactly that.
+    /// [FR-RED-3, FR-RED-4, MET-FEAT-5, PRIN-6, GR-8]
+    #[test]
+    fn annotation_removal_is_not_confirmed_without_evidence() {
+        let removals = vec![RemovalRecord {
+            page_index: 0,
+            rect: Rect::new(10.0, 20.0, 100.0, 50.0),
+            removed: vec![RemovedContent::Annotation {
+                ann_id: 7,
+                ann_type: "Highlight".into(),
+            }],
+        }];
+        let mut text_model = HashMap::new();
+        text_model.insert(0, vec!["safe text only".into()]);
+
+        let v = verify_redaction(&removals, &text_model, None);
+
+        assert_eq!(
+            v.items_confirmed_removed, 0,
+            "nothing was inspected, so nothing may be counted as confirmed"
+        );
+        assert!(!v.passed, "an unverifiable removal must not pass");
+        assert!(
+            v.remaining_risks.iter().any(|r| r.contains("annotation")),
+            "the risk must name what could not be verified, got {:?}",
+            v.remaining_risks
+        );
+    }
+
+    /// "0" and "was never looked at" are different facts and a signed report
+    /// must not render them identically. [PRIN-6, GR-8, FR-RED-4]
+    #[test]
+    fn report_distinguishes_not_examined_from_none_found() {
+        let v = VerificationResult::pass(1, 1);
+
+        let examined = RedactionReport::generate(&v, Some(0), Some(0), 1);
+        assert!(
+            examined.report_text.contains("Annotations removed: 0"),
+            "an examined zero still reads as zero, got:
+{}",
+            examined.report_text
+        );
+
+        let unexamined = RedactionReport::generate(&v, None, None, 1);
+        assert!(
+            unexamined.report_text.contains("Annotations removed: not examined"),
+            "an unexamined count must say so, got:
+{}",
+            unexamined.report_text
+        );
+        assert!(
+            unexamined.report_text.contains("Metadata fields scrubbed: not examined"),
+            "an unexamined count must say so, got:
+{}",
+            unexamined.report_text
+        );
+    }
 
     #[test]
     fn redaction_batch_mark_and_verify() {
@@ -591,6 +693,39 @@ mod tests {
         let result = verify_redaction(&removals, &text_model, None);
         assert!(result.passed);
         assert!(result.remaining_risks.is_empty());
+    }
+
+    #[test]
+    fn verification_cannot_pass_without_evidence_for_a_redacted_page() {
+        // The `else` branch counted a missing text-model entry as an item
+        // "confirmed removed" — absence of evidence treated as proof. In the
+        // real path this fired for every page: the coordinator invalidates the
+        // text cache when it applies the redaction group, so the map it then
+        // hands here is always empty, and verification passed vacuously.
+        // Redaction correctness is an absolute metric.
+        // [FR-RED-3, FR-RED-4, MET-FEAT-5, SDS §3.3.1, PRIN-6, GR-8]
+        let removals = vec![RemovalRecord {
+            page_index: 0,
+            rect: Rect::new(10.0, 20.0, 100.0, 50.0),
+            removed: vec![RemovedContent::Text {
+                char_count: 6,
+                text_sample: "secret".into(),
+            }],
+        }];
+
+        let result = verify_redaction(&removals, &HashMap::new(), None);
+        assert!(
+            !result.passed,
+            "no evidence must never verify as removed: {result:?}"
+        );
+        assert!(
+            result
+                .remaining_risks
+                .iter()
+                .any(|r| r.to_lowercase().contains("could not")),
+            "the risk must say verification was not possible: {:?}",
+            result.remaining_risks
+        );
     }
 
     #[test]
@@ -880,10 +1015,10 @@ mod tests {
     fn redaction_report_generated() {
         // [FR-RED-3] Redaction report is generated with all details.
         let verification = VerificationResult::pass(2, 5);
-        let report = RedactionReport::generate(&verification, 3, 2, 4);
+        let report = RedactionReport::generate(&verification, Some(3), Some(2), 4);
         assert!(report.passed);
-        assert_eq!(report.metadata_scrubbed, 3);
-        assert_eq!(report.annotations_removed, 2);
+        assert_eq!(report.metadata_scrubbed, Some(3));
+        assert_eq!(report.annotations_removed, Some(2));
         assert_eq!(report.content_patches, 4);
         assert!(report.report_text.contains("PASSED"));
         assert!(report.report_text.contains("Metadata fields scrubbed: 3"));
@@ -954,7 +1089,7 @@ mod tests {
         assert!(verification.passed, "verification should pass");
 
         // Step 7: Generate report.
-        let report = RedactionReport::generate(&verification, 1, 1, 1);
+        let report = RedactionReport::generate(&verification, Some(1), Some(1), 1);
         assert!(report.passed);
         assert!(report.report_text.contains("PASSED"));
         assert!(report.report_text.contains("Metadata fields scrubbed: 1"));

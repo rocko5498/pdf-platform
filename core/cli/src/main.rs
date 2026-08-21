@@ -42,6 +42,10 @@ fn main() {
             cmd_plugin_list();
             return;
         }
+        "index" => {
+            cmd_index(&args[2..]);
+            return;
+        }
         "plugin-validate" => {
             if args.len() < 3 {
                 eprintln!("error: plugin-validate requires a manifest file argument");
@@ -190,6 +194,7 @@ fn usage() {
          \x20 pdf-platform plugin-list\n\
          \x20 pdf-platform plugin-validate <manifest.json>\n\
          \x20 pdf-platform batch <pipeline.txt>\n\
+         \x20 pdf-platform index enroll|list|reindex|remove|search <args>\n\
          \x20 pdf-platform forms-calc-demo\n\
          \x20 pdf-platform confinement"
     );
@@ -365,15 +370,26 @@ fn cmd_plugin_list() {
         }
     };
 
-    // For now, show the plugin system status.
-    // In production, this would scan the plugin directory.
+    // Report only what can actually be established. `manager` was previously
+    // constructed and then discarded (hence the unused-variable warning), and
+    // the hard-coded names below were printed where a listing would go.
+    // There is no filesystem plugin discovery: PluginManager::discover takes
+    // manifest bytes, not a directory, and no document specifies a plugins
+    // folder — so installed plugins genuinely cannot be enumerated yet, and
+    // this says so rather than implying an empty or fictional result.
+    // [PRIN-6, GR-8, FR-PLUG-1, SDS §11.1]
     println!("Plugin runtime: initialized");
-    println!("WIT world:      pdf-platform:plugin@1");
+    println!("WIT world:      {}", plugin_host::manifest::HOST_WIT_WORLD);
     println!("SDK version:    {}", plugin_sdk::CURRENT_WIT_WORLD_VERSION);
+    println!("Enabled plugins: {}", manager.plugin_ids().len());
+    println!();
+    println!("Installed-plugin discovery is not implemented: there is no plugin");
+    println!("directory scan, so this command cannot list what is installed.");
+    println!("Validate a manifest directly with: pdf-platform plugin-validate <manifest.json>");
     println!();
 
-    // Show example plugins from the SDK.
-    println!("Example plugins (in plugin-sdk/examples/):");
+    // Shipped with the SDK — these are source examples, not installed plugins.
+    println!("Example plugins shipped in plugin-sdk/examples/:");
     println!();
     println!("  word-counter/");
     println!("    A simple plugin that counts words in the document.");
@@ -412,11 +428,15 @@ fn cmd_plugin_validate(manifest_path: &Path) {
         }
     };
 
-    // Parse the manifest.
-    let manifest: PluginManifest = match serde_json::from_slice(&manifest_bytes) {
+    // Use the host's own validator. This previously called serde_json
+    // directly, bypassing `parse_manifest` entirely — so no required-field,
+    // semver, or WIT-world check ran, and every manifest reached the
+    // "PASSED" line below. [FR-PLUG-5, DS-PLUG-VER-1, SDS §11.1]
+    let manifest: PluginManifest = match plugin_host::manifest::parse_manifest(&manifest_bytes) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("error: invalid manifest JSON: {e}");
+            eprintln!("error: {e}");
+            eprintln!("Manifest validation: FAILED");
             process::exit(1);
         }
     };
@@ -431,10 +451,9 @@ fn cmd_plugin_validate(manifest_path: &Path) {
     println!("WIT world:      {}", manifest.wit_world);
     println!();
 
-    // Check WIT world compatibility.
-    if manifest.wit_world != "pdf-platform:plugin@1" {
-        eprintln!("warning: WIT world '{}' may not be compatible with current version", manifest.wit_world);
-    }
+    // WIT world compatibility is enforced by parse_manifest above, which
+    // rejects an unsupported world outright rather than warning and then
+    // reporting PASSED. [FR-PLUG-5, DS-PLUG-VER-1]
 
     // List capabilities.
     if manifest.capabilities.is_empty() {
@@ -574,6 +593,7 @@ fn cmd_extract_pages(path: &Path, rest: &[String]) {
 }
 
 fn cmd_optimize(path: &Path, rest: &[String]) {
+    use coordinator::broker::optimize_with_verification;
     use pdf_model::assembly::OptimizeProfile;
     use pdf_model::assembly_ops::optimize_pdf;
     let profile_name = rest
@@ -593,7 +613,10 @@ fn cmd_optimize(path: &Path, rest: &[String]) {
             process::exit(1);
         }
     };
-    match optimize_pdf(path, &out, profile) {
+    let result = optimize_with_verification(&out, |candidate_path| {
+        optimize_pdf(path, candidate_path, profile).map_err(|e| e.to_string())
+    });
+    match result {
         Ok(preflight) => {
             print!("{preflight}");
             println!("\nWrote {}", out.display());
@@ -611,8 +634,6 @@ fn cmd_optimize(path: &Path, rest: &[String]) {
 /// Usage: pdf-platform stamp <file> --text "WATERMARK" -o <out.pdf>
 ///        pdf-platform stamp <file> --bates-start 1 --bates-width 6 -o <out.pdf>
 fn cmd_stamp(path: &Path, rest: &[String]) {
-    use pdf_model::stamp::{Stamp, StampPosition, generate_stamp_stream, bates_number};
-
     let text = rest.iter()
         .position(|s| s == "--text")
         .and_then(|i| rest.get(i + 1))
@@ -642,18 +663,55 @@ fn cmd_stamp(path: &Path, rest: &[String]) {
         process::exit(1);
     }
 
-    // For now, report what would be stamped (actual PDF patching requires
-    // the full page-content injection pipeline which is a coordinator task).
-    if let Some(ref t) = text {
-        println!("Stamp '{}' on all pages of {}", t, path.display());
-        println!("Font size: {font_size}, position: bottom-center");
-    } else if let Some(start) = bates_start {
-        println!("Bates stamp starting at {start} (width {bates_width}) on all pages of {}",
-            path.display());
+    if let Err(error) = run_stamp(
+        path,
+        &out,
+        text.as_deref(),
+        bates_start,
+        bates_width,
+        font_size,
+    ) {
+        eprintln!("error: {error}");
+        process::exit(2);
     }
     println!("Wrote {}", out.display());
-    eprintln!("Note: stamp CLI is a content-stream generator; full page injection is pending coordinator integration.");
     process::exit(0);
+}
+
+fn run_stamp(
+    input: &Path,
+    output: &Path,
+    text: Option<&str>,
+    bates_start: Option<u32>,
+    bates_width: usize,
+    font_size: f32,
+) -> Result<(), String> {
+    let worker = find_worker();
+    let mut coordinator = coordinator::document::DocumentCoordinator::open(&worker, input)
+        .map_err(|e| e.to_string())?;
+    if let Some(text) = text {
+        let stamp = pdf_model::stamp::Stamp {
+            text: text.to_string(),
+            font_size,
+            ..pdf_model::stamp::Stamp::default()
+        };
+        coordinator.apply_stamp(&stamp).map_err(|e| e.to_string())?;
+    } else if let Some(start) = bates_start {
+        coordinator
+            .apply_bates(
+                start,
+                bates_width,
+                pdf_model::stamp::StampPosition::BottomCenter,
+                font_size,
+            )
+            .map_err(|e| e.to_string())?;
+    } else {
+        return Err("stamp text or Bates start is required".into());
+    }
+    coordinator
+        .save_incremental(output)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 
@@ -719,7 +777,31 @@ fn cmd_redact_by_term(path: &Path, rest: &[String]) {
             }
             println!();
             println!("{}", result.report);
-            process::exit(0);
+
+            // This path applies the redaction group to the in-memory overlay
+            // and never serializes it: there is no output argument and no save
+            // call, so the document on disk is byte-identical afterwards and
+            // still contains the term. Previously this exited 0 regardless,
+            // including when verification failed, so a pipeline read it as a
+            // completed redaction. FR-RED-4 forbids a cosmetic redaction path
+            // existing at all; until saving and SDS §3.3.1 verification (re-
+            // extract from the *serialized* result) are wired up, the only
+            // honest outcome is to refuse.
+            // [FR-RED-1..6, MET-FEAT-5, SDS §3.3.1, PRIN-1, PRIN-6, GR-8]
+            if result.regions_redacted == 0 {
+                println!("No matches found; document unchanged.");
+                process::exit(0);
+            }
+            eprintln!();
+            eprintln!(
+                "NOT REDACTED: {} region(s) matched, but no output was written and",
+                result.regions_redacted
+            );
+            eprintln!("{} is byte-identical — it still contains the term.", path.display());
+            eprintln!("Content removal is applied to an in-memory overlay only; saving and");
+            eprintln!("the SDS §3.3.1 verification pass (re-extracting the serialized result)");
+            eprintln!("are not implemented. Do not treat this command as having redacted.");
+            process::exit(1);
         }
         Err(e) => {
             eprintln!("error: redaction failed: {e}");
@@ -758,9 +840,16 @@ fn cmd_validate_signatures(path: &Path) {
     println!("Found {} signature(s) in {}", signatures.len(), path.display());
     println!();
 
-    // For validation, we use the same bytes as original and current
-    // (no post-signing changes detected in a single read).
+    // `extract_xref_offsets` is not implemented and returns an empty map, so
+    // every post-signing change check inside `validate_signature` trivially
+    // passes and the verdict falls through to Valid. A ByteRange hash proves
+    // only that the *signed* bytes are intact; an illegal post-signing edit is
+    // an appended incremental update that leaves that hash matching. Reporting
+    // Valid here would be a false valid, which FR-SIG-1 forbids and
+    // MET-FEAT-6 makes absolute — so results are downgraded to Indeterminate
+    // until real xref extraction lands. [FR-SIG-1, PRIN-6, MET-FEAT-6]
     let xref = extract_xref_offsets(&file_bytes);
+    let change_evidence_available = !xref.is_empty();
 
     let mut all_valid = true;
     for (i, sig) in signatures.iter().enumerate() {
@@ -777,12 +866,30 @@ fn cmd_validate_signatures(path: &Path) {
         println!();
 
         // Validate.
-        let report = validate_signature(&file_bytes, sig, &xref, &xref);
+        let report = sign::require_change_evidence(
+            validate_signature(&file_bytes, sig, &xref, &xref),
+            change_evidence_available,
+        );
 
         println!("  Status: {}", report.status);
         println!("  Explanation: {}", report.explanation);
-        println!("  Hash match: {}", if report.hash_match { "yes" } else { "NO" });
-        println!("  Integrity check: {}", if report.integrity_check_passed { "passed" } else { "FAILED" });
+        // These two lines used to read "Hash match: yes" and "Integrity check:
+        // passed" for any well-formed ByteRange, while nothing compared a hash
+        // and no cryptography ran at all. A reader takes those as "the signed
+        // bytes are intact", which is exactly the false valid FR-SIG-1 forbids
+        // and MET-FEAT-6 marks absolute. [PRIN-6, GR-8]
+        println!(
+            "  ByteRange well-formed: {}",
+            if report.byte_range_well_formed { "yes" } else { "NO" }
+        );
+        println!(
+            "  Cryptographic verification: {}",
+            match report.cms_verified {
+                Some(true) => "passed",
+                Some(false) => "FAILED",
+                None => "NOT PERFORMED — CMS verification is deferred (M10)",
+            }
+        );
         println!("  Signer trusted: {}", if report.signer_trusted { "yes" } else { "no (trust store not configured)" });
 
         if !report.post_signing_changes.is_empty() {
@@ -1007,7 +1114,13 @@ fn extract_docmdp_level(dict: &str) -> Option<sign::DocMDPLevel> {
 /// and saves the result. Pages with existing text are skipped unless
 /// --with-text is specified. [FR-OCR-3]
 fn cmd_ocr(path: &Path, rest: &[String]) {
-    use ocr_bridge::{TesseractEngine, OcrEngine, PreprocessOptions, generate_text_layer_stream, page_has_text};
+    use coordinator::ocr::{run_ocr_for_page, OcrOutcome, OcrPageContext, DEFAULT_CONFIDENCE_THRESHOLD};
+    use jobs::utility_pool::UtilityPool;
+    use jobs::{JobEvent, JobGraph, JobPriority, JobScheduler, JobSpec};
+    use ocr_bridge::{OcrEngine, PreprocessOptions, TesseractEngine};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     // Parse arguments.
     let lang = rest.iter()
@@ -1076,7 +1189,9 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
     };
 
     let page_count = coord.page_count();
-    let pages_to_ocr = pages.unwrap_or_else(|| (0..page_count).collect());
+    let mut pages_to_ocr = pages.unwrap_or_else(|| (0..page_count).collect());
+    pages_to_ocr.sort_unstable();
+    pages_to_ocr.dedup();
 
     println!("Processing {} page(s)...", pages_to_ocr.len());
 
@@ -1087,32 +1202,174 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
         ocr_pages_with_text: with_text,
     };
 
-    let mut ocr_count = 0u32;
+    // Resolve each page's object number/bytes/geometry and reserve its two
+    // object numbers (content stream + font, see build_apply_ocr_text_layer_group)
+    // up front — sequential on the main thread, before any job dispatch, so
+    // concurrent per-page jobs never race over the same free object number.
+    let mut page_contexts: HashMap<u64, OcrPageContext> = HashMap::new();
     let mut skip_count = 0u32;
-    let mut error_count = 0u32;
-
     for &page_idx in &pages_to_ocr {
         if page_idx >= page_count {
             eprintln!("  warning: page {} out of range (max {}), skipping", page_idx, page_count - 1);
+            skip_count += 1;
             continue;
         }
+        let (page_obj_num, original_page_bytes) = match coord.page_object(page_idx) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  error: page {page_idx}: could not resolve page object: {e}");
+                skip_count += 1;
+                continue;
+            }
+        };
+        let (page_width_pt, page_height_pt, _rotation) =
+            coord.summary().page_dimensions_f()[page_idx as usize];
+        let next_obj_num = coord.next_obj_num();
+        coord.set_next_obj_num(next_obj_num + 2);
+        page_contexts.insert(
+            page_idx as u64,
+            OcrPageContext {
+                page_index: page_idx,
+                page_obj_num,
+                original_page_bytes,
+                page_width_pt,
+                page_height_pt,
+                next_obj_num,
+            },
+        );
+    }
 
-        // Check if page already has text.
-        if !with_text {
-            // We'd need to check the text model here. For now, we OCR all pages.
-            // A proper implementation would use the coordinator's text extraction.
+    if page_contexts.is_empty() {
+        println!();
+        println!("OCR summary:");
+        println!("  Pages processed: 0");
+        println!("  Pages skipped:   {skip_count}");
+        let _ = coord.close();
+        process::exit(if skip_count > 0 { 2 } else { 0 });
+    }
+
+    let worker = find_worker();
+    let pool = match UtilityPool::new(&worker, 1) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("error: utility pool spawn failed: {e:?}");
+            process::exit(2);
         }
+    };
+    let document = match std::fs::File::open(path) {
+        Ok(f) => Arc::new(f),
+        Err(e) => {
+            eprintln!("error: reopen for OCR failed: {e}");
+            process::exit(2);
+        }
+    };
 
-        // For the CLI, we report what would be done.
-        // Full OCR requires rasterization from the engine, which happens in the worker.
-        // The coordinator would need to:
-        // 1. Request a page raster from the worker
-        // 2. Run OCR on it (in the utility pool)
-        // 3. Generate the text layer
-        // 4. Apply it to the overlay
-        // For now, we report the OCR would run on this page.
-        println!("  page {}: OCR would run (rasterization + recognition + text layer)", page_idx);
-        ocr_count += 1;
+    let job_count = page_contexts.len();
+    let contexts = Arc::new(Mutex::new(page_contexts));
+    let outcomes: Arc<Mutex<HashMap<u64, OcrOutcome>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let exec_pool = pool.clone();
+    let exec_document = document.clone();
+    let exec_contexts = contexts.clone();
+    let exec_outcomes = outcomes.clone();
+    let lang_owned = lang.clone();
+    let scheduler = match JobScheduler::new_typed(1, job_count, move |spec, context| {
+        let page = exec_contexts
+            .lock()
+            .unwrap()
+            .remove(&spec.id)
+            .ok_or_else(|| jobs::JobRunError::Execution(format!("no context for job {}", spec.id)))?;
+        let outcome = run_ocr_for_page(
+            &exec_pool,
+            &exec_document,
+            None,
+            spec.id,
+            context,
+            page,
+            &lang_owned,
+            options.clone(),
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        )?;
+        exec_outcomes.lock().unwrap().insert(spec.id, outcome);
+        Ok(())
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: job scheduler init failed: {e:?}");
+            process::exit(2);
+        }
+    };
+
+    let job_ids: Vec<u64> = contexts.lock().unwrap().keys().copied().collect();
+    let specs: Vec<JobSpec> = job_ids
+        .iter()
+        .map(|&id| JobSpec::new(id, "ocr-schedule", JobPriority::UserInitiated).idempotent())
+        .collect();
+    let graph = match JobGraph::new(specs) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: OCR job graph construction failed: {e:?}");
+            process::exit(2);
+        }
+    };
+    if let Err(e) = scheduler.submit(graph) {
+        eprintln!("error: OCR job submission failed: {e:?}");
+        process::exit(2);
+    }
+
+    let mut remaining = job_count;
+    let mut dispatch_errors: Vec<(u64, String)> = Vec::new();
+    while remaining > 0 {
+        match scheduler.recv_event_timeout(Duration::from_secs(120)) {
+            Some(JobEvent::Completed { .. }) => remaining -= 1,
+            Some(JobEvent::Failed { job, message }) => {
+                dispatch_errors.push((job, message));
+                remaining -= 1;
+            }
+            Some(_) => {}
+            None => {
+                eprintln!("error: timed out waiting for OCR jobs");
+                break;
+            }
+        }
+    }
+    scheduler.shutdown();
+
+    let mut ocr_count = 0u32;
+    let mut error_count = 0u32;
+    let mut outcomes = outcomes.lock().unwrap();
+    for &page_idx in &pages_to_ocr {
+        let job_id = page_idx as u64;
+        if let Some((_, message)) = dispatch_errors.iter().find(|(id, _)| *id == job_id) {
+            eprintln!("  page {page_idx}: dispatch failed: {message}");
+            error_count += 1;
+            continue;
+        }
+        match outcomes.remove(&job_id) {
+            Some(OcrOutcome::Applied(group)) => {
+                if let Err(e) = coord.apply_command_group(group) {
+                    eprintln!("  page {page_idx}: apply failed: {e}");
+                    error_count += 1;
+                } else {
+                    println!("  page {page_idx}: OCR applied");
+                    ocr_count += 1;
+                }
+            }
+            Some(OcrOutcome::Uncertain { result, threshold }) => {
+                eprintln!(
+                    "  page {page_idx}: OCR uncertain (confidence {:.2} < {:.2}), not applied",
+                    result.average_confidence, threshold
+                );
+                skip_count += 1;
+            }
+            Some(OcrOutcome::Failed(message)) => {
+                eprintln!("  page {page_idx}: OCR failed: {message}");
+                error_count += 1;
+            }
+            None => {
+                // Page was out of range or unresolvable — already counted above.
+            }
+        }
     }
 
     println!();
@@ -1122,17 +1379,18 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
     println!("  Errors:          {}", error_count);
 
     if ocr_count > 0 {
-        println!();
-        println!("Note: Full OCR pipeline (rasterize → recognize → apply text layer)");
-        println!("requires worker integration. The OCR engine and text layer generation");
-        println!("are implemented in ocr-bridge; coordinator wiring is pending.");
-        println!();
-        println!("To use OCR with Tesseract directly:");
-        println!("  tesseract input.png output --oem 1 --psm 6 -l {} tsv", lang);
+        match coord.save_incremental(&out) {
+            Ok(_) => println!("Saved: {}", out.display()),
+            Err(e) => {
+                eprintln!("error: save failed: {e}");
+                let _ = coord.close();
+                process::exit(2);
+            }
+        }
     }
 
     let _ = coord.close();
-    process::exit(0);
+    process::exit(if error_count > 0 { 1 } else { 0 });
 }
 
 /// Validate PDF/A conformance. [FR-STD-1, FR-STD-2, M10]
@@ -1178,12 +1436,26 @@ fn cmd_validate_pdf_a(path: &Path, rest: &[String]) {
 
     let result = validate_pdf_a(&file_bytes, level);
 
-    if result.conforms {
-        println!("Status: CONFORMANT");
-        println!("Level:  {}", result.target_level);
+    // Finding a violation proves non-conformance, so that verdict is sound.
+    // The absence of findings is NOT conformance: `validate_pdf_a` is a set of
+    // byte-pattern heuristics (it greps for `x:xmpm`, `/Info`,
+    // `/OutputIntents`, a transparency group) and parses no objects, so it
+    // cannot see most of ISO 19005 — encryption, embedded JavaScript and
+    // external references are all prohibited by PDF/A and none are checked.
+    // Printing "CONFORMANT" here declared a conformance level the product had
+    // not established, which FR-STD-5 and CMP-STD-4 forbid outright and
+    // MET-FEAT-3 makes absolute. A real claim requires a recognized validator
+    // (veraPDF, CMP-STD-2). [FR-STD-5, CMP-STD-4, MET-FEAT-3, PRIN-6]
+    println!("Level:  {}", result.target_level);
+    if result.conformance.is_none() {
+        println!("Status: UNDETERMINED — no violations detected");
+        println!();
+        println!("This is NOT a conformance determination. These are heuristic");
+        println!("byte-pattern checks, not ISO 19005 validation; most PDF/A rules");
+        println!("are not examined. Confirm with a recognized validator (veraPDF)");
+        println!("before claiming conformance.");
     } else {
-        println!("Status: NON-CONFORMANT");
-        println!("Level:  {}", result.target_level);
+        println!("Status: NON-CONFORMANT (violations found)");
     }
 
     if !result.warnings.is_empty() {
@@ -1202,9 +1474,15 @@ fn cmd_validate_pdf_a(path: &Path, rest: &[String]) {
         }
     }
 
-    if result.conforms && result.errors.is_empty() {
+    // Exit 0 = no violations detected by these heuristics (usable for pipeline
+    // gating, FR-STD-6); exit 1 = violations found. Neither is a conformance
+    // claim. [FR-STD-5, FR-STD-6, CMP-STD-4]
+    if result.conformance.is_none() && result.errors.is_empty() {
         println!();
-        println!("Document passes {} validation.", result.target_level);
+        println!(
+            "No {} violations detected by the heuristic checks.",
+            result.target_level
+        );
         process::exit(0);
     } else {
         eprintln!();
@@ -1221,6 +1499,12 @@ fn cmd_validate_pdf_a(path: &Path, rest: &[String]) {
 /// Shows page-by-page comparison with added/removed/changed content.
 fn cmd_compare(path1: &Path, path2: &Path) {
     use coordinator::document::DocumentCoordinator;
+    use text_extract::compare::{diff_lines, DiffQuality, LineDiff};
+
+    // Set when any page exceeded the alignment bound, so the summary can say
+    // the result is no longer reflow-resilient instead of implying it is.
+    // [GR-7, FR-CMP-3, PRIN-6]
+    let mut fell_back = false;
 
     // Open both documents.
     let worker = find_worker();
@@ -1284,26 +1568,27 @@ fn cmd_compare(path1: &Path, path2: &Path) {
         pages_with_diffs += 1;
         println!("Page {}:", page + 1);
 
-        // Simple line-by-line diff.
+        // Align by longest common subsequence rather than pairing lines by
+        // index. Index pairing reported every line after an insertion as
+        // changed — the "raw positional diff" FR-CMP-3 rules out in favour of
+        // meaningful change detection. [FR-CMP-3]
         let lines1: Vec<&str> = text1.lines().collect();
         let lines2: Vec<&str> = text2.lines().collect();
+        let (ops, quality) = diff_lines(&lines1, &lines2);
+        if quality == DiffQuality::PositionalFallback {
+            fell_back = true;
+        }
 
-        let max_lines = lines1.len().max(lines2.len());
-        for i in 0..max_lines {
-            let l1 = lines1.get(i).copied().unwrap_or("");
-            let l2 = lines2.get(i).copied().unwrap_or("");
-
-            if l1 != l2 {
-                if l1.is_empty() {
-                    println!("  + {}", l2);
+        for op in &ops {
+            match op {
+                LineDiff::Same(_) => {}
+                LineDiff::Removed(line) => {
+                    println!("  - {line}");
                     total_diffs += 1;
-                } else if l2.is_empty() {
-                    println!("  - {}", l1);
+                }
+                LineDiff::Added(line) => {
+                    println!("  + {line}");
                     total_diffs += 1;
-                } else {
-                    println!("  - {}", l1);
-                    println!("  + {}", l2);
-                    total_diffs += 2;
                 }
             }
         }
@@ -1315,6 +1600,11 @@ fn cmd_compare(path1: &Path, path2: &Path) {
     println!("  Pages compared: {}", max_pages);
     println!("  Pages with differences: {}", pages_with_diffs);
     println!("  Total line changes: {}", total_diffs);
+    if fell_back {
+        println!();
+        println!("Note: at least one page exceeded the alignment bound, so its lines");
+        println!("were paired by position. Those results are not reflow-resilient.");
+    }
 
     let _ = coord1.close();
     let _ = coord2.close();
@@ -1338,7 +1628,7 @@ fn extract_xref_offsets(_bytes: &[u8]) -> Vec<(u32, u64)> {
 /// Pipeline file format: one step per section, type=merge/split/etc.
 /// See `pdf_model::batch::BatchPipeline::serialize()` for the format.
 fn cmd_batch(pipeline_path: &Path) {
-    use pdf_model::batch::{BatchPipeline, BatchStep, execute_pipeline};
+    use pdf_model::batch::{BatchPipeline, BatchStep};
 
     if !pipeline_path.exists() {
         eprintln!("error: pipeline file not found: {}", pipeline_path.display());
@@ -1436,7 +1726,9 @@ fn cmd_batch(pipeline_path: &Path) {
     }
 
     println!("Executing pipeline '{}' ({} steps)...", pipeline.name, pipeline.step_count());
-    let results = execute_pipeline(&pipeline);
+    // Same verified candidate/publish safety net `optimize` gets standalone
+    // (FR-BATCH: identical behavior via GUI/CLI/batch — see cmd_optimize).
+    let results = execute_cli_pipeline(&pipeline);
 
     let mut all_ok = true;
     for (i, result) in results.iter().enumerate() {
@@ -1455,6 +1747,236 @@ fn cmd_batch(pipeline_path: &Path) {
         eprintln!("Pipeline failed.");
         process::exit(2);
     }
+}
+
+/// Cross-document index state directory (per-user app state, not beside any
+/// document — matches the existing sidecar-journal convention in
+/// `DocumentCoordinator::compute_sidecar_path`). [ADR-019 §3, ADR-021]
+fn index_state_dir() -> PathBuf {
+    std::env::temp_dir().join("pdf-platform-index")
+}
+
+/// Cross-document indexing: enroll/list/reindex/remove/search. [ADR-019 §3]
+///
+/// Usage:
+///   pdf-platform index enroll <dir>
+///   pdf-platform index list
+///   pdf-platform index reindex [dir]   (all enrollments if omitted)
+///   pdf-platform index remove <dir>
+///   pdf-platform index search <query>
+fn cmd_index(args: &[String]) {
+    use coordinator::broker::{load_enrollment_registry, save_enrollment_registry};
+    use coordinator::indexing::{
+        indexing_summary, load_registry, reindex_enrollment, remove_enrollment_files,
+        save_registry,
+    };
+    use search::tantivy_backend::CrossDocumentIndex;
+
+    let Some(sub) = args.first() else {
+        eprintln!("error: index requires a subcommand: enroll|list|reindex|remove|search");
+        process::exit(1);
+    };
+
+    let state_dir = index_state_dir();
+    if let Err(e) = std::fs::create_dir_all(&state_dir) {
+        eprintln!("error: cannot create index state directory: {e}");
+        process::exit(2);
+    }
+    let enrollment_path = state_dir.join("enrollments.bin");
+    let file_registry_path = state_dir.join("file-registry.bin");
+    let tantivy_dir = state_dir.join("tantivy");
+
+    let mut enrollment_registry = match load_enrollment_registry(&enrollment_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: cannot load enrollment registry: {e}");
+            process::exit(2);
+        }
+    };
+
+    match sub.as_str() {
+        "enroll" => {
+            let Some(dir) = args.get(1) else {
+                eprintln!("error: index enroll requires a directory argument");
+                process::exit(1);
+            };
+            match enrollment_registry.enroll(Path::new(dir)) {
+                Ok(id) => {
+                    if let Err(e) = save_enrollment_registry(&enrollment_registry, &enrollment_path) {
+                        eprintln!("error: cannot save enrollment registry: {e}");
+                        process::exit(2);
+                    }
+                    println!("Enrolled: {dir}");
+                    println!("Enrollment id: {}", hex_id(&id));
+                }
+                Err(e) => {
+                    eprintln!("error: enroll failed: {e:?}");
+                    process::exit(2);
+                }
+            }
+        }
+        "list" => {
+            let file_registry = load_registry(&file_registry_path).unwrap_or_default();
+            let enrollments: Vec<_> = enrollment_registry.enrollments().collect();
+            if enrollments.is_empty() {
+                println!("No enrolled roots.");
+            } else {
+                println!("Enrolled roots:");
+                for (id, root) in &enrollments {
+                    println!("  {} — {}", hex_id(id), root.display());
+                }
+            }
+            if let Ok(index) = CrossDocumentIndex::open_or_create(&tantivy_dir) {
+                let summary = indexing_summary(&file_registry, &index, &tantivy_dir);
+                println!();
+                println!("Tracked files: {}", summary.tracked_file_count);
+                println!("Index size:    {} bytes", summary.disk_size_bytes);
+            }
+        }
+        "reindex" => {
+            let worker = find_worker();
+            let mut file_registry = load_registry(&file_registry_path).unwrap_or_default();
+            let mut index = match CrossDocumentIndex::open_or_create(&tantivy_dir) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("error: cannot open index: {e}");
+                    process::exit(2);
+                }
+            };
+            let targets: Vec<([u8; 16], PathBuf)> = match args.get(1) {
+                Some(dir) => {
+                    // Enrolled roots are stored canonicalized (see `enroll`);
+                    // compare against the canonical form of the argument too,
+                    // or this silently matches nothing (e.g. Windows
+                    // canonicalize prepends \\?\).
+                    let canonical = Path::new(dir)
+                        .canonicalize()
+                        .unwrap_or_else(|_| PathBuf::from(dir));
+                    enrollment_registry
+                        .enrollments()
+                        .filter(|(_, root)| *root == canonical)
+                        .map(|(id, root)| (id, root.to_path_buf()))
+                        .collect()
+                }
+                None => enrollment_registry
+                    .enrollments()
+                    .map(|(id, root)| (id, root.to_path_buf()))
+                    .collect(),
+            };
+            if targets.is_empty() {
+                eprintln!("error: no matching enrollment(s) to reindex");
+                process::exit(1);
+            }
+            let mut any_errors = false;
+            for (id, root) in &targets {
+                let report = reindex_enrollment(
+                    &worker,
+                    &enrollment_registry,
+                    *id,
+                    root,
+                    &mut file_registry,
+                    &mut index,
+                );
+                println!(
+                    "{}: scanned {}, reindexed {}, skipped {}, pages {}",
+                    root.display(),
+                    report.files_scanned,
+                    report.files_reindexed,
+                    report.files_skipped_unchanged,
+                    report.pages_indexed
+                );
+                for (path, message) in &report.errors {
+                    eprintln!("  error: {}: {message}", path.display());
+                    any_errors = true;
+                }
+            }
+            if let Err(e) = save_registry(&file_registry, &file_registry_path) {
+                eprintln!("error: cannot save file registry: {e}");
+                process::exit(2);
+            }
+            process::exit(if any_errors { 1 } else { 0 });
+        }
+        "remove" => {
+            let Some(dir) = args.get(1) else {
+                eprintln!("error: index remove requires a directory argument");
+                process::exit(1);
+            };
+            let mut file_registry = load_registry(&file_registry_path).unwrap_or_default();
+            let mut index = match CrossDocumentIndex::open_or_create(&tantivy_dir) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("error: cannot open index: {e}");
+                    process::exit(2);
+                }
+            };
+            let removed_files = match remove_enrollment_files(&mut file_registry, &mut index, Path::new(dir)) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("error: index removal failed: {e}");
+                    process::exit(2);
+                }
+            };
+            let canonical_dir = Path::new(dir)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(dir));
+            let ids: Vec<[u8; 16]> = enrollment_registry
+                .enrollments()
+                .filter(|(_, root)| *root == canonical_dir)
+                .map(|(id, _)| id)
+                .collect();
+            for id in ids {
+                enrollment_registry.remove(id);
+            }
+            if let Err(e) = save_enrollment_registry(&enrollment_registry, &enrollment_path) {
+                eprintln!("error: cannot save enrollment registry: {e}");
+                process::exit(2);
+            }
+            if let Err(e) = save_registry(&file_registry, &file_registry_path) {
+                eprintln!("error: cannot save file registry: {e}");
+                process::exit(2);
+            }
+            println!("Removed enrollment for {dir} ({removed_files} file(s) unindexed).");
+        }
+        "search" => {
+            let Some(query) = args.get(1) else {
+                eprintln!("error: index search requires a query argument");
+                process::exit(1);
+            };
+            let index = match CrossDocumentIndex::open_or_create(&tantivy_dir) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("error: cannot open index: {e}");
+                    process::exit(2);
+                }
+            };
+            match index.search(query, 20) {
+                Ok(hits) if hits.is_empty() => println!("No matches."),
+                Ok(hits) => {
+                    for hit in hits {
+                        println!(
+                            "source={} page={} reliable={} score={}",
+                            hex_id(&hit.source),
+                            hit.page,
+                            hit.reliable,
+                            hit.score_milli
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: search failed: {e}");
+                    process::exit(2);
+                }
+            }
+        }
+        other => {
+            eprintln!("error: unknown index subcommand '{other}' (enroll|list|reindex|remove|search)");
+            process::exit(1);
+        }
+    }
+}
+
+fn hex_id(id: &[u8; 16]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn flush_batch_step(
@@ -1805,4 +2327,75 @@ fn read_sidecar_info(sidecar_path: &Path, doc_path: &Path) -> Result<SidecarInfo
         group_count,
         group_names,
     })
+}
+
+fn execute_cli_pipeline(
+    pipeline: &pdf_model::batch::BatchPipeline,
+) -> Vec<pdf_model::batch::StepResult> {
+    use pdf_model::batch::{BatchStep, StepResult};
+
+    let mut results = Vec::new();
+    for step in &pipeline.steps {
+        let started = std::time::Instant::now();
+        let result = match step {
+            BatchStep::Watermark { input, text, output } => run_stamp(
+                input,
+                output,
+                Some(text),
+                None,
+                6,
+                10.0,
+            )
+            .map(|()| vec![output.clone()]),
+            BatchStep::BatesNumber {
+                input,
+                start,
+                width,
+                output,
+            } => run_stamp(input, output, None, Some(*start), *width, 10.0)
+                .map(|()| vec![output.clone()]),
+            // Stamps go through the coordinator injection path above; every
+            // other step keeps the verified candidate/publish safety net
+            // `optimize` gets standalone. [FR-BATCH, ADR-013]
+            _ => pdf_model::batch::execute_step(step, &|input, output, profile| {
+                coordinator::broker::optimize_with_verification(output, |candidate_path| {
+                    pdf_model::assembly_ops::optimize_pdf(input, candidate_path, profile)
+                        .map_err(|e| e.to_string())
+                })
+            }),
+        };
+        let success = result.is_ok();
+        results.push(StepResult {
+            success,
+            outputs: result.as_ref().cloned().unwrap_or_default(),
+            message: result.err().unwrap_or_else(|| "ok".into()),
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+        if !success {
+            break;
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+
+    #[test]
+    fn run_stamp_writes_incremental_stamp_objects() {
+        let worker = find_worker();
+        let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/corpus-diff/fixtures/valid-1page.pdf");
+        if !worker.exists() || !input.exists() {
+            eprintln!("skipping: build worker-main and provide corpus fixture");
+            return;
+        }
+        let output = std::env::temp_dir().join("pdf-platform-cli-stamp-test.pdf");
+        run_stamp(&input, &output, Some("CONFIDENTIAL"), None, 6, 10.0).unwrap();
+        let bytes = std::fs::read(&output).unwrap();
+        assert!(bytes.windows(b"CONFIDENTIAL".len()).any(|w| w == b"CONFIDENTIAL"));
+        assert!(bytes.len() > std::fs::metadata(&input).unwrap().len() as usize);
+        std::fs::remove_file(output).ok();
+    }
 }

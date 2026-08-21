@@ -14,7 +14,7 @@ SearchPanel::SearchPanel(QWidget* parent) : QWidget(parent) {
     // Search input row
     auto* input_layout = new QHBoxLayout();
     input_ = new QLineEdit(this);
-    input_->setPlaceholder(QStringLiteral("Find in document…"));
+    input_->setPlaceholderText(QStringLiteral("Find in document…"));
     input_->setObjectName(QStringLiteral("searchInput"));
     input_->setAccessibleName(QStringLiteral("Search text"));
     input_layout->addWidget(input_);

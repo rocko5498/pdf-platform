@@ -103,10 +103,20 @@ pub struct ValidationReport {
     pub post_signing_changes: Vec<PostSigningChange>,
     /// Whether the signer certificate is trusted.
     pub signer_trusted: bool,
-    /// Whether the CMS signature integrity check passed.
-    pub integrity_check_passed: bool,
-    /// Whether the ByteRange hash matches.
-    pub hash_match: bool,
+    /// Whether the signature's ByteRange is structurally well formed: the
+    /// offset/length pairs are in order and lie inside the file.
+    ///
+    /// This is a *structural* property only. It is not a hash comparison and
+    /// not evidence that the signed bytes are intact. The field it replaces
+    /// was named `hash_match` and was set from exactly this check.
+    /// [FR-SIG-1, PRIN-6, GR-8]
+    pub byte_range_well_formed: bool,
+    /// Result of cryptographic (CMS/PKCS#7) verification, or `None` when none
+    /// was attempted. It is `None` on every path today: CMS verification is
+    /// deferred to M10 and no crypto library is linked. A report must be able
+    /// to say "not performed" rather than borrow the structural check's pass.
+    /// [FR-SIG-1, MET-FEAT-6]
+    pub cms_verified: Option<bool>,
     /// Timestamp of validation.
     pub validation_time: u64,
 }
@@ -161,19 +171,22 @@ pub fn hash_byte_ranges(file_bytes: &[u8], byte_range: &[u64]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// Verify that a signature's hash matches the file's byte ranges. [FR-SIG-2]
-pub fn verify_byte_range_hash(
-    file_bytes: &[u8],
-    signature: &SignatureInfo,
-) -> bool {
+/// Check that a signature's ByteRange is structurally usable: contents and
+/// range are present, and the offset/length pairs lie inside the file.
+///
+/// This is **not** a hash comparison. It was previously named
+/// `verify_byte_range_hash` and computed a SHA-256 of the covered ranges only
+/// to discard it — a digest is never empty, so the result was always exactly
+/// this structural check, while the name, the `hash_match` field it fed, and
+/// the "hash does not match" explanation all said otherwise. Comparing a
+/// digest requires the expected value from the CMS structure, which needs a
+/// crypto library and is deferred to M10.
+/// [FR-SIG-1, FR-SIG-2, MET-FEAT-6, PRIN-6, GR-8]
+pub fn byte_range_is_well_formed(signature: &SignatureInfo, file_len: usize) -> bool {
     if signature.contents.is_empty() || signature.byte_range.is_empty() {
         return false;
     }
-    let computed = hash_byte_ranges(file_bytes, &signature.byte_range);
-    // For PKCS#7 detached signatures, the hash is inside the CMS structure.
-    // For a basic check, we verify the byte range is valid and non-overlapping.
-    // Full CMS verification requires a crypto library (deferred to M10).
-    !computed.is_empty() && byte_range_valid(&signature.byte_range, file_bytes.len())
+    byte_range_valid(&signature.byte_range, file_len)
 }
 
 /// Check that byte ranges are valid (non-overlapping, within file bounds). [FR-SIG-2]
@@ -291,8 +304,9 @@ pub fn validate_signature(
         .unwrap_or_default()
         .as_secs();
 
-    // Step 1: Verify byte range is well-formed.
-    let hash_ok = verify_byte_range_hash(file_bytes, signature);
+    // Step 1: Check the ByteRange is structurally well formed. This is not a
+    // hash comparison; nothing in this crate performs one. [FR-SIG-1, M10]
+    let well_formed = byte_range_is_well_formed(signature, file_bytes.len());
 
     // Step 2: Analyze DocMDP changes.
     let changes = if let Some(level) = signature.docmdp_level {
@@ -322,10 +336,11 @@ pub fn validate_signature(
             SignatureStatus::Indeterminate,
             "ByteRange is empty — signature cannot be verified".to_string(),
         )
-    } else if !hash_ok {
+    } else if !well_formed {
         (
             SignatureStatus::Invalid,
-            "ByteRange hash does not match — signature integrity broken".to_string(),
+            "ByteRange is malformed — offsets do not lie inside the file, so the              signed region cannot be identified"
+                .to_string(),
         )
     } else if xref_changed {
         (
@@ -341,7 +356,8 @@ pub fn validate_signature(
     } else {
         (
             SignatureStatus::Valid,
-            "Signature integrity verified; no illegal post-signing changes".to_string(),
+            "No illegal post-signing changes detected. Cryptographic              verification was NOT performed — the signed bytes are not proven              intact and the signer is not identified."
+                .to_string(),
         )
     };
 
@@ -351,9 +367,45 @@ pub fn validate_signature(
         signature: signature.clone(),
         post_signing_changes: changes,
         signer_trusted: false, // Requires trust store (M10)
-        integrity_check_passed: hash_ok,
-        hash_match: hash_ok,
+        byte_range_well_formed: well_formed,
+        // No CMS verification is performed anywhere in this crate. [M10]
+        cms_verified: None,
         validation_time: now,
+    }
+}
+
+/// Refuse to report `Valid` when post-signing change analysis had nothing to
+/// examine. [FR-SIG-1, PRIN-6, MET-FEAT-6]
+///
+/// [`validate_signature`] decides "no illegal post-signing changes" from the
+/// cross-reference data it is handed. A caller that cannot supply that data
+/// (because xref extraction is unimplemented, or the revision history could
+/// not be read) passes empty slices, and every change check then trivially
+/// passes: `analyze_docmdp_changes` finds nothing, and `xref_changed` is false
+/// over an empty iterator. The verdict falls through to `Valid`.
+///
+/// That is a false valid. A ByteRange hash proves only that the *signed* bytes
+/// are intact; illegal post-signing edits arrive as an appended incremental
+/// update, which leaves that hash matching, and the xref/DocMDP analysis is
+/// what catches them. Callers without that evidence pass
+/// `evidence_available: false` to convert such a verdict to `Indeterminate`.
+///
+/// This only ever moves `Valid` to `Indeterminate`. `Invalid` is never
+/// softened: a proven failure stays a failure regardless of missing evidence.
+pub fn require_change_evidence(
+    report: ValidationReport,
+    evidence_available: bool,
+) -> ValidationReport {
+    if evidence_available || report.status != SignatureStatus::Valid {
+        return report;
+    }
+    ValidationReport {
+        status: SignatureStatus::Indeterminate,
+        explanation: "Signed bytes are intact, but post-signing changes could not be \
+                      examined (no cross-reference data was available), so this \
+                      signature cannot be reported as valid"
+            .to_string(),
+        ..report
     }
 }
 
@@ -557,8 +609,20 @@ impl std::fmt::Display for PdfALevel {
 /// PDF/A validation result. [FR-STD-5]
 #[derive(Debug, Clone)]
 pub struct PdfAValidationResult {
-    /// Whether the document conforms to the target level.
-    pub conforms: bool,
+    /// Conformance verdict, or `None` when it could not be determined.
+    ///
+    /// `Some(false)` — a violation was detected, which is a sound negative.
+    /// `None`        — no violation was detected, which is **not** conformance.
+    /// `Some(true)`  — unreachable until a recognized validator is integrated.
+    ///
+    /// The field this replaces was `conforms: bool`, set from
+    /// `errors.is_empty()`. `validate_pdf_a` greps four byte patterns and
+    /// parses no objects, so it cannot see encryption, embedded JavaScript, or
+    /// external references — all prohibited by ISO 19005. Absence of findings
+    /// from those heuristics is not evidence of conformance, and MET-FEAT-3
+    /// makes standards conformance absolute.
+    /// [FR-STD-5, CMP-STD-4, MET-FEAT-3, PRIN-6, GR-8]
+    pub conformance: Option<bool>,
     /// The target level.
     pub target_level: PdfALevel,
     /// Validation errors (must-fix for conformance).
@@ -598,6 +662,19 @@ pub struct PdfAMetadata {
 ///
 /// Checks: metadata, fonts, transparency, output intents, and other
 /// PDF/A requirements. Returns a detailed result.
+/// Heuristic PDF/A pre-check. **Not** an ISO 19005 conformance determination.
+///
+/// This searches for byte patterns (`x:xmpm`, `/Info`, `/OutputIntents`, a
+/// transparency group) and parses no objects. It therefore cannot see most of
+/// the standard: encryption, embedded JavaScript and external references are
+/// all prohibited by PDF/A and none are examined, and PDF/A-1b's mandatory
+/// OutputIntent is currently only a warning.
+///
+/// A finding proves non-conformance. The **absence** of findings proves
+/// nothing, so `conforms == true` must never be presented to a user as
+/// conformance — FR-STD-5 and CMP-STD-4 forbid declaring a level the product
+/// has not established, and MET-FEAT-3 makes that absolute. Real claims
+/// require a recognized validator (veraPDF, CMP-STD-2).
 pub fn validate_pdf_a(
     file_bytes: &[u8],
     target_level: PdfALevel,
@@ -640,7 +717,10 @@ pub fn validate_pdf_a(
     let fonts_embedded = errors.iter().all(|e| !e.contains("font"));
 
     PdfAValidationResult {
-        conforms: errors.is_empty(),
+        // A detected violation is a sound negative verdict. No detection means
+        // undetermined, never conformant: establishing conformance requires a
+        // recognized validator such as veraPDF (CMP-STD-2). [MET-FEAT-3]
+        conformance: if errors.is_empty() { None } else { Some(false) },
         target_level,
         errors,
         warnings,
@@ -748,6 +828,64 @@ mod tests {
         assert_ne!(h1, h2, "different ranges should produce different hashes");
     }
 
+    fn report_with(status: SignatureStatus) -> ValidationReport {
+        ValidationReport {
+            status,
+            explanation: "original explanation".into(),
+            signature: SignatureInfo {
+                name: String::new(),
+                location: String::new(),
+                reason: String::new(),
+                date: String::new(),
+                filter: String::new(),
+                sub_filter: String::new(),
+                byte_range: vec![0, 4],
+                contents: vec![1, 2, 3],
+                docmdp_level: None,
+                byte_offset: 0,
+                obj_num: 1,
+                page_index: None,
+            },
+            post_signing_changes: Vec::new(),
+            signer_trusted: false,
+            byte_range_well_formed: true,
+            cms_verified: None,
+            validation_time: 0,
+        }
+    }
+
+    #[test]
+    fn valid_becomes_indeterminate_when_no_change_evidence_was_available() {
+        // A ByteRange hash only proves the signed bytes are intact. Illegal
+        // post-signing edits arrive as an appended incremental update, which
+        // leaves that hash matching. Claiming "no illegal post-signing
+        // changes" without having examined any is a false valid.
+        let report = require_change_evidence(report_with(SignatureStatus::Valid), false);
+        assert_eq!(report.status, SignatureStatus::Indeterminate);
+        assert!(
+            report.explanation.contains("post-signing"),
+            "must say what could not be checked: {}",
+            report.explanation
+        );
+    }
+
+    #[test]
+    fn valid_is_left_alone_when_change_evidence_was_available() {
+        let report = require_change_evidence(report_with(SignatureStatus::Valid), true);
+        assert_eq!(report.status, SignatureStatus::Valid);
+        assert_eq!(report.explanation, "original explanation");
+    }
+
+    #[test]
+    fn an_invalid_verdict_is_never_softened_by_missing_evidence() {
+        let report = require_change_evidence(report_with(SignatureStatus::Invalid), false);
+        assert_eq!(
+            report.status,
+            SignatureStatus::Invalid,
+            "missing evidence must never upgrade a proven failure"
+        );
+    }
+
     #[test]
     fn validate_signature_valid_no_changes() {
         let file = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
@@ -770,7 +908,62 @@ mod tests {
         let report = validate_signature(file, &sig, &xref, &xref);
         assert_eq!(report.status, SignatureStatus::Valid);
         assert!(report.post_signing_changes.is_empty());
-        assert!(report.integrity_check_passed);
+        assert!(report.byte_range_well_formed);
+        assert_eq!(report.cms_verified, None, "no crypto ran");
+    }
+
+    /// No cryptographic verification happens anywhere in this crate -- CMS
+    /// verification is deferred to M10 -- so a report must not claim a hash
+    /// matched or that an integrity check passed. MET-FEAT-6 marks
+    /// never-false-valid absolute. [FR-SIG-1, MET-FEAT-6, PRIN-6, GR-8]
+    #[test]
+    fn a_well_formed_byte_range_is_not_reported_as_a_verified_signature() {
+        let pdf = b"%PDF-1.4
+1 0 obj
+<< /Type /Catalog >>
+endobj
+";
+        let (file, sig) = make_signed_pdf(pdf, &[0xCA, 0xFE]);
+        let xref = vec![(1u32, 9u64)];
+
+        let report = validate_signature(&file, &sig, &xref, &xref);
+
+        assert!(
+            report.byte_range_well_formed,
+            "this fixture's ByteRange is well formed"
+        );
+        assert_eq!(
+            report.cms_verified, None,
+            "no CMS verification is performed, so it must be reported as              not performed rather than as a pass"
+        );
+        assert!(
+            !report.explanation.to_lowercase().contains("integrity verified"),
+            "an explanation must not claim verified integrity when nothing              cryptographic ran, got {:?}",
+            report.explanation
+        );
+    }
+
+    /// A malformed ByteRange is a structural defect, not a hash mismatch, and
+    /// the explanation must say which. [FR-SIG-1, PRIN-6]
+    #[test]
+    fn a_malformed_byte_range_is_not_described_as_a_hash_mismatch() {
+        let pdf = b"%PDF-1.4
+1 0 obj
+<< /Type /Catalog >>
+endobj
+";
+        let (file, mut sig) = make_signed_pdf(pdf, &[0xCA, 0xFE]);
+        // Range runs past the end of the file.
+        sig.byte_range = vec![0, (file.len() as u64) + 4096];
+
+        let report = validate_signature(&file, &sig, &[], &[]);
+
+        assert_ne!(report.status, SignatureStatus::Valid);
+        assert!(
+            !report.explanation.to_lowercase().contains("hash does not match"),
+            "no hash was compared, so the explanation must not blame one, got {:?}",
+            report.explanation
+        );
     }
 
     #[test]
@@ -875,8 +1068,8 @@ mod tests {
             signature: sig,
             post_signing_changes: vec![],
             signer_trusted: false,
-            integrity_check_passed: true,
-            hash_match: true,
+            byte_range_well_formed: true,
+            cms_verified: None,
             validation_time: 0,
         };
         let s = report.summary();
@@ -1109,11 +1302,45 @@ mod tests {
         assert_eq!(PdfALevel::A4.to_string(), "PDF/A-4");
     }
 
+    /// Finding a violation proves non-conformance. Finding none proves nothing:
+    /// `validate_pdf_a` greps four byte patterns and parses no objects, so it
+    /// cannot see encryption, embedded JavaScript, or external references, all
+    /// of which ISO 19005 prohibits. A clean run must therefore report
+    /// "undetermined", never conformance. MET-FEAT-3 makes standards
+    /// conformance absolute. [FR-STD-5, CMP-STD-4, MET-FEAT-3, PRIN-6, GR-8]
+    #[test]
+    fn a_clean_heuristic_run_reports_undetermined_not_conformant() {
+        // Carries XMP and an output intent, so none of the heuristics fire.
+        let pdf = b"%PDF-1.7
+<< /Info 1 0 R /OutputIntents [2 0 R] >>
+x:xmpmeta
+";
+
+        let result = validate_pdf_a(pdf, PdfALevel::A2b);
+
+        assert!(result.errors.is_empty(), "no heuristic should have fired");
+        assert_eq!(
+            result.conformance, None,
+            "absence of findings is not conformance"
+        );
+    }
+
+    /// A violation is still a sound negative verdict. [FR-STD-5]
+    #[test]
+    fn a_detected_violation_is_reported_as_non_conformance() {
+        let pdf = b"%PDF-1.4
+<< /Type /Catalog >>
+"; // no XMP
+        let result = validate_pdf_a(pdf, PdfALevel::A1b);
+        assert!(!result.errors.is_empty());
+        assert_eq!(result.conformance, Some(false));
+    }
+
     #[test]
     fn validate_pdf_a_missing_xmp() {
         let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
         let result = validate_pdf_a(pdf, PdfALevel::A1a);
-        assert!(!result.conforms, "PDF/A-1a without XMP should not conform");
+        assert_eq!(result.conformance, Some(false), "PDF/A-1a without XMP should not conform");
         assert!(result.errors.iter().any(|e| e.contains("XMP")));
     }
 

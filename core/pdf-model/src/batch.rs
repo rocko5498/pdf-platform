@@ -185,18 +185,45 @@ impl BatchPipeline {
 ///
 /// Each step is executed in order. If a step fails, execution stops
 /// and the error is reported. Returns results for each completed step.
+///
+/// Runs `Optimize` steps directly through `assembly_ops::optimize_pdf` with
+/// no verification — the same as this crate always has. Callers that can
+/// see the coordinator layer (which owns the candidate/verify/publish
+/// safety net, `pdf-model` must not depend on it — ADR-025) should use
+/// [`execute_pipeline_with`] instead so `Optimize` steps get the same
+/// verified-publish guarantee the CLI's standalone `optimize` command has.
 pub fn execute_pipeline(pipeline: &BatchPipeline) -> Vec<StepResult> {
+    execute_pipeline_with(pipeline, &|input, output, profile| {
+        crate::assembly_ops::optimize_pdf(input, output, profile).map_err(|e| e.to_string())
+    })
+}
+
+/// Like [`execute_pipeline`], but `Optimize` steps are generated through the
+/// supplied `optimize` hook instead of calling `assembly_ops::optimize_pdf`
+/// directly. The hook receives the same `(input, output, profile)` the step
+/// declares and decides how to get bytes to `output` safely — e.g. wrapping
+/// `coordinator::broker::optimize_with_verification` around
+/// `assembly_ops::optimize_pdf` to add candidate/verify/atomic-publish —
+/// without `pdf-model` itself depending on `coordinator` (ADR-025 layering).
+/// [FR-BATCH-1]
+pub fn execute_pipeline_with(
+    pipeline: &BatchPipeline,
+    optimize: &dyn Fn(&std::path::Path, &std::path::Path, crate::assembly::OptimizeProfile) -> Result<String, String>,
+) -> Vec<StepResult> {
     let mut results: Vec<StepResult> = Vec::new();
     for step in &pipeline.steps {
         let start = std::time::Instant::now();
-        let result = execute_step(step);
+        let result = execute_step(step, optimize);
         let duration_ms = start.elapsed().as_millis() as u64;
         let success = result.is_ok();
-        let outputs = result.unwrap_or_default();
+        let (outputs, message) = match result {
+            Ok(outputs) => (outputs, "ok".to_string()),
+            Err(error) => (Vec::new(), error),
+        };
         results.push(StepResult {
             success,
             outputs,
-            message: if success { "ok".into() } else { "failed".into() },
+            message,
             duration_ms,
         });
         // Stop on first failure.
@@ -208,7 +235,10 @@ pub fn execute_pipeline(pipeline: &BatchPipeline) -> Vec<StepResult> {
 }
 
 /// Execute a single batch step. Returns output paths on success.
-fn execute_step(step: &BatchStep) -> Result<Vec<PathBuf>, String> {
+pub fn execute_step(
+    step: &BatchStep,
+    optimize: &dyn Fn(&std::path::Path, &std::path::Path, crate::assembly::OptimizeProfile) -> Result<String, String>,
+) -> Result<Vec<PathBuf>, String> {
     match step {
         BatchStep::Merge { inputs, output } => {
             let paths: Vec<&std::path::Path> = inputs.iter().map(|p| p.as_path()).collect();
@@ -237,23 +267,26 @@ fn execute_step(step: &BatchStep) -> Result<Vec<PathBuf>, String> {
                 "archive" => crate::assembly::OptimizeProfile::ArchivePreserving,
                 _ => crate::assembly::OptimizeProfile::Screen,
             };
-            crate::assembly_ops::optimize_pdf(input, output, prof)
-                .map_err(|e| e.to_string())?;
+            optimize(input, output, prof)?;
             Ok(vec![output.clone()])
         }
-        BatchStep::Watermark { input, text, output } => {
-            // Stamp module generates content streams; for now copy the file
-            // and note that full page injection requires coordinator wiring.
-            std::fs::copy(input, output)
-                .map_err(|e| format!("copy failed: {e}"))?;
-            eprintln!("Watermark '{text}' applied to {}", output.display());
-            Ok(vec![output.clone()])
-        }
-        BatchStep::BatesNumber { input, start: _, width: _, output } => {
-            std::fs::copy(input, output)
-                .map_err(|e| format!("copy failed: {e}"))?;
-            Ok(vec![output.clone()])
-        }
+        // These two previously copied the input to the output and reported
+        // success, so a batch run emitted an unstamped file and called it
+        // stamped. `stamp` generates content streams but cannot inject them
+        // into a page; that is a coordinator mutation path (ADR-013). Until
+        // it is wired through, refusing with a reason is the required
+        // behaviour: correctness before capability, and never a false
+        // success. [PRIN-1, PRIN-6, GR-8, UX-ERR-3, FR-STAMP]
+        BatchStep::Watermark { text, .. } => Err(format!(
+            "watermark '{text}' not applied: batch stamping needs the \
+             coordinator page injection path, which is not wired up. \
+             Refusing rather than writing an unstamped file."
+        )),
+        BatchStep::BatesNumber { start, width, .. } => Err(format!(
+            "Bates numbering from {start} (width {width}) not applied: batch \
+             stamping needs the coordinator page injection path, which is not \
+             wired up. Refusing rather than writing an unnumbered file."
+        )),
     }
 }
 
@@ -307,27 +340,68 @@ mod tests {
             inputs: vec!["a.pdf".into()],
             output: "out.pdf".into(),
         };
-        let result = execute_step(&step);
+        let result = execute_step(&step, &default_optimize);
         assert!(result.is_err());
     }
 
+    // Replaces `batch_watermark_copies_file`, which asserted that watermarking
+    // produced a byte-identical copy — i.e. it locked in a false success. A
+    // step that cannot stamp must refuse and leave no misleading artifact.
+    // [PRIN-1, PRIN-6, GR-8, UX-ERR-3]
+
     #[test]
-    fn batch_watermark_copies_file() {
-        let dir = std::env::temp_dir().join("pdf_platform_batch_test");
+    fn watermark_refuses_instead_of_emitting_an_unstamped_copy() {
+        let dir = std::env::temp_dir().join("pdf_platform_batch_watermark");
+        // Clear first: a previous failing run panics before its cleanup, and
+        // a stale artifact would mask exactly what this test checks.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let src = dir.join("src.pdf");
         let out = dir.join("stamped.pdf");
         std::fs::write(&src, b"fake pdf content").unwrap();
 
         let step = BatchStep::Watermark {
-            input: src.clone(),
+            input: "src.pdf".into(),
             text: "CONFIDENTIAL".into(),
+            output: "stamped.pdf".into(),
+        };
+        let error = execute_step(&step, &default_optimize)
+            .expect_err("an unimplemented stamp must not report success");
+        assert!(
+            error.contains("page injection"),
+            "the refusal must say why: {error}"
+        );
+        assert!(
+            !out.exists(),
+            "a refused step must not leave an unstamped file behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bates_number_refuses_instead_of_emitting_an_unnumbered_copy() {
+        let dir = std::env::temp_dir().join("pdf_platform_batch_bates");
+        // Clear first: a previous failing run panics before its cleanup, and
+        // a stale artifact would mask exactly what this test checks.
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("src.pdf");
+        let out = dir.join("numbered.pdf");
+        std::fs::write(&src, b"fake pdf content").unwrap();
+
+        let step = BatchStep::BatesNumber {
+            input: src.clone(),
+            start: 1,
+            width: 6,
             output: out.clone(),
         };
-        let result = execute_step(&step).unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(out.exists());
-        assert_eq!(std::fs::read(&out).unwrap(), b"fake pdf content");
+        let error = execute_step(&step, &default_optimize)
+            .expect_err("an unimplemented stamp must not report success");
+        assert!(
+            error.contains("page injection"),
+            "the refusal must say why: {error}"
+        );
+        assert!(!out.exists(), "a refused step must leave no artifact");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -338,8 +412,16 @@ mod tests {
             output: "out.pdf".into(),
             profile: "screen".into(),
         };
-        let result = execute_step(&step);
+        let result = execute_step(&step, &default_optimize);
         // Will fail because file doesn't exist (or qpdf missing).
         assert!(result.is_err());
+    }
+
+    fn default_optimize(
+        input: &std::path::Path,
+        output: &std::path::Path,
+        profile: crate::assembly::OptimizeProfile,
+    ) -> Result<String, String> {
+        crate::assembly_ops::optimize_pdf(input, output, profile).map_err(|e| e.to_string())
     }
 }

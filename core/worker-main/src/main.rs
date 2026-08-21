@@ -13,11 +13,19 @@ use engine_api::rasterize::{Rasterize, RasterizeRequest, TileRect};
 use pdf_cos::scan::scan_file;
 use protocol::commands::{decode_command, Command};
 use protocol::events::{encode_worker_event, WorkerEvent};
-use protocol::handles::{encode_tile_ready, PixelFormat, TileSlotDesc, SHMEM_SMOKE_MAGIC, TILE_RGBA8_BYTES};
+use protocol::handles::{
+    encode_tile_ready, PixelFormat, TileSlotDesc, SHMEM_SMOKE_MAGIC, TILE_RGBA8_BYTES,
+};
 use protocol::inspect::StructuralSummary;
 use protocol::transport::TransportError;
+use protocol::utility_jobs::{
+    decode_command as decode_utility_job, encode_event as encode_utility_event, UtilityJobCommand,
+    UtilityJobEvent, UtilityJobInput,
+};
 use sandbox::shmem::map_shmem_file;
-use sandbox::spawn::{adopt_document_file, adopt_inherited, adopt_password, adopt_shmem_file};
+use sandbox::spawn::{
+    adopt_document_file, adopt_inherited, adopt_output_file, adopt_password, adopt_shmem_file,
+};
 
 fn main() -> ExitCode {
     // Apply sandbox confinement BEFORE any handle adoption or untrusted input.
@@ -51,10 +59,18 @@ fn main() -> ExitCode {
         }
     };
 
+    let _output_file: Option<File> = match adopt_output_file() {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("worker: adopt output failed: {error}");
+            return ExitCode::from(8);
+        }
+    };
+
     // Read password for encrypted documents (passed as env var by coordinator).
     let password: Option<String> = adopt_password();
 
-        // ONE engine instance per document. Re-opening the same inherited handle for
+    // ONE engine instance per document. Re-opening the same inherited handle for
     // Structure/Extract after Rasterize already loaded PDFium fails, which made
     // outline/layers report "no engine loaded" while tiles still rendered. [ADR-005]
     #[cfg(feature = "pdfium")]
@@ -76,9 +92,88 @@ fn main() -> ExitCode {
     #[cfg(not(feature = "pdfium"))]
     let pdfium: Option<()> = None;
 
+    // Detected once at startup; degrades to EngineUnavailable per-job if absent. [ADR-018]
+    let ocr_engine = ocr_bridge::TesseractEngine::new();
+
     loop {
         match transport.recv_timeout(Duration::from_secs(1)) {
             Ok(msg) => {
+                if let Ok(job) = decode_utility_job(&msg) {
+                    let event = if let Err(message) = validate_utility_inputs(&job, &shmem_file) {
+                        UtilityJobEvent::Failed {
+                            correlation_id: job.correlation_id,
+                            job_id: job.job_id,
+                            message,
+                        }
+                    } else if job.operation == "noop" {
+                        UtilityJobEvent::Completed {
+                            correlation_id: job.correlation_id,
+                            job_id: job.job_id,
+                            output: Vec::new(),
+                        }
+                    } else if job.operation == "ocr" {
+                        #[cfg(feature = "pdfium")]
+                        let rasterizer = pdfium.as_ref().map(|e| e as &dyn Rasterize);
+                        #[cfg(not(feature = "pdfium"))]
+                        let rasterizer: Option<&dyn Rasterize> = None;
+                        match execute_ocr_job(&job, rasterizer, &ocr_engine) {
+                            Ok(output) => UtilityJobEvent::Completed {
+                                correlation_id: job.correlation_id,
+                                job_id: job.job_id,
+                                output,
+                            },
+                            Err(message) => UtilityJobEvent::Failed {
+                                correlation_id: job.correlation_id,
+                                job_id: job.job_id,
+                                message,
+                            },
+                        }
+                    } else if job.operation == "thumbnail" {
+                        #[cfg(feature = "pdfium")]
+                        {
+                            match (shmem_file.as_ref(), pdfium.as_ref()) {
+                                (Some(shmem), Some(engine)) => {
+                                    match execute_thumbnail_job(&job, shmem, engine) {
+                                        Ok(output) => UtilityJobEvent::Completed {
+                                            correlation_id: job.correlation_id,
+                                            job_id: job.job_id,
+                                            output,
+                                        },
+                                        Err(message) => UtilityJobEvent::Failed {
+                                            correlation_id: job.correlation_id,
+                                            job_id: job.job_id,
+                                            message,
+                                        },
+                                    }
+                                }
+                                _ => UtilityJobEvent::Failed {
+                                    correlation_id: job.correlation_id,
+                                    job_id: job.job_id,
+                                    message: "thumbnail requires document engine and shared memory"
+                                        .into(),
+                                },
+                            }
+                        }
+                        #[cfg(not(feature = "pdfium"))]
+                        {
+                            UtilityJobEvent::Failed {
+                                correlation_id: job.correlation_id,
+                                job_id: job.job_id,
+                                message: "thumbnail engine unavailable in this build".into(),
+                            }
+                        }
+                    } else {
+                        UtilityJobEvent::Failed {
+                            correlation_id: job.correlation_id,
+                            job_id: job.job_id,
+                            message: format!("unsupported utility operation: {}", job.operation),
+                        }
+                    };
+                    if let Ok(frame) = encode_utility_event(&event) {
+                        let _ = transport.send(&frame);
+                    }
+                    continue;
+                }
                 // Try typed command decode first, fall through to legacy.
                 match decode_command(&msg) {
                     Ok(cmd) => match cmd {
@@ -121,7 +216,10 @@ fn main() -> ExitCode {
                                 &mut transport,
                             );
                         }
-                        Command::ExtractPage { correlation_id, page_index } => {
+                        Command::ExtractPage {
+                            correlation_id,
+                            page_index,
+                        } => {
                             handle_extract_page(
                                 pdfium.as_ref().map(|e| e as &dyn Extract),
                                 correlation_id,
@@ -131,26 +229,35 @@ fn main() -> ExitCode {
                         }
                         Command::GetOutline { correlation_id } => {
                             handle_get_outline(
-                                pdfium.as_ref().map(|e| e as &dyn engine_api::structure::Structure),
+                                pdfium
+                                    .as_ref()
+                                    .map(|e| e as &dyn engine_api::structure::Structure),
                                 correlation_id,
                                 &mut transport,
                             );
                         }
                         Command::GetLayers { correlation_id } => {
                             handle_get_layers(
-                                pdfium.as_ref().map(|e| e as &dyn engine_api::structure::Structure),
+                                pdfium
+                                    .as_ref()
+                                    .map(|e| e as &dyn engine_api::structure::Structure),
                                 correlation_id,
                                 &mut transport,
                             );
                         }
                         Command::GetAttachments { correlation_id } => {
                             handle_get_attachments(
-                                pdfium.as_ref().map(|e| e as &dyn engine_api::structure::Structure),
+                                pdfium
+                                    .as_ref()
+                                    .map(|e| e as &dyn engine_api::structure::Structure),
                                 correlation_id,
                                 &mut transport,
                             );
                         }
-                        Command::GetObject { correlation_id, obj_num } => {
+                        Command::GetObject {
+                            correlation_id,
+                            obj_num,
+                        } => {
                             handle_get_object(&doc_file, correlation_id, obj_num, &mut transport);
                         }
                         Command::RenderPageForOcr {
@@ -181,18 +288,26 @@ fn main() -> ExitCode {
                             );
                         }
                         // Coordinator-level commands — should not reach the worker.
-                        Command::DeletePages { correlation_id, .. } |
-                        Command::RotatePages { correlation_id, .. } |
-                        Command::AddAnnotation { correlation_id, .. } |
-                        Command::DeleteAnnotation { correlation_id, .. } |
-                        Command::RedactByTerm { correlation_id, .. } => {
-                            send_error(&mut transport, correlation_id, "organize/annotation/redaction commands are coordinator-level");
+                        Command::DeletePages { correlation_id, .. }
+                        | Command::RotatePages { correlation_id, .. }
+                        | Command::AddAnnotation { correlation_id, .. }
+                        | Command::DeleteAnnotation { correlation_id, .. }
+                        | Command::RedactByTerm { correlation_id, .. } => {
+                            send_error(
+                                &mut transport,
+                                correlation_id,
+                                "organize/annotation/redaction commands are coordinator-level",
+                            );
                         }
                         // M11 plugin commands — handled by coordinator, not document worker.
-                        Command::LoadPlugin { correlation_id, .. } |
-                        Command::UnloadPlugin { correlation_id, .. } |
-                        Command::InvokePluginAction { correlation_id, .. } => {
-                            send_error(&mut transport, correlation_id, "plugin commands are coordinator-level");
+                        Command::LoadPlugin { correlation_id, .. }
+                        | Command::UnloadPlugin { correlation_id, .. }
+                        | Command::InvokePluginAction { correlation_id, .. } => {
+                            send_error(
+                                &mut transport,
+                                correlation_id,
+                                "plugin commands are coordinator-level",
+                            );
                         }
                     },
                     Err(_) => {
@@ -210,6 +325,139 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+fn validate_utility_inputs(
+    job: &UtilityJobCommand,
+    shmem_file: &Option<File>,
+) -> Result<(), String> {
+    for input in &job.inputs {
+        let UtilityJobInput::SharedMemory {
+            grant_id,
+            offset,
+            length,
+        } = input
+        else {
+            continue;
+        };
+        if *grant_id == [0; 16] {
+            return Err("invalid zero utility grant".into());
+        }
+        let file = shmem_file
+            .as_ref()
+            .ok_or_else(|| "utility shared memory not attached".to_string())?;
+        let region_len = file
+            .metadata()
+            .map_err(|error| format!("utility shared memory metadata failed: {error}"))?
+            .len();
+        let end = offset
+            .checked_add(*length)
+            .ok_or_else(|| "utility shared memory range overflow".to_string())?;
+        if end > region_len {
+            return Err(format!(
+                "utility shared memory range out of bounds: {end} > {region_len}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Render one page's raster in-process. [FR-OCR-1]
+///
+/// Shared by `handle_render_page_for_ocr` (legacy IPC path — kept for
+/// compatibility, but its base64-over-IPC transport breaks past ~4MB of
+/// pixels; not used by the OCR job path below) and `execute_ocr_job`, which
+/// renders and recognizes in the same process so no raster ever crosses IPC.
+fn rasterize_full_page(
+    engine: &dyn Rasterize,
+    page_index: u32,
+    scale: f32,
+) -> Result<engine_api::rasterize::TileOutput, String> {
+    let page_count = engine.page_count();
+    if page_index >= page_count {
+        return Err(format!(
+            "page {page_index} out of range (document has {page_count} pages)"
+        ));
+    }
+    engine
+        .rasterize(&RasterizeRequest {
+            page_index,
+            rect: TileRect {
+                x: 0,
+                y: 0,
+                w: 8192,
+                h: 8192,
+            },
+            scale,
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Run one OCR job: self-render the page, then recognize. [FR-OCR-1, ADR-018]
+///
+/// No page raster crosses IPC in either direction — the worker renders via
+/// its own loaded document engine and recognizes in the same process,
+/// unlike the shared-memory-input design this replaced (which required the
+/// coordinator to pre-render and hand over a raster) or the legacy
+/// `RenderPageForOcr` IPC path (which breaks on realistic page sizes).
+fn execute_ocr_job(
+    job: &UtilityJobCommand,
+    rasterizer: Option<&dyn Rasterize>,
+    engine: &dyn ocr_bridge::OcrEngine,
+) -> Result<Vec<u8>, String> {
+    let [UtilityJobInput::Inline(request)] = job.inputs.as_slice() else {
+        return Err("OCR requires exactly one inline request".into());
+    };
+    let decoded = ocr_bridge::decode_utility_request(request)
+        .map_err(|error| format!("OCR request decode failed: {error:?}"))?;
+    let Some(rasterizer) = rasterizer else {
+        return Err("ocr requires a loaded document engine".into());
+    };
+    let dpi_scale = decoded.options.target_dpi as f32 / 72.0;
+    let tile = rasterize_full_page(rasterizer, decoded.page_index, dpi_scale)?;
+    ocr_bridge::execute_utility_ocr(engine, request, &tile.rgba_pixels, tile.width, tile.height)
+        .map_err(|error| format!("OCR execution failed: {error:?}"))
+}
+
+fn execute_thumbnail_job(
+    job: &UtilityJobCommand,
+    shmem_file: &File,
+    engine: &dyn Rasterize,
+) -> Result<Vec<u8>, String> {
+    let [UtilityJobInput::Inline(request), UtilityJobInput::SharedMemory {
+        grant_id,
+        offset,
+        length,
+    }] = job.inputs.as_slice()
+    else {
+        return Err("thumbnail requires request metadata and one shared-memory output".into());
+    };
+    if *grant_id == [0; 16] {
+        return Err("invalid zero thumbnail output grant".into());
+    }
+    let region_len = usize::try_from(
+        shmem_file
+            .metadata()
+            .map_err(|error| format!("thumbnail shared-memory metadata failed: {error}"))?
+            .len(),
+    )
+    .map_err(|_| "thumbnail shared-memory region is too large".to_string())?;
+    let mut map = map_shmem_file(shmem_file, region_len)
+        .map_err(|error| format!("thumbnail shared-memory map failed: {error}"))?;
+    let start = usize::try_from(*offset).map_err(|_| "thumbnail output offset is too large")?;
+    let output_len =
+        usize::try_from(*length).map_err(|_| "thumbnail output length is too large")?;
+    let end = start
+        .checked_add(output_len)
+        .ok_or_else(|| "thumbnail output range overflow".to_string())?;
+    let output = map
+        .get_mut(start..end)
+        .ok_or_else(|| "thumbnail output range is out of bounds".to_string())?;
+    let result = render_pipeline::thumbnail::render_thumbnail(engine, request, output)
+        .map_err(|error| format!("thumbnail render failed: {error:?}"))?;
+    map.flush()
+        .map_err(|error| format!("thumbnail shared-memory flush failed: {error}"))?;
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +478,10 @@ fn handle_inspect(
     };
     match scan_and_encode(file, pdfium) {
         Ok(summary) => {
-            let event = WorkerEvent::Summary { correlation_id, summary };
+            let event = WorkerEvent::Summary {
+                correlation_id,
+                summary,
+            };
             let body = encode_worker_event(&event);
             if let Err(e) = transport.send(&body) {
                 eprintln!("worker: send summary failed: {e}");
@@ -289,7 +540,8 @@ fn handle_render_tile_typed(
             let total_needed = slot_offset as usize + output.rgba_pixels.len();
             match map_shmem_file(file, total_needed) {
                 Ok(mut map) => {
-                    let slot = &mut map[slot_offset as usize..slot_offset as usize + output.rgba_pixels.len()];
+                    let slot = &mut map
+                        [slot_offset as usize..slot_offset as usize + output.rgba_pixels.len()];
                     slot.copy_from_slice(&output.rgba_pixels);
                     let _ = map.flush();
 
@@ -302,7 +554,10 @@ fn handle_render_tile_typed(
                         col,
                         row,
                     };
-                    let event = WorkerEvent::TileReady { correlation_id, desc };
+                    let event = WorkerEvent::TileReady {
+                        correlation_id,
+                        desc,
+                    };
                     let body = encode_worker_event(&event);
                     if let Err(e) = transport.send(&body) {
                         eprintln!("worker: send TILE_READY failed: {e}");
@@ -387,24 +642,7 @@ fn handle_render_page_for_ocr(
         return;
     };
 
-    // Get page dimensions by rendering a 1x1 tile to discover the page size.
-    let page_count = eng.page_count();
-    if page_index >= page_count {
-        send_error(transport, correlation_id, &format!(
-            "page {} out of range (document has {} pages)", page_index, page_count
-        ));
-        return;
-    }
-
-    // Render the full page at the requested scale.
-    // We render the entire page as one tile by using a large rect.
-    let output = eng.rasterize(&RasterizeRequest {
-        page_index,
-        rect: TileRect { x: 0, y: 0, w: 8192, h: 8192 },
-        scale,
-    });
-
-    match output {
+    match rasterize_full_page(eng, page_index, scale) {
         Ok(tile) => {
             // Encode pixels as base64 for wire transport.
             use base64::Engine;
@@ -423,7 +661,11 @@ fn handle_render_page_for_ocr(
             }
         }
         Err(e) => {
-            send_error(transport, correlation_id, &format!("render for OCR failed: {e}"));
+            send_error(
+                transport,
+                correlation_id,
+                &format!("render for OCR failed: {e}"),
+            );
         }
     }
 }
@@ -444,11 +686,18 @@ fn handle_get_outline(
             // Nesting indicated by leading pipe count: 0 pipes = top-level, 1 pipe = child, etc.
             // [FR-BOOK, M1 exit: bookmark navigation]
             let mut lines = Vec::new();
-            fn serialize_entries(entries: &[engine_api::structure::OutlineEntry], depth: u32, lines: &mut Vec<String>) {
+            fn serialize_entries(
+                entries: &[engine_api::structure::OutlineEntry],
+                depth: u32,
+                lines: &mut Vec<String>,
+            ) {
                 for entry in entries {
                     let prefix = "|".repeat(depth as usize);
                     let title_escaped = entry.title.replace('|', "\\p").replace('\n', "\\n");
-                    lines.push(format!("{}{}|{}|{}", prefix, entry.page, entry.y, title_escaped));
+                    lines.push(format!(
+                        "{}{}|{}|{}",
+                        prefix, entry.page, entry.y, title_escaped
+                    ));
                     serialize_entries(&entry.children, depth + 1, lines);
                 }
             }
@@ -512,7 +761,9 @@ fn handle_get_attachments(
     match structure.attachments() {
         Ok(attachments) => {
             let count = attachments.files.len() as u32;
-            let data = attachments.files.iter()
+            let data = attachments
+                .files
+                .iter()
                 .map(|a| format!("{} ({} bytes)", a.name, a.size))
                 .collect::<Vec<_>>()
                 .join(";");
@@ -572,14 +823,20 @@ fn handle_get_object(
 
     let idx = obj_num as usize;
     if idx >= entries.len() || !entries[idx].in_use {
-        send_error(transport, correlation_id, &format!("object {obj_num} not found"));
+        send_error(
+            transport,
+            correlation_id,
+            &format!("object {obj_num} not found"),
+        );
         return;
     }
 
     let offset = entries[idx].offset as usize;
     // Find endobj after the offset to determine object length.
     let obj_bytes = &map[offset..];
-    let end = obj_bytes.windows(7).position(|w| w == b"endobj")
+    let end = obj_bytes
+        .windows(7)
+        .position(|w| w == b"endobj")
         .map(|p| offset + p + 7)
         .unwrap_or(offset + obj_bytes.len().min(4096));
 
@@ -642,15 +899,21 @@ fn parse_xref_table(data: &[u8], offset: usize) -> Option<Vec<XrefEntry>> {
         let count = parse_uint(d, &mut pos)?;
         skip_ws(d, &mut pos);
         // skip eol
-        if d.get(pos) == Some(&b'\r') { pos += 1; }
-        if d.get(pos) == Some(&b'\n') { pos += 1; }
+        if d.get(pos) == Some(&b'\r') {
+            pos += 1;
+        }
+        if d.get(pos) == Some(&b'\n') {
+            pos += 1;
+        }
 
         let needed = first + count;
         if entries.len() < needed {
             entries.resize(needed, XrefEntry::default());
         }
         for obj in first..first + count {
-            if pos + 20 > d.len() { break; }
+            if pos + 20 > d.len() {
+                break;
+            }
             let entry_bytes = &d[pos..pos + 20];
             let offset_bytes = &entry_bytes[0..10];
             let in_use = entry_bytes.get(17) == Some(&b'n');
@@ -658,7 +921,10 @@ fn parse_xref_table(data: &[u8], offset: usize) -> Option<Vec<XrefEntry>> {
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(0);
-            entries[obj] = XrefEntry { offset: byte_offset, in_use };
+            entries[obj] = XrefEntry {
+                offset: byte_offset,
+                in_use,
+            };
             pos += 20;
         }
     }
@@ -670,7 +936,9 @@ fn parse_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
     while *pos < data.len() && data[*pos].is_ascii_digit() {
         *pos += 1;
     }
-    if *pos == start { return None; }
+    if *pos == start {
+        return None;
+    }
     std::str::from_utf8(&data[start..*pos]).ok()?.parse().ok()
 }
 
@@ -727,7 +995,11 @@ fn handle_forms_calc(
     }
 }
 
-fn send_error(transport: &mut Box<dyn protocol::transport::WorkerTransport>, correlation_id: u64, message: &str) {
+fn send_error(
+    transport: &mut Box<dyn protocol::transport::WorkerTransport>,
+    correlation_id: u64,
+    message: &str,
+) {
     let event = WorkerEvent::RenderError {
         correlation_id,
         message: message.to_string(),
@@ -837,4 +1109,148 @@ fn fill_tile_smoke(file: &File) -> Result<Vec<u8>, String> {
         row: 0,
     };
     Ok(encode_tile_ready(&desc))
+}
+
+#[cfg(test)]
+mod utility_ocr_tests {
+    use super::*;
+    use engine_api::rasterize::{RasterizeError, TileOutput};
+    use ocr_bridge::{
+        decode_utility_result, encode_utility_request, OcrEngine, OcrPageResult, OcrUtilityRequest,
+        PreprocessOptions,
+    };
+
+    struct FixtureEngine;
+
+    impl OcrEngine for FixtureEngine {
+        fn recognize(
+            &self,
+            _raster: &[u8],
+            width: u32,
+            height: u32,
+            page_index: u32,
+            _options: &PreprocessOptions,
+        ) -> OcrPageResult {
+            OcrPageResult {
+                page_index,
+                raster_width: width,
+                raster_height: height,
+                blocks: Vec::new(),
+                full_text: "worker fixture".into(),
+                average_confidence: 0.3,
+                had_existing_text: false,
+                orientation_correction: 0.0,
+                success: true,
+                error: None,
+            }
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "fixture"
+        }
+    }
+
+    struct FixtureRasterizer;
+
+    impl Rasterize for FixtureRasterizer {
+        fn rasterize(&self, _request: &RasterizeRequest) -> Result<TileOutput, RasterizeError> {
+            Ok(TileOutput {
+                rgba_pixels: vec![7; 2 * 2 * 4],
+                width: 2,
+                height: 2,
+            })
+        }
+
+        fn page_count(&self) -> u32 {
+            5
+        }
+    }
+
+    #[test]
+    fn ocr_job_self_renders_via_engine_then_recognizes() {
+        let request = OcrUtilityRequest {
+            page_index: 4,
+            language: "eng".into(),
+            options: PreprocessOptions::default(),
+        };
+        let job = UtilityJobCommand {
+            correlation_id: 1,
+            job_id: 2,
+            operation: "ocr".into(),
+            inputs: vec![UtilityJobInput::Inline(
+                encode_utility_request(&request).unwrap(),
+            )],
+        };
+
+        let output = execute_ocr_job(&job, Some(&FixtureRasterizer as &dyn Rasterize), &FixtureEngine)
+            .unwrap();
+        let result = decode_utility_result(&output).unwrap();
+        assert_eq!(result.page_index, 4);
+        assert_eq!(result.full_text, "worker fixture");
+        assert_eq!(result.raster_width, 2);
+        assert_eq!(result.raster_height, 2);
+    }
+}
+
+#[cfg(test)]
+mod utility_thumbnail_tests {
+    use super::*;
+    use engine_api::rasterize::{RasterizeError, RasterizeRequest, TileOutput};
+    use protocol::utility_thumbnails::{
+        decode_thumbnail_result, encode_thumbnail_request, ThumbnailRequest,
+    };
+    use sandbox::shmem::SharedRegion;
+
+    struct FixtureRasterizer;
+
+    impl Rasterize for FixtureRasterizer {
+        fn rasterize(&self, request: &RasterizeRequest) -> Result<TileOutput, RasterizeError> {
+            Ok(TileOutput {
+                rgba_pixels: vec![11; (request.rect.w * request.rect.h * 4) as usize],
+                width: request.rect.w,
+                height: request.rect.h,
+            })
+        }
+
+        fn page_count(&self) -> u32 {
+            1
+        }
+    }
+
+    #[test]
+    fn worker_writes_thumbnail_only_to_declared_output_grant() {
+        let region = SharedRegion::create(80).unwrap();
+        let request = ThumbnailRequest {
+            page: 0,
+            width: 4,
+            height: 4,
+            scale: 0.25,
+            generation: 2,
+            revision: 5,
+        };
+        let job = UtilityJobCommand {
+            correlation_id: 1,
+            job_id: 2,
+            operation: "thumbnail".into(),
+            inputs: vec![
+                UtilityJobInput::Inline(encode_thumbnail_request(&request).unwrap()),
+                UtilityJobInput::SharedMemory {
+                    grant_id: [2; 16],
+                    offset: 8,
+                    length: 64,
+                },
+            ],
+        };
+
+        let encoded = execute_thumbnail_job(&job, region.file(), &FixtureRasterizer).unwrap();
+        let result = decode_thumbnail_result(&encoded).unwrap();
+        assert!(result.is_current(2, 5));
+        assert!(region.as_slice()[..8].iter().all(|byte| *byte == 0));
+        assert!(region.as_slice()[8..72].iter().all(|byte| *byte == 11));
+        assert!(region.as_slice()[72..].iter().all(|byte| *byte == 0));
+    }
 }

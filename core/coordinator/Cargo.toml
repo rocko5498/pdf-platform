@@ -3,7 +3,7 @@ name        = "coordinator"
 description = "DocumentCoordinator actor + global service wiring. [ADR-010, SDS §2.2]"
 version.workspace = true
 edition.workspace = true
-
+license.workspace = true
 [dependencies]
 pdf-types       = { path = "../pdf-types" }
 pdf-cos         = { path = "../pdf-cos" }
@@ -20,4 +20,6 @@ plugin-host     = { path = "../plugin-host" }
 sandbox         = { path = "../sandbox" }
 protocol        = { path = "../protocol" }
 diagnostics     = { path = "../diagnostics" }
+# MIT OR Apache-2.0. Exit seam: broker::UtilityGrantRegistry::issue_at.
+getrandom       = "0.4"
 base64          = "0.22"

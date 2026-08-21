@@ -145,7 +145,7 @@ fn bench_render_scroll_2000_pages(c: &mut Criterion) {
                 let region = SharedRegion::create(TILE_RGBA8_BYTES * 4).unwrap();
                 let mut child = spawn_worker_with_attachments(
                     &worker,
-                    &SpawnAttachments { doc: Some(&doc_file), shmem: Some(region.file()), password: None },
+                    &SpawnAttachments { doc: Some(&doc_file), shmem: Some(region.file()), output: None, password: None },
                     &[],
                 )
                 .unwrap();

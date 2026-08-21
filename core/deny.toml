@@ -1,0 +1,117 @@
+# Licence allowlist gate. [ADR-028 §1, ADR-029, DEP-1]
+#
+# ADR-028 §1 requires a CI-enforced licence allowlist. Nothing enforced it, so
+# the licence posture the project states publicly -- GPLv3 application,
+# permissive core seams, LGPL Qt dynamic-only, BSD PDFium, and AGPL forbidden
+# in anything we link -- rested on review attention alone.
+#
+# Scope: licences only. cargo-deny also checks advisories, bans, and sources.
+# Those are worth having and are deliberately left for separate changes, so
+# this one lands as the rule ADR-028 §1 actually states rather than as four
+# gates at once. `advisories` and `bans` stay at their permissive defaults here
+# and are not claimed to be enforced. [GR-8]
+#
+# Enforced by the `licenses` job in .github/workflows/ci.yml.
+# Run locally:  cd core && cargo deny check licenses
+#
+# Result on 2026-08-02 (cargo-deny 0.20.2, default features, all five targets):
+# `licenses ok`, exit 0. Nothing third-party is rejected and no AGPL appears
+# anywhere in the graph, which is the rule that matters most.
+#
+# Getting there required declaring the workspace's own licence. None of the 23
+# crates here carried a `license` field and `[workspace.package]` had none to
+# inherit, so an SBOM under ADR-029 §3 would have listed this project's own code
+# as unlicensed. They are now `GPL-3.0-or-later` by inheritance, matching the
+# string `plugin-sdk/Cargo.toml` already declared -- the only in-repo statement
+# of the "or later" question. ADR-028 §1's "GPLv3 application, permissive core
+# seams" enumerates the licence landscape we consume (permissive crates at the
+# seams, LGPL Qt, BSD PDFium); it does not ask our own application crates to be
+# permissive, and nothing in the repo enumerates a crate that should be. A
+# maintainer wanting a specific crate relicensed changes one line in that
+# crate's manifest and this gate keeps holding. [ADR-028 §1, ADR-029 §3, PR-4]
+
+[graph]
+# Every platform CI covers. A licence must be acceptable on all of them, not
+# only on the machine that happened to run the check.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+# Default features only — the same set `cargo build --workspace` compiles in CI, so
+# this gate covers exactly what gets shipped. `all-features = true` would also cover
+# optional paths, but it forces resolution of crates this project never builds and did
+# not complete locally in ten minutes. If a feature ever gates a dependency with a
+# different licence, that is the moment to revisit this line, not before. [GR-8]
+
+[licenses]
+# Anything not listed is denied. AGPL is absent by construction, which is the
+# rule that matters most: MuPDF, Ghostscript, and qpdf are external oracles and
+# tools, never linked. [ADR-028 §1, GR-4]
+allow = [
+    # This project's own licence. `plugin-sdk/Cargo.toml` already declares
+    # `GPL-3.0-or-later`, which is the only in-repo statement of the "or later"
+    # question. ADR-028 §1 permits GPL where the consuming artifact is itself
+    # GPL-distributed, which is exactly this application.
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "0BSD",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# Dual-licensed crates where the permissive half is the one we elect. Recording
+# the choice here is the point: without it the allowlist silently accepts a
+# crate on a GPL or LGPL branch that would carry obligations into the core.
+[[licenses.exceptions]]
+# Intel ITT profiling hooks, pulled in transitively by wasmtime. We take the
+# BSD-3-Clause branch, never GPL-2.0-only. [ADR-028 §1, ADR-033]
+name = "ittapi"
+allow = ["BSD-3-Clause"]
+
+[[licenses.exceptions]]
+name = "ittapi-sys"
+allow = ["BSD-3-Clause"]
+
+# `r-efi` (MIT OR Apache-2.0 OR LGPL-2.1-or-later) appears in `Cargo.lock` but not
+# in the default-feature graph for any target CI covers, so no exception is
+# recorded for it — cargo-deny warns about exceptions it never encounters, and an
+# exception nobody hits is a claim nobody checks. Add one if it ever enters the
+# graph, electing MIT.
+
+# CDLA-Permissive-2.0 above covers `webpki-roots`, a data licence over the
+# Mozilla root-certificate store rather than a code licence. It enters the
+# graph only through `reqwest`, whose only dependent is `pdfium-auto` -- the
+# runtime engine download that violates GR-1/GR-9 and is proposed for removal.
+# When that lands, this allowance can be dropped along with the entire HTTP,
+# TLS, and QUIC stack it covers.
+
+[bans]
+# Not enforced by this change; left at defaults so the licence gate is the only
+# thing that can fail. A separate change should decide duplicate-version policy
+# and any crate bans. [ADR-028 §2]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[advisories]
+# Not enforced by this change. ADR-028 §2 wants a cargo-vet/audit trail for
+# Tier 2 dependencies; that is its own piece of work with its own triage
+# process, and bolting it on here would make a licence gate fail for reasons
+# that are not licences.
+yanked = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

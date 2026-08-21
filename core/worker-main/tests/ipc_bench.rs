@@ -30,7 +30,7 @@ fn ipc_render_tile_roundtrip_baseline() {
         let region = SharedRegion::create(TILE_RGBA8_BYTES).expect("create shmem");
         let mut child = spawn_worker_with_attachments(
             worker_path(),
-            &SpawnAttachments { doc: None, shmem: Some(region.file()), password: None },
+            &SpawnAttachments { doc: None, shmem: Some(region.file()), output: None, password: None },
             &[],
         )
         .expect("spawn");

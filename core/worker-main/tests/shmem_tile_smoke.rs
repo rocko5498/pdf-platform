@@ -24,6 +24,7 @@ fn worker_fills_shmem_tile_smoke() {
         &SpawnAttachments {
             doc: None,
             shmem: Some(region.file()),
+            output: None,
             password: None,
         },
         &[],

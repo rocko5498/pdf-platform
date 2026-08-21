@@ -31,13 +31,80 @@ unsafe impl Sync for PdfiumEngine {}
 static INIT: Once = Once::new();
 static mut PDFIUM_PTR: *const Pdfium = std::ptr::null();
 
+/// Fraction of private-use codepoints above which extraction is suspect.
+const PUA_UNRELIABLE_RATIO: f32 = 0.10;
+
+/// Judge whether extracted page text can be trusted. [FR-SRCH-5, ADR-019 §4]
+///
+/// `reliable` was hard-coded `true`, so the honesty mechanism ADR-019 §4
+/// requires — flagging pages whose text layer is unreliable instead of letting
+/// them be "silently searched wrong" — never fired.
+///
+/// Detects the two signatures of a missing or lying ToUnicode CMap that
+/// survive into extracted text: U+FFFD replacement characters (a codepoint
+/// that could not be mapped at all), and a high proportion of Private Use Area
+/// codepoints (a subset font extracting as raw glyph ids, which looks like
+/// text and searches wrong).
+///
+/// This is deliberately conservative and does not claim to catch every
+/// pathology — a font that lies *plausibly* still extracts as ordinary
+/// characters and cannot be caught here. It replaces an unconditional claim of
+/// reliability with a real, if partial, check.
+fn text_is_reliable(text: &str) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    if text.contains('\u{FFFD}') {
+        return false;
+    }
+    let total = text.chars().count();
+    let private_use = text
+        .chars()
+        .filter(|c| matches!(*c, '\u{E000}'..='\u{F8FF}'))
+        .count();
+    (private_use as f32 / total as f32) < PUA_UNRELIABLE_RATIO
+}
+
+/// Retry a fallible bind with linear backoff, returning the last error.
+///
+/// Binding PDFium is not reliably idempotent across processes on a cold
+/// cache: when several sandboxed workers start at once, `LoadLibraryExW`
+/// on the shared `pdfium.dll` can fail with `ERROR_SHARING_VIOLATION` (32)
+/// even though the file is complete and no process holds it open. Observed
+/// as `fault_injection` passing 8/8 serially but 5/8 in parallel. A worker
+/// that fails here aborts, which the coordinator can only report as
+/// "transport disconnected". [ADR-022, ADR-005]
+fn retry_bind<T, E>(
+    attempts: u32,
+    delay: std::time::Duration,
+    mut bind: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut last = None;
+    for attempt in 0..attempts.max(1) {
+        match bind() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                last = Some(error);
+                if attempt + 1 < attempts {
+                    std::thread::sleep(delay * (attempt + 1));
+                }
+            }
+        }
+    }
+    Err(last.expect("at least one attempt always runs"))
+}
+
 fn pdfium() -> &'static Pdfium {
     // SAFETY: INIT ensures this runs exactly once. The pointer is written
     // before any reader can see it (Once::call_once is a barrier).
     unsafe {
         INIT.call_once(|| {
-            let pdfium = pdfium_auto::bind_pdfium_silent()
-                .expect("failed to initialize PDFium");
+            let pdfium = retry_bind(
+                5,
+                std::time::Duration::from_millis(40),
+                pdfium_auto::bind_pdfium_silent,
+            )
+            .expect("failed to initialize PDFium");
             let leaked = Box::leak(Box::new(pdfium));
             PDFIUM_PTR = leaked as *const Pdfium;
         });
@@ -72,9 +139,18 @@ impl PdfiumEngine {
         file: &std::fs::File,
         password: Option<&str>,
     ) -> Result<Self, String> {
-        use std::io::Read;
+        use std::io::{Read, Seek, SeekFrom};
         let mut data = Vec::new();
         let mut handle = file.try_clone().map_err(|e| format!("clone handle: {e}"))?;
+        // The document arrives as an inherited FD/HANDLE, so this process shares
+        // one open file description — and one file offset — with the coordinator
+        // and with every worker spawned before it. Reading from the current
+        // position yields nothing once an earlier reader reached EOF, which
+        // presents as a bogus FormatError. Always read the whole file.
+        // [SDS §4.2, SDS §10.1, GR-8]
+        handle
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("rewind handle: {e}"))?;
         handle.read_to_end(&mut data).map_err(|e| format!("read file: {e}"))?;
         Self::from_bytes_with_password(data, password)
     }
@@ -376,12 +452,24 @@ impl Extract for PdfiumEngine {
 
         let char_count = char_data.len() as u32;
 
+        // Was hard-coded `true`, so no page was ever flagged and the ADR-019 §4
+        // honesty path could not fire. [FR-SRCH-5]
+        let page_text: String = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reliable = text_is_reliable(&page_text);
+
         Ok(PageTextModel {
             page_index,
             lines,
-            reliable: true, // TODO: detect unreliable ToUnicode maps
+            reliable,
             char_count,
-            has_structure: false, // TODO: detect tagged structure
+            // Still unimplemented, but conservative: claiming "no structure"
+            // understates the document rather than promising accessible
+            // reading order that was never verified. [DS-CANVAS-A11Y-4]
+            has_structure: false,
         })
     }
 
@@ -419,6 +507,87 @@ fn build_line(line_index: u32, chars: &[(char, f32, f32, f32, f32)]) -> TextLine
         width: x2 - x,
         height: y2 - y,
         spans,
+    }
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::text_is_reliable;
+
+    #[test]
+    fn ordinary_text_is_reliable() {
+        assert!(text_is_reliable("The quick brown fox jumps over the lazy dog."));
+    }
+
+    #[test]
+    fn a_replacement_character_marks_the_page_unreliable() {
+        // U+FFFD in extracted PDF text means a codepoint could not be mapped —
+        // in practice a missing or broken ToUnicode CMap.
+        assert!(!text_is_reliable("Invoice total: \u{FFFD}\u{FFFD}\u{FFFD}"));
+    }
+
+    #[test]
+    fn heavy_private_use_area_output_marks_the_page_unreliable() {
+        // A subset font with no ToUnicode commonly extracts as PUA glyph ids:
+        // it looks like text and searches wrong. [ADR-019 §4]
+        assert!(!text_is_reliable("\u{E000}\u{E001}\u{E002}\u{E003}\u{E004}"));
+    }
+
+    #[test]
+    fn an_incidental_private_use_glyph_does_not_condemn_a_good_page() {
+        let mostly_fine = format!("{}\u{E000}", "a".repeat(200));
+        assert!(text_is_reliable(&mostly_fine));
+    }
+
+    #[test]
+    fn an_empty_page_is_not_reported_as_unreliable() {
+        // No text is a legitimate state (an image-only scan), not a decoding
+        // failure — OCR is the answer there, not a reliability warning.
+        assert!(text_is_reliable(""));
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::retry_bind;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    #[test]
+    fn returns_immediately_when_the_first_attempt_succeeds() {
+        let calls = Cell::new(0);
+        let result: Result<u8, ()> = retry_bind(5, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Ok(7)
+        });
+        assert_eq!(result, Ok(7));
+        assert_eq!(calls.get(), 1, "a successful bind must not be retried");
+    }
+
+    #[test]
+    fn retries_a_transient_failure_until_it_succeeds() {
+        let calls = Cell::new(0);
+        let result: Result<u8, &str> = retry_bind(5, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err("sharing violation")
+            } else {
+                Ok(1)
+            }
+        });
+        assert_eq!(result, Ok(1));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn gives_up_after_the_attempt_budget_and_reports_the_last_error() {
+        let calls = Cell::new(0);
+        let result: Result<u8, u32> = retry_bind(4, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Err(calls.get())
+        });
+        assert_eq!(calls.get(), 4, "must not exceed its attempt budget");
+        assert_eq!(result, Err(4), "must surface the final error, not the first");
     }
 }
 
@@ -535,5 +704,36 @@ mod tests {
         assert_eq!(model.page_index, 0);
         // The fixture may or may not have text; just verify extraction doesn't panic.
         eprintln!("extracted {} chars, {} lines", model.char_count, model.lines.len());
+    }
+
+    /// The worker receives its document as an inherited FD/HANDLE, so it shares
+    /// one open file description — and therefore one file offset — with the
+    /// coordinator that spawned it. After a first worker reads the document,
+    /// that shared offset sits at EOF, so a respawned worker reading from the
+    /// current position sees zero bytes and silently comes up with no engine.
+    /// [SDS §4.2, SDS §10.1, GR-8]
+    #[test]
+    fn pdfium_loads_from_handle_left_at_eof() {
+        use std::io::{Read, Write};
+
+        let path = std::env::temp_dir().join(format!(
+            "pdf-platform-eof-handle-{}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, minimal_pdf_bytes()).expect("write fixture");
+
+        let mut file = std::fs::File::open(&path).expect("open fixture");
+        let mut drained = Vec::new();
+        file.read_to_end(&mut drained).expect("drain to EOF");
+        assert_eq!(drained.len(), minimal_pdf_bytes().len(), "first read consumed the file");
+
+        let engine = PdfiumEngine::from_file_handle(&file)
+            .expect("load from a handle another reader already advanced to EOF");
+        assert_eq!(Rasterize::page_count(&engine), 1);
+
+        drop(engine);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+        let _ = std::io::stdout().flush();
     }
 }

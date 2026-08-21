@@ -3,6 +3,11 @@ name        = "sandbox"
 description = "Per-OS worker confinement + WorkerTransport impls. [ADR-008, ADR-016, ADR-031]"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+enforced-confinement = []
 
 [dependencies]
 protocol    = { path = "../protocol" }

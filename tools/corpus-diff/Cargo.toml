@@ -3,6 +3,7 @@ name        = "corpus-diff"
 description = "Structural differential-testing harness: our scanner vs the qpdf oracle. [ADR-022, SDS §14 M0 exit criteria]"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 workspace = "../../core"
 
 [dependencies]

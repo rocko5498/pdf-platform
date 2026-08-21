@@ -103,6 +103,14 @@ fn fault_inject_worker_kill_preserves_state() {
     assert_eq!(after.page_count, before.page_count);
     assert_eq!(after.has_acroform, before.has_acroform);
     assert_eq!(after.has_xfa, before.has_xfa);
+    // page_count/has_acroform/has_xfa all come from the mmap-based COS scan and
+    // survive even when the respawned worker failed to load an engine.
+    // page_dimensions come from the engine, so they are what actually proves the
+    // respawn restored a working worker rather than a degraded one. [GR-8, SDS §10.1]
+    assert_eq!(
+        after.page_dimensions, before.page_dimensions,
+        "respawned worker lost its engine"
+    );
 
     session.send(b"quit").expect("quit");
     let _ = session.poll(Duration::from_secs(2));
@@ -201,24 +209,31 @@ fn fault_inject_torn_append_truncates_to_valid() {
 
     let path = temp_pdf(&torn, "torn-append");
 
-    // The scanner MUST either:
-    // a) Find the ORIGINAL xref (via startxref in original bytes) → valid revision (3 pages)
-    // b) Find the torn xref and detect it's incomplete → fail gracefully with leniency
-    // NEVER: crash, panic, or silently use the torn revision.
-    let result = scan_structure(&path);
-    match result {
-        Ok(ds) => {
-            // Scanner found the original xref — valid-revision guarantee [SDS §10.5].
-            assert_eq!(ds.page_count, 3,
-                "torn-append must resolve to original valid revision (3 pages), not the torn one");
-        }
-        Err(e) => {
-            // Scanner detected torn xref and failed gracefully — acceptable.
-            // The key assertion: it did NOT crash or produce a valid result
-            // with wrong page count.
-            eprintln!("torn append detected and rejected: {e} — expected behavior");
-        }
-    }
+    // SDS §10.5 is not a choice between two acceptable outcomes: "next open
+    // detects the incomplete increment and truncates back to the last valid
+    // xref … the file always opens as *some* valid revision, never a corrupt
+    // hybrid". SDS §10.6 states the assertion this test owes as "simulated
+    // torn appends (asserting truncation to a valid revision)", and the M3
+    // exit criterion is the "valid-revision guarantee on torn append".
+    //
+    // This previously accepted an `Err` as "failed gracefully — acceptable",
+    // with no assertion in that arm at all. A document that will not open is
+    // not a valid revision, it is the data loss the guarantee exists to
+    // prevent — and the arm would have swallowed *any* error, including one
+    // unrelated to the torn xref, so a regression could pass silently. The
+    // `Ok` arm is the one taken today; this stops the other one from being an
+    // escape hatch. [SDS §10.5, SDS §10.6, MET-REL-2, T-5, AI-1, AI-7]
+    let ds = scan_structure(&path).unwrap_or_else(|e| {
+        panic!(
+            "torn append must still open as a valid revision, but the scan \
+             failed: {e}"
+        )
+    });
+    assert_eq!(
+        ds.page_count, 3,
+        "torn-append must resolve to the original valid revision (3 pages), \
+         never the torn one"
+    );
 
     std::fs::remove_file(&path).ok();
 }

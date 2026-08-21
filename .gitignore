@@ -21,6 +21,10 @@ CMakeFiles/
 # Node (Claude Code / tooling)
 node_modules/
 
+# Python (tools/ gate scripts leave bytecode caches)
+__pycache__/
+*.py[cod]
+
 # OS / editor
 .DS_Store
 Thumbs.db
@@ -30,6 +34,12 @@ Thumbs.db
 
 # Agent session state (ephemeral, not committed)
 .agent-state/
+.claude/settings.local.json
+.swarm/
+.serena/cache/
+# Local vector/index caches — may contain indexed source; never commit (GIT-5)
+ruvector.db
+.codebase-memory/
 
 # Secrets - never commit
 *.pem

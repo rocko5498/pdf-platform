@@ -42,13 +42,29 @@ Precedence on conflict: ADR → SDS → PRD → UI/UX Design System → Implemen
 Criterion-level status: [docs/milestone-exit-tracker.md](docs/milestone-exit-tracker.md).  
 Release checklist: [docs/release-gates.md](docs/release-gates.md).
 
-### M0 baseline measurements (PRD §14)
+### M0 baseline measurements — indicative, not a budget claim
 
-| Metric | Measured | Budget | Status |
-|--------|----------|--------|--------|
-| Cold start (spawn + inspect) | ~11 ms | ≤ 1,000 ms | ✅ |
-| First page (spawn + render tile) | ~13 ms | ≤ 300 ms | ✅ |
-| Cold start to first pixel | ~14 ms | — | ✅ |
+These are worker-level microbenchmarks. They do **not** discharge `MET-PERF-1/2`,
+and are not compared against those budgets here:
+
+- `MET-PERF-1` measures time from **application** launch to interactive. These numbers
+  measure spawning a worker process and inspecting a document — the Qt shell, window
+  creation, and first paint are not in them.
+- `MET-PERF-2` measures open-request to first-page-visible for a **representative**
+  document, against `≤ 300 ms median, ≤ 600 ms p95`. These are single figures from a
+  fixture, not percentiles.
+- No reference hardware is recorded, and `MET-GOV-1` requires targets, hardware, and
+  corpora to be versioned together for results to be comparable. `B-3` forbids
+  benchmarking on an unpinned machine and calling a budget met.
+
+| Metric | Observed | Related budget | Status |
+|--------|----------|----------------|--------|
+| Worker spawn + inspect | ~11 ms | related to MET-PERF-1 | **not a budget claim** |
+| Worker spawn + render tile | ~13 ms | related to MET-PERF-2 | **not a budget claim** |
+| Spawn to first pixel | ~14 ms | — | indicative |
+
+Per `ADR-023` / `B-4`, M0 and M1 treat these as budget *validation*. Real gating happens
+at release, on reference hardware, against `tools/bench/p95_gates.toml`.
 
 ## Build
 

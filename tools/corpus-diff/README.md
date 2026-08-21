@@ -1,8 +1,15 @@
 # corpus-diff
 
-M0 exit-criterion tool. Renders a set of known-good PDFs before and after a
-change and diffs the tile output. CI fails if any tile differs beyond threshold.
+M0 structural differential-testing gate. It compares the platform's structural
+inspection result with qpdf for every fixture and fails when the results disagree.
 
-Cite: SDS §14 M0 exit criteria.
+Run from `core/`:
 
-ponytail: stub — wire up at M0 implementation; must gate the CI pipeline before M0 ships.
+```bash
+cargo run -q -p corpus-diff
+```
+
+The command requires qpdf on `PATH` and is enforced by `.github/workflows/ci.yml`.
+Render-tile comparison is not implemented and must not be claimed by this harness.
+
+Cites: ADR-022, SDS §14 M0 exit criteria.
