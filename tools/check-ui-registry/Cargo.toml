@@ -3,6 +3,7 @@ name        = "check-ui-registry"
 description = "ADR-032 conformance gate: the shortcut/menu registry is the interface-stability contract, and no shortcut may be bound in C++ source. [ADR-032, ADR-030, DS-CONV-4, RQA-1, RQA-2]"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 workspace = "../../core"
 
 [dependencies]
