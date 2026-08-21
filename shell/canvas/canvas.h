@@ -129,8 +129,7 @@ private:
     FormsPanel* forms_ = nullptr;
     SearchPanel* search_ = nullptr;
 
-    void* shmem_mapping_ = nullptr;
-    void* shmem_section_ = nullptr;  // CreateFileMapping handle (Windows); not the file handle
+    void* shmem_mapping_ = nullptr;  // Borrowed pointer owned by Rust SharedRegion.
     uint32_t page_count_ = 0;
     uint32_t current_page_ = 0;
     float scale_ = 1.0f;

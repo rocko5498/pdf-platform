@@ -10,6 +10,8 @@ add_library(shell-panels STATIC
     annotation_tools.h
     forms_panel.cc
     forms_panel.h
+    search_panel.cc
+    search_panel.h
 )
 target_include_directories(shell-panels PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"

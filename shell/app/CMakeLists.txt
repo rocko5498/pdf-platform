@@ -16,13 +16,4 @@ target_link_libraries(pdf-platform PRIVATE
     shell-a11y
     shell-panels
     Qt6::Widgets
-    Qt6::OpenGL
-    Qt6::OpenGLWidgets
-    ws2_32
-    ntdll
-    userenv
-    bcrypt
-    advapi32
-    kernel32
-    msvcrt
 )

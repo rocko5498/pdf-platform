@@ -28,11 +28,6 @@
 #include <QTextStream>
 #include <QWheelEvent>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#  define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
 namespace pdf_platform {
 
 // ---------------------------------------------------------------------------
@@ -383,36 +378,15 @@ void MainWindow::setupChrome() {
 }
 
 MainWindow::~MainWindow() {
-    // Only UnmapViewOfFile when we created a Win32 section (legacy path).
-    // Normal path: pointer is owned by Rust SharedRegion. [ADR-011]
-    if (shmem_section_) {
-        if (shmem_mapping_) {
-            UnmapViewOfFile(shmem_mapping_);
-        }
-        CloseHandle(static_cast<HANDLE>(shmem_section_));
-        shmem_section_ = nullptr;
-    }
+    // The mapped pointer is borrowed from Rust SharedRegion. [ADR-011]
     shmem_mapping_ = nullptr;
     close_document();
 }
 
 
 void MainWindow::mapShmem(qintptr handle) {
-    // Same-process FFI: Rust SharedRegion is already mapped with memmap2.
-    // `handle` is the base pointer of that view â€” not a Win32 file/section handle.
-    // Do not MapViewOfFile / UnmapViewOfFile on it. [ADR-011, SDS Â§6.3]
-    if (shmem_section_) {
-        if (shmem_mapping_) {
-            UnmapViewOfFile(shmem_mapping_);
-        }
-        CloseHandle(static_cast<HANDLE>(shmem_section_));
-        shmem_section_ = nullptr;
-    }
-    shmem_mapping_ = nullptr;
-    if (handle == 0) {
-        return;
-    }
-    shmem_mapping_ = reinterpret_cast<void*>(handle);
+    // Same-process FFI: Rust SharedRegion owns the mapped view. [ADR-011, SDS §6.3]
+    shmem_mapping_ = handle == 0 ? nullptr : reinterpret_cast<void*>(handle);
 }
 
 
@@ -757,13 +731,6 @@ void MainWindow::clearDocumentUi() {
     scale_ = 1.0f;
     scroll_y_ = 0.f;
     path_.clear();
-    if (shmem_section_) {
-        if (shmem_mapping_) {
-            UnmapViewOfFile(shmem_mapping_);
-        }
-        CloseHandle(static_cast<HANDLE>(shmem_section_));
-        shmem_section_ = nullptr;
-    }
     // Pointer owned by Rust session; drop local view only.
     shmem_mapping_ = nullptr;
     if (outline_) {
