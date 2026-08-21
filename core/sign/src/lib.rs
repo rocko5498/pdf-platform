@@ -103,10 +103,20 @@ pub struct ValidationReport {
     pub post_signing_changes: Vec<PostSigningChange>,
     /// Whether the signer certificate is trusted.
     pub signer_trusted: bool,
-    /// Whether the CMS signature integrity check passed.
-    pub integrity_check_passed: bool,
-    /// Whether the ByteRange hash matches.
-    pub hash_match: bool,
+    /// Whether the signature's ByteRange is structurally well formed: the
+    /// offset/length pairs are in order and lie inside the file.
+    ///
+    /// This is a *structural* property only. It is not a hash comparison and
+    /// not evidence that the signed bytes are intact. The field it replaces
+    /// was named `hash_match` and was set from exactly this check.
+    /// [FR-SIG-1, PRIN-6, GR-8]
+    pub byte_range_well_formed: bool,
+    /// Result of cryptographic (CMS/PKCS#7) verification, or `None` when none
+    /// was attempted. It is `None` on every path today: CMS verification is
+    /// deferred to M10 and no crypto library is linked. A report must be able
+    /// to say "not performed" rather than borrow the structural check's pass.
+    /// [FR-SIG-1, MET-FEAT-6]
+    pub cms_verified: Option<bool>,
     /// Timestamp of validation.
     pub validation_time: u64,
 }
@@ -161,19 +171,22 @@ pub fn hash_byte_ranges(file_bytes: &[u8], byte_range: &[u64]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// Verify that a signature's hash matches the file's byte ranges. [FR-SIG-2]
-pub fn verify_byte_range_hash(
-    file_bytes: &[u8],
-    signature: &SignatureInfo,
-) -> bool {
+/// Check that a signature's ByteRange is structurally usable: contents and
+/// range are present, and the offset/length pairs lie inside the file.
+///
+/// This is **not** a hash comparison. It was previously named
+/// `verify_byte_range_hash` and computed a SHA-256 of the covered ranges only
+/// to discard it — a digest is never empty, so the result was always exactly
+/// this structural check, while the name, the `hash_match` field it fed, and
+/// the "hash does not match" explanation all said otherwise. Comparing a
+/// digest requires the expected value from the CMS structure, which needs a
+/// crypto library and is deferred to M10.
+/// [FR-SIG-1, FR-SIG-2, MET-FEAT-6, PRIN-6, GR-8]
+pub fn byte_range_is_well_formed(signature: &SignatureInfo, file_len: usize) -> bool {
     if signature.contents.is_empty() || signature.byte_range.is_empty() {
         return false;
     }
-    let computed = hash_byte_ranges(file_bytes, &signature.byte_range);
-    // For PKCS#7 detached signatures, the hash is inside the CMS structure.
-    // For a basic check, we verify the byte range is valid and non-overlapping.
-    // Full CMS verification requires a crypto library (deferred to M10).
-    !computed.is_empty() && byte_range_valid(&signature.byte_range, file_bytes.len())
+    byte_range_valid(&signature.byte_range, file_len)
 }
 
 /// Check that byte ranges are valid (non-overlapping, within file bounds). [FR-SIG-2]
@@ -291,8 +304,9 @@ pub fn validate_signature(
         .unwrap_or_default()
         .as_secs();
 
-    // Step 1: Verify byte range is well-formed.
-    let hash_ok = verify_byte_range_hash(file_bytes, signature);
+    // Step 1: Check the ByteRange is structurally well formed. This is not a
+    // hash comparison; nothing in this crate performs one. [FR-SIG-1, M10]
+    let well_formed = byte_range_is_well_formed(signature, file_bytes.len());
 
     // Step 2: Analyze DocMDP changes.
     let changes = if let Some(level) = signature.docmdp_level {
@@ -322,10 +336,11 @@ pub fn validate_signature(
             SignatureStatus::Indeterminate,
             "ByteRange is empty — signature cannot be verified".to_string(),
         )
-    } else if !hash_ok {
+    } else if !well_formed {
         (
             SignatureStatus::Invalid,
-            "ByteRange hash does not match — signature integrity broken".to_string(),
+            "ByteRange is malformed — offsets do not lie inside the file, so the              signed region cannot be identified"
+                .to_string(),
         )
     } else if xref_changed {
         (
@@ -341,7 +356,8 @@ pub fn validate_signature(
     } else {
         (
             SignatureStatus::Valid,
-            "Signature integrity verified; no illegal post-signing changes".to_string(),
+            "No illegal post-signing changes detected. Cryptographic              verification was NOT performed — the signed bytes are not proven              intact and the signer is not identified."
+                .to_string(),
         )
     };
 
@@ -351,8 +367,9 @@ pub fn validate_signature(
         signature: signature.clone(),
         post_signing_changes: changes,
         signer_trusted: false, // Requires trust store (M10)
-        integrity_check_passed: hash_ok,
-        hash_match: hash_ok,
+        byte_range_well_formed: well_formed,
+        // No CMS verification is performed anywhere in this crate. [M10]
+        cms_verified: None,
         validation_time: now,
     }
 }
@@ -831,8 +848,8 @@ mod tests {
             },
             post_signing_changes: Vec::new(),
             signer_trusted: false,
-            integrity_check_passed: true,
-            hash_match: true,
+            byte_range_well_formed: true,
+            cms_verified: None,
             validation_time: 0,
         }
     }
@@ -891,7 +908,62 @@ mod tests {
         let report = validate_signature(file, &sig, &xref, &xref);
         assert_eq!(report.status, SignatureStatus::Valid);
         assert!(report.post_signing_changes.is_empty());
-        assert!(report.integrity_check_passed);
+        assert!(report.byte_range_well_formed);
+        assert_eq!(report.cms_verified, None, "no crypto ran");
+    }
+
+    /// No cryptographic verification happens anywhere in this crate -- CMS
+    /// verification is deferred to M10 -- so a report must not claim a hash
+    /// matched or that an integrity check passed. MET-FEAT-6 marks
+    /// never-false-valid absolute. [FR-SIG-1, MET-FEAT-6, PRIN-6, GR-8]
+    #[test]
+    fn a_well_formed_byte_range_is_not_reported_as_a_verified_signature() {
+        let pdf = b"%PDF-1.4
+1 0 obj
+<< /Type /Catalog >>
+endobj
+";
+        let (file, sig) = make_signed_pdf(pdf, &[0xCA, 0xFE]);
+        let xref = vec![(1u32, 9u64)];
+
+        let report = validate_signature(&file, &sig, &xref, &xref);
+
+        assert!(
+            report.byte_range_well_formed,
+            "this fixture's ByteRange is well formed"
+        );
+        assert_eq!(
+            report.cms_verified, None,
+            "no CMS verification is performed, so it must be reported as              not performed rather than as a pass"
+        );
+        assert!(
+            !report.explanation.to_lowercase().contains("integrity verified"),
+            "an explanation must not claim verified integrity when nothing              cryptographic ran, got {:?}",
+            report.explanation
+        );
+    }
+
+    /// A malformed ByteRange is a structural defect, not a hash mismatch, and
+    /// the explanation must say which. [FR-SIG-1, PRIN-6]
+    #[test]
+    fn a_malformed_byte_range_is_not_described_as_a_hash_mismatch() {
+        let pdf = b"%PDF-1.4
+1 0 obj
+<< /Type /Catalog >>
+endobj
+";
+        let (file, mut sig) = make_signed_pdf(pdf, &[0xCA, 0xFE]);
+        // Range runs past the end of the file.
+        sig.byte_range = vec![0, (file.len() as u64) + 4096];
+
+        let report = validate_signature(&file, &sig, &[], &[]);
+
+        assert_ne!(report.status, SignatureStatus::Valid);
+        assert!(
+            !report.explanation.to_lowercase().contains("hash does not match"),
+            "no hash was compared, so the explanation must not blame one, got {:?}",
+            report.explanation
+        );
     }
 
     #[test]
@@ -996,8 +1068,8 @@ mod tests {
             signature: sig,
             post_signing_changes: vec![],
             signer_trusted: false,
-            integrity_check_passed: true,
-            hash_match: true,
+            byte_range_well_formed: true,
+            cms_verified: None,
             validation_time: 0,
         };
         let s = report.summary();
