@@ -7,21 +7,35 @@
 
 ---
 
-## 1. Current mode
+## 1. Current mode and governing design
+
+Governing design:
+`docs/superpowers/specs/2026-08-01-enforced-worker-confinement-design.md`.
+It supersedes the advisory-only implementation direction in the 2026-07-13
+draft while preserving the human review gate.
 
 | Item | Value |
 |---|---|
-| `ConfinementMode` | **Advisory** |
-| Child lockdown | Logs intended profile; does not fail closed |
+| Default build | `Advisory`; `filters_active=false` |
+| `enforced-confinement` build | Fails closed with `BackendUnavailable` until the reviewed OS slice lands |
+| Child lockdown | Shared policy contract active; OS filters not implemented |
 | Parent confine (Windows) | Logs intended AppContainer + job; not applied |
-| Public claim | “Advisory confinement hooks present” — **not** “sandboxed” |
+| Public claim | “Advisory confinement”; never “sandboxed” |
 
-Enforcement (`ConfinementMode::Enforced`) requires:
+The shared contract distinguishes `Advisory`, `EnforcementPending`, and
+`Enforced`. Only a successful private platform backend may construct an active
+report. Enforcement requires:
 
 1. Signed review of this package  
 2. Superseding ADR or amendment note if policy changes  
 3. CI test that proves deny paths without breaking legitimate worker work  
-4. Explicit enablement flag / build feature (default off until review)
+4. Explicit `enforced-confinement` build feature (default off until review)
+
+Unsigned platform review items:
+
+- Linux: namespaces and seccomp-bpf allowlist.
+- Windows: AppContainer launch and job-object limits.
+- macOS: `sandbox_init` profile.
 
 ---
 
