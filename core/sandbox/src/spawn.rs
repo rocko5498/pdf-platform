@@ -332,6 +332,7 @@ mod unix {
     use super::*;
     use crate::transport::UnixWorkerTransport;
     use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::process::CommandExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
 
@@ -339,8 +340,12 @@ mod unix {
     const F_SETFD: i32 = 2;
     const FD_CLOEXEC: i32 = 1;
 
+    const PRIO_PROCESS: i32 = 0;
+    const UTILITY_NICE: i32 = 10;
+
     extern "C" {
         fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
     }
 
     fn clear_cloexec(fd: RawFd) -> io::Result<()> {
@@ -387,14 +392,30 @@ mod unix {
         }
         let unlink = Unlink(sock_path.clone());
 
-        let mut cmd = match priority {
-            SpawnPriority::Normal => Command::new(worker_exe),
-            SpawnPriority::UtilityLow => {
-                let mut command = Command::new("nice");
-                command.arg("-n").arg("10").arg(worker_exe);
-                command
-            }
-        };
+        // Priority is applied in the forked child, not by exec-ing `nice`.
+        // The wrapper cost a second exec that the inherited shmem/document FDs
+        // had to survive, and on macOS they did not: the utility worker got
+        // EBADF from `File::metadata()` on ENV_SHMEM_FD while Linux passed.
+        // Registering a `pre_exec` closure also keeps std on its fork/exec
+        // path rather than the `posix_spawn` fast path, which is what makes
+        // the cleared FD_CLOEXEC above actually mean inherited. `nice` is also
+        // one less external binary the sandboxed spawn depends on.
+        // [ADR-008, ADR-016, CMP-XPLAT-1]
+        let mut cmd = Command::new(worker_exe);
+        let lower_priority = matches!(priority, SpawnPriority::UtilityLow);
+        // SAFETY: the closure runs between fork and exec, where only
+        // async-signal-safe calls are permitted. `setpriority` is a bare
+        // syscall with no allocation, no locks and no libc state; its failure
+        // is deliberately ignored because a worker that could not be niced is
+        // still a correct worker. [UNSAFE-1, UNSAFE-2, GR-8]
+        unsafe {
+            cmd.pre_exec(move || {
+                if lower_priority {
+                    setpriority(PRIO_PROCESS, 0, UTILITY_NICE);
+                }
+                Ok(())
+            });
+        }
         cmd.env(ENV_IPC_SOCK, &sock_path)
             .env_remove(ENV_IPC_PIPE)
             .env_remove(ENV_DOC_HANDLE)
