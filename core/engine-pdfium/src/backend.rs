@@ -139,9 +139,18 @@ impl PdfiumEngine {
         file: &std::fs::File,
         password: Option<&str>,
     ) -> Result<Self, String> {
-        use std::io::Read;
+        use std::io::{Read, Seek, SeekFrom};
         let mut data = Vec::new();
         let mut handle = file.try_clone().map_err(|e| format!("clone handle: {e}"))?;
+        // The document arrives as an inherited FD/HANDLE, so this process shares
+        // one open file description — and one file offset — with the coordinator
+        // and with every worker spawned before it. Reading from the current
+        // position yields nothing once an earlier reader reached EOF, which
+        // presents as a bogus FormatError. Always read the whole file.
+        // [SDS §4.2, SDS §10.1, GR-8]
+        handle
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("rewind handle: {e}"))?;
         handle.read_to_end(&mut data).map_err(|e| format!("read file: {e}"))?;
         Self::from_bytes_with_password(data, password)
     }
@@ -695,5 +704,36 @@ mod tests {
         assert_eq!(model.page_index, 0);
         // The fixture may or may not have text; just verify extraction doesn't panic.
         eprintln!("extracted {} chars, {} lines", model.char_count, model.lines.len());
+    }
+
+    /// The worker receives its document as an inherited FD/HANDLE, so it shares
+    /// one open file description — and therefore one file offset — with the
+    /// coordinator that spawned it. After a first worker reads the document,
+    /// that shared offset sits at EOF, so a respawned worker reading from the
+    /// current position sees zero bytes and silently comes up with no engine.
+    /// [SDS §4.2, SDS §10.1, GR-8]
+    #[test]
+    fn pdfium_loads_from_handle_left_at_eof() {
+        use std::io::{Read, Write};
+
+        let path = std::env::temp_dir().join(format!(
+            "pdf-platform-eof-handle-{}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, minimal_pdf_bytes()).expect("write fixture");
+
+        let mut file = std::fs::File::open(&path).expect("open fixture");
+        let mut drained = Vec::new();
+        file.read_to_end(&mut drained).expect("drain to EOF");
+        assert_eq!(drained.len(), minimal_pdf_bytes().len(), "first read consumed the file");
+
+        let engine = PdfiumEngine::from_file_handle(&file)
+            .expect("load from a handle another reader already advanced to EOF");
+        assert_eq!(Rasterize::page_count(&engine), 1);
+
+        drop(engine);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+        let _ = std::io::stdout().flush();
     }
 }
