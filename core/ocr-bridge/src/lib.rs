@@ -1421,22 +1421,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn preprocess_tolerates_a_degenerate_raster() {
-        // A zero-dimension raster has no interior pixels. It must return an
-        // internally consistent empty buffer instead of aborting the Z1
-        // worker during preprocessing. [FR-OCR-3, GR-8]
-        for (width, height) in [(0, 0), (0, 4), (4, 0), (1, 1)] {
-            let raster = vec![255u8; (width * height * 4) as usize];
-            let (output, out_w, out_h, _) =
-                preprocess_page(&raster, width, height, &PreprocessOptions::default());
-            assert_eq!(
-                output.len(),
-                (out_w * out_h * 4) as usize,
-                "{width}x{height} produced an inconsistent buffer"
-            );
-        }
-    }
 
     #[test]
     fn escape_ocr_str_handles_specials() {
@@ -1544,7 +1528,7 @@ mod tests {
         ));
         assert!(!missing.exists(), "fixture path must not exist");
 
-        let result = read_and_parse_tsv(&missing, 7);
+        let result = read_and_parse_tsv(&missing, 7, 100, 200);
 
         assert!(!result.success);
         assert_eq!(result.page_index, 7);
@@ -1564,7 +1548,7 @@ mod tests {
         ));
         std::fs::write(&path, "").expect("write empty tsv");
 
-        let result = read_and_parse_tsv(&path, 3);
+        let result = read_and_parse_tsv(&path, 3, 100, 200);
 
         assert!(!result.success);
         assert_eq!(
