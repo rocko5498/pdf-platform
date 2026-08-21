@@ -659,8 +659,8 @@ fn resize_bilinear(input: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32)
 fn despeckle(input: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut output = input.to_vec();
     let threshold = 128u8; // binary threshold for noise detection
-    // saturating_sub: a zero-dimension raster has no interior pixels to
-    // inspect, and `height - 1` would underflow u32 and abort the worker.
+    // A zero-dimension raster has no interior pixels; ordinary subtraction
+    // would underflow u32 and abort the sandboxed worker. [FR-OCR-3, GR-8]
     for y in 1..height.saturating_sub(1) {
         for x in 1..width.saturating_sub(1) {
             let idx = ((y * width + x) * 4) as usize;
@@ -1378,6 +1378,23 @@ mod tests {
         // 1..height-1 over u32, so height 0 underflowed. A Z1 crash here is a
         // worker abort the coordinator can only see as "transport
         // disconnected". [PRIN-1, GR-8, FR-OCR-4]
+        for (width, height) in [(0, 0), (0, 4), (4, 0), (1, 1)] {
+            let raster = vec![255u8; (width * height * 4) as usize];
+            let (output, out_w, out_h, _) =
+                preprocess_page(&raster, width, height, &PreprocessOptions::default());
+            assert_eq!(
+                output.len(),
+                (out_w * out_h * 4) as usize,
+                "{width}x{height} produced an inconsistent buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn preprocess_tolerates_a_degenerate_raster() {
+        // A zero-dimension raster has no interior pixels. It must return an
+        // internally consistent empty buffer instead of aborting the Z1
+        // worker during preprocessing. [FR-OCR-3, GR-8]
         for (width, height) in [(0, 0), (0, 4), (4, 0), (1, 1)] {
             let raster = vec![255u8; (width * height * 4) as usize];
             let (output, out_w, out_h, _) =
