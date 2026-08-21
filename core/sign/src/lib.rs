@@ -592,8 +592,20 @@ impl std::fmt::Display for PdfALevel {
 /// PDF/A validation result. [FR-STD-5]
 #[derive(Debug, Clone)]
 pub struct PdfAValidationResult {
-    /// Whether the document conforms to the target level.
-    pub conforms: bool,
+    /// Conformance verdict, or `None` when it could not be determined.
+    ///
+    /// `Some(false)` — a violation was detected, which is a sound negative.
+    /// `None`        — no violation was detected, which is **not** conformance.
+    /// `Some(true)`  — unreachable until a recognized validator is integrated.
+    ///
+    /// The field this replaces was `conforms: bool`, set from
+    /// `errors.is_empty()`. `validate_pdf_a` greps four byte patterns and
+    /// parses no objects, so it cannot see encryption, embedded JavaScript, or
+    /// external references — all prohibited by ISO 19005. Absence of findings
+    /// from those heuristics is not evidence of conformance, and MET-FEAT-3
+    /// makes standards conformance absolute.
+    /// [FR-STD-5, CMP-STD-4, MET-FEAT-3, PRIN-6, GR-8]
+    pub conformance: Option<bool>,
     /// The target level.
     pub target_level: PdfALevel,
     /// Validation errors (must-fix for conformance).
@@ -688,7 +700,10 @@ pub fn validate_pdf_a(
     let fonts_embedded = errors.iter().all(|e| !e.contains("font"));
 
     PdfAValidationResult {
-        conforms: errors.is_empty(),
+        // A detected violation is a sound negative verdict. No detection means
+        // undetermined, never conformant: establishing conformance requires a
+        // recognized validator such as veraPDF (CMP-STD-2). [MET-FEAT-3]
+        conformance: if errors.is_empty() { None } else { Some(false) },
         target_level,
         errors,
         warnings,
@@ -1215,11 +1230,45 @@ mod tests {
         assert_eq!(PdfALevel::A4.to_string(), "PDF/A-4");
     }
 
+    /// Finding a violation proves non-conformance. Finding none proves nothing:
+    /// `validate_pdf_a` greps four byte patterns and parses no objects, so it
+    /// cannot see encryption, embedded JavaScript, or external references, all
+    /// of which ISO 19005 prohibits. A clean run must therefore report
+    /// "undetermined", never conformance. MET-FEAT-3 makes standards
+    /// conformance absolute. [FR-STD-5, CMP-STD-4, MET-FEAT-3, PRIN-6, GR-8]
+    #[test]
+    fn a_clean_heuristic_run_reports_undetermined_not_conformant() {
+        // Carries XMP and an output intent, so none of the heuristics fire.
+        let pdf = b"%PDF-1.7
+<< /Info 1 0 R /OutputIntents [2 0 R] >>
+x:xmpmeta
+";
+
+        let result = validate_pdf_a(pdf, PdfALevel::A2b);
+
+        assert!(result.errors.is_empty(), "no heuristic should have fired");
+        assert_eq!(
+            result.conformance, None,
+            "absence of findings is not conformance"
+        );
+    }
+
+    /// A violation is still a sound negative verdict. [FR-STD-5]
+    #[test]
+    fn a_detected_violation_is_reported_as_non_conformance() {
+        let pdf = b"%PDF-1.4
+<< /Type /Catalog >>
+"; // no XMP
+        let result = validate_pdf_a(pdf, PdfALevel::A1b);
+        assert!(!result.errors.is_empty());
+        assert_eq!(result.conformance, Some(false));
+    }
+
     #[test]
     fn validate_pdf_a_missing_xmp() {
         let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
         let result = validate_pdf_a(pdf, PdfALevel::A1a);
-        assert!(!result.conforms, "PDF/A-1a without XMP should not conform");
+        assert_eq!(result.conformance, Some(false), "PDF/A-1a without XMP should not conform");
         assert!(result.errors.iter().any(|e| e.contains("XMP")));
     }
 

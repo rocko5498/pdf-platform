@@ -1404,8 +1404,8 @@ fn cmd_validate_pdf_a(path: &Path, rest: &[String]) {
     // MET-FEAT-3 makes absolute. A real claim requires a recognized validator
     // (veraPDF, CMP-STD-2). [FR-STD-5, CMP-STD-4, MET-FEAT-3, PRIN-6]
     println!("Level:  {}", result.target_level);
-    if result.conforms {
-        println!("Status: NO VIOLATIONS DETECTED");
+    if result.conformance.is_none() {
+        println!("Status: UNDETERMINED — no violations detected");
         println!();
         println!("This is NOT a conformance determination. These are heuristic");
         println!("byte-pattern checks, not ISO 19005 validation; most PDF/A rules");
@@ -1434,7 +1434,7 @@ fn cmd_validate_pdf_a(path: &Path, rest: &[String]) {
     // Exit 0 = no violations detected by these heuristics (usable for pipeline
     // gating, FR-STD-6); exit 1 = violations found. Neither is a conformance
     // claim. [FR-STD-5, FR-STD-6, CMP-STD-4]
-    if result.conforms && result.errors.is_empty() {
+    if result.conformance.is_none() && result.errors.is_empty() {
         println!();
         println!(
             "No {} violations detected by the heuristic checks.",
