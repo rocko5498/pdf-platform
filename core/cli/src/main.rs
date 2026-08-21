@@ -634,8 +634,6 @@ fn cmd_optimize(path: &Path, rest: &[String]) {
 /// Usage: pdf-platform stamp <file> --text "WATERMARK" -o <out.pdf>
 ///        pdf-platform stamp <file> --bates-start 1 --bates-width 6 -o <out.pdf>
 fn cmd_stamp(path: &Path, rest: &[String]) {
-    use pdf_model::stamp::{Stamp, StampPosition, generate_stamp_stream, bates_number};
-
     let text = rest.iter()
         .position(|s| s == "--text")
         .and_then(|i| rest.get(i + 1))
@@ -665,25 +663,55 @@ fn cmd_stamp(path: &Path, rest: &[String]) {
         process::exit(1);
     }
 
-    // This previously printed "Wrote <out>" and exited 0 without ever opening
-    // the input or creating the output — a flat false success. Page-content
-    // injection is a coordinator mutation path (ADR-013) that is not wired up
-    // here, so the command must refuse and say so rather than claim a file it
-    // did not write. [PRIN-1, PRIN-6, GR-8, UX-ERR-3, FR-STAMP]
-    if let Some(ref t) = text {
-        eprintln!("error: cannot stamp '{t}' on {}", path.display());
-    } else if let Some(start) = bates_start {
-        eprintln!(
-            "error: cannot apply Bates numbering from {start} (width {bates_width}) to {}",
-            path.display()
-        );
+    if let Err(error) = run_stamp(
+        path,
+        &out,
+        text.as_deref(),
+        bates_start,
+        bates_width,
+        font_size,
+    ) {
+        eprintln!("error: {error}");
+        process::exit(2);
     }
-    eprintln!(
-        "The stamp module generates content streams (font size {font_size}), but injecting \
-         them into pages requires the coordinator mutation path, which is not wired up yet."
-    );
-    eprintln!("No file was written to {}.", out.display());
-    process::exit(1);
+    println!("Wrote {}", out.display());
+    process::exit(0);
+}
+
+fn run_stamp(
+    input: &Path,
+    output: &Path,
+    text: Option<&str>,
+    bates_start: Option<u32>,
+    bates_width: usize,
+    font_size: f32,
+) -> Result<(), String> {
+    let worker = find_worker();
+    let mut coordinator = coordinator::document::DocumentCoordinator::open(&worker, input)
+        .map_err(|e| e.to_string())?;
+    if let Some(text) = text {
+        let stamp = pdf_model::stamp::Stamp {
+            text: text.to_string(),
+            font_size,
+            ..pdf_model::stamp::Stamp::default()
+        };
+        coordinator.apply_stamp(&stamp).map_err(|e| e.to_string())?;
+    } else if let Some(start) = bates_start {
+        coordinator
+            .apply_bates(
+                start,
+                bates_width,
+                pdf_model::stamp::StampPosition::BottomCenter,
+                font_size,
+            )
+            .map_err(|e| e.to_string())?;
+    } else {
+        return Err("stamp text or Bates start is required".into());
+    }
+    coordinator
+        .save_incremental(output)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 
@@ -1600,8 +1628,7 @@ fn extract_xref_offsets(_bytes: &[u8]) -> Vec<(u32, u64)> {
 /// Pipeline file format: one step per section, type=merge/split/etc.
 /// See `pdf_model::batch::BatchPipeline::serialize()` for the format.
 fn cmd_batch(pipeline_path: &Path) {
-    use coordinator::broker::optimize_with_verification;
-    use pdf_model::batch::{BatchPipeline, BatchStep, execute_pipeline_with};
+    use pdf_model::batch::{BatchPipeline, BatchStep};
 
     if !pipeline_path.exists() {
         eprintln!("error: pipeline file not found: {}", pipeline_path.display());
@@ -1701,12 +1728,7 @@ fn cmd_batch(pipeline_path: &Path) {
     println!("Executing pipeline '{}' ({} steps)...", pipeline.name, pipeline.step_count());
     // Same verified candidate/publish safety net `optimize` gets standalone
     // (FR-BATCH: identical behavior via GUI/CLI/batch — see cmd_optimize).
-    let results = execute_pipeline_with(&pipeline, &|input, output, profile| {
-        optimize_with_verification(output, |candidate_path| {
-            pdf_model::assembly_ops::optimize_pdf(input, candidate_path, profile)
-                .map_err(|e| e.to_string())
-        })
-    });
+    let results = execute_cli_pipeline(&pipeline);
 
     let mut all_ok = true;
     for (i, result) in results.iter().enumerate() {
@@ -2305,4 +2327,75 @@ fn read_sidecar_info(sidecar_path: &Path, doc_path: &Path) -> Result<SidecarInfo
         group_count,
         group_names,
     })
+}
+
+fn execute_cli_pipeline(
+    pipeline: &pdf_model::batch::BatchPipeline,
+) -> Vec<pdf_model::batch::StepResult> {
+    use pdf_model::batch::{BatchStep, StepResult};
+
+    let mut results = Vec::new();
+    for step in &pipeline.steps {
+        let started = std::time::Instant::now();
+        let result = match step {
+            BatchStep::Watermark { input, text, output } => run_stamp(
+                input,
+                output,
+                Some(text),
+                None,
+                6,
+                10.0,
+            )
+            .map(|()| vec![output.clone()]),
+            BatchStep::BatesNumber {
+                input,
+                start,
+                width,
+                output,
+            } => run_stamp(input, output, None, Some(*start), *width, 10.0)
+                .map(|()| vec![output.clone()]),
+            // Stamps go through the coordinator injection path above; every
+            // other step keeps the verified candidate/publish safety net
+            // `optimize` gets standalone. [FR-BATCH, ADR-013]
+            _ => pdf_model::batch::execute_step(step, &|input, output, profile| {
+                coordinator::broker::optimize_with_verification(output, |candidate_path| {
+                    pdf_model::assembly_ops::optimize_pdf(input, candidate_path, profile)
+                        .map_err(|e| e.to_string())
+                })
+            }),
+        };
+        let success = result.is_ok();
+        results.push(StepResult {
+            success,
+            outputs: result.as_ref().cloned().unwrap_or_default(),
+            message: result.err().unwrap_or_else(|| "ok".into()),
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+        if !success {
+            break;
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+
+    #[test]
+    fn run_stamp_writes_incremental_stamp_objects() {
+        let worker = find_worker();
+        let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/corpus-diff/fixtures/valid-1page.pdf");
+        if !worker.exists() || !input.exists() {
+            eprintln!("skipping: build worker-main and provide corpus fixture");
+            return;
+        }
+        let output = std::env::temp_dir().join("pdf-platform-cli-stamp-test.pdf");
+        run_stamp(&input, &output, Some("CONFIDENTIAL"), None, 6, 10.0).unwrap();
+        let bytes = std::fs::read(&output).unwrap();
+        assert!(bytes.windows(b"CONFIDENTIAL".len()).any(|w| w == b"CONFIDENTIAL"));
+        assert!(bytes.len() > std::fs::metadata(&input).unwrap().len() as usize);
+        std::fs::remove_file(output).ok();
+    }
 }

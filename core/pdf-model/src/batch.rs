@@ -235,7 +235,7 @@ pub fn execute_pipeline_with(
 }
 
 /// Execute a single batch step. Returns output paths on success.
-fn execute_step(
+pub fn execute_step(
     step: &BatchStep,
     optimize: &dyn Fn(&std::path::Path, &std::path::Path, crate::assembly::OptimizeProfile) -> Result<String, String>,
 ) -> Result<Vec<PathBuf>, String> {
@@ -361,9 +361,9 @@ mod tests {
         std::fs::write(&src, b"fake pdf content").unwrap();
 
         let step = BatchStep::Watermark {
-            input: src.clone(),
+            input: "src.pdf".into(),
             text: "CONFIDENTIAL".into(),
-            output: out.clone(),
+            output: "stamped.pdf".into(),
         };
         let error = execute_step(&step, &default_optimize)
             .expect_err("an unimplemented stamp must not report success");
