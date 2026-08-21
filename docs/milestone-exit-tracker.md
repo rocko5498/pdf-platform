@@ -9,7 +9,7 @@ Update when a criterion is proven by test, bench, or audited demo.
 | **M0** | Shell QTest coverage (ADR-003) | **Not started** | ADR-003 requires "widget code carries QTest coverage for input→command translation (the shell's one testable responsibility, wired into ADR-022 CI)", and ADR-029 §1 lists a "shell QTest suite" in the PR pipeline. `find shell -name '*test*'` returns nothing and no workflow builds the shell. The shell's single mandated test stratum has no implementation [ADR-003, ADR-022, ADR-029 §1, T-8] |
 | **M0** | Kill-worker respawn | **Met** | `session_death.rs` |
 | **M0** | Corpus-diff + CI | **Met** | GitHub Actions |
-| **M0** | Cold-start / first-page budgets | **Met** | ~11ms / ~13ms recorded |
+| **M0** | Cold-start / first-page budgets | **Not claimed** | ~11ms / ~13ms are worker spawn+inspect and spawn+render-tile microbenchmarks, on unrecorded hardware. MET-PERF-1 measures *application* launch-to-interactive and MET-PERF-2 wants median and p95 on a representative document; neither is discharged. B-3 and MET-GOV-1 forbid claiming a budget without versioned reference hardware |
 | **M0** | Sandbox confinement | **Advisory + review package** | `docs/security/confinement-review-package.md`; `confinement_report()`; no silent enforce |
 | **M0/M1** | Shell open→shmem→tile (Windows) | **Met (smoke)** | Human open+view; path/shmem/password hardened; single PDFium engine; resilient panels |
 | **M1** | Multi-page + zoom + scroll | **Mostly** | Continuous multi-tile composite + wheel scroll |
