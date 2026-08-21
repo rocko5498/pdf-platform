@@ -805,8 +805,7 @@ impl OcrEngine for TesseractEngine {
                 }
 
                 // Parse TSV output.
-                let tsv_content = std::fs::read_to_string(&tsv_path).unwrap_or_default();
-                parse_tesseract_tsv(&tsv_content, page_index, proc_w, proc_h)
+                read_and_parse_tsv(&tsv_path, page_index, proc_w, proc_h)
             }
             Err(e) => OcrPageResult {
                 page_index,
@@ -875,6 +874,38 @@ fn which_tesseract() -> Option<std::path::PathBuf> {
 }
 
 /// Parse Tesseract TSV output into OcrPageResult.
+/// Read Tesseract's TSV output and parse it.
+///
+/// Tesseract can exit 0 and still leave no readable TSV. Discarding that read
+/// error and parsing an empty string makes the result indistinguishable from a
+/// page Tesseract genuinely found no text on, so an I/O failure gets reported
+/// as "no text recognized" - blaming the document for the machine's problem.
+/// GR-8 requires the deviation to surface as what it is. [FR-OCR-3, GR-8]
+fn read_and_parse_tsv(
+    tsv_path: &std::path::Path,
+    page_index: u32,
+    raster_width: u32,
+    raster_height: u32,
+) -> OcrPageResult {
+    match std::fs::read_to_string(tsv_path) {
+        Ok(tsv_content) => {
+            parse_tesseract_tsv(&tsv_content, page_index, raster_width, raster_height)
+        }
+        Err(e) => OcrPageResult {
+            page_index,
+            raster_width,
+            raster_height,
+            blocks: Vec::new(),
+            full_text: String::new(),
+            average_confidence: 0.0,
+            had_existing_text: false,
+            orientation_correction: 0.0,
+            success: false,
+            error: Some(format!("read tesseract TSV output: {e}")),
+        },
+    }
+}
+
 fn parse_tesseract_tsv(tsv: &str, page_index: u32, raster_width: u32, raster_height: u32) -> OcrPageResult {
     let mut blocks = Vec::new();
     let mut full_text = String::new();
@@ -1497,5 +1528,50 @@ mod tests {
             stream_str.contains("Hello World"),
             "text content must be present"
         );
+    }
+
+    /// Tesseract can exit 0 and still leave no readable TSV — a full temp
+    /// volume, a sandbox denial, a racing cleanup. Reporting that as "no text
+    /// recognized" blames the document for an I/O failure, which is exactly the
+    /// misattribution GR-8 forbids: the deviation must surface as what it is.
+    /// [FR-OCR-3, GR-8, ADR-022]
+    #[test]
+    fn unreadable_tsv_is_reported_as_a_read_failure_not_an_empty_page() {
+        let missing = std::env::temp_dir().join(format!(
+            "pdf-platform-absent-tsv-{}-{}.tsv",
+            std::process::id(),
+            line!()
+        ));
+        assert!(!missing.exists(), "fixture path must not exist");
+
+        let result = read_and_parse_tsv(&missing, 7);
+
+        assert!(!result.success);
+        assert_eq!(result.page_index, 7);
+        let error = result.error.expect("a failure must carry an error");
+        assert!(
+            error.contains("read tesseract TSV output"),
+            "error must name the read failure, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn readable_but_empty_tsv_still_reports_no_text_recognized() {
+        let path = std::env::temp_dir().join(format!(
+            "pdf-platform-empty-tsv-{}-{}.tsv",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "").expect("write empty tsv");
+
+        let result = read_and_parse_tsv(&path, 3);
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("no text recognized"),
+            "a genuinely empty result keeps its own diagnostic"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }
