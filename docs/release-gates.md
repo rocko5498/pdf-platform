@@ -7,6 +7,7 @@ Run before tagging a release. Do **not** invent numbers — attach real outputs.
 ## Automated (CI / local)
 
 ```bash
+python tools/provision_engine.py   # installs the pinned PDFium; verifies SHA-256
 cd core
 cargo test --workspace
 cargo run -q -p corpus-diff
@@ -36,6 +37,13 @@ checklist a release decision is actually made from. [MET-FEAT-4, T-2, PRIN-6, GR
 The CI step is likewise named "Extraction correctness suite (M2)". Renaming it
 is deliberately left out of this change to avoid a third concurrent editor of
 `.github/workflows/ci.yml`.
+
+### The engine must be provisioned first
+
+`cargo test --workspace` without a provisioned PDFium exercises the stub paths and proves
+nothing about rendering. `python tools/provision_engine.py --check` reports whether the
+pinned artifact is installed; CI runs the install step before `cargo build`.
+[ADR-028, ADR-038, SDS §13.4]
 
 ## Manual / lab
 

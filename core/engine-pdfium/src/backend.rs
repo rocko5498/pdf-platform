@@ -3,7 +3,8 @@
 //! Uses `pdfium-render` for safe bindings + prebuilt PDFium binaries.
 //! SAFETY: all unsafe lives here; every unsafe block must carry a // SAFETY: comment. [ADR-027]
 
-use std::sync::Once;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use engine_api::extract::{Extract, ExtractError, PageTextModel, TextLine, TextSpan};
 use engine_api::rasterize::{Rasterize, RasterizeError, RasterizeRequest, TileOutput};
@@ -23,13 +24,27 @@ pub struct PdfiumEngine {
 unsafe impl Send for PdfiumEngine {}
 unsafe impl Sync for PdfiumEngine {}
 
-/// Global PDFium instance, initialized once per process. [ADR-005]
+/// Global PDFium instance, bound once per process. [ADR-005]
 ///
-/// SAFETY: Pdfium is designed to live for the process lifetime.
-/// We leak the Box so the reference is stable. pdfium-render's own
-/// `Pdfium::default()` uses the same pattern internally.
-static INIT: Once = Once::new();
-static mut PDFIUM_PTR: *const Pdfium = std::ptr::null();
+/// The binding outcome is cached, failure included: a missing engine is a
+/// property of the installation, so retrying it per document would only
+/// repeat the same filesystem lookup and the same diagnostic.
+static PDFIUM: OnceLock<Result<PdfiumHandle, String>> = OnceLock::new();
+
+/// A leaked `Pdfium` shared across worker threads.
+///
+/// `Pdfium` owns a `Box<dyn PdfiumLibraryBindings>`, which is neither `Send`
+/// nor `Sync` in the type system, so it cannot sit in a `OnceLock` directly.
+#[derive(Clone, Copy)]
+struct PdfiumHandle(*const Pdfium);
+
+// SAFETY: the pointee is leaked at first bind and never freed or mutated
+// afterwards, so every reader observes an immutable, permanently live value.
+// PDFium itself synchronizes its internal state, which is the same reasoning
+// `PdfiumEngine`'s Send/Sync impls below already rely on. [ADR-005, ADR-027]
+unsafe impl Send for PdfiumHandle {}
+// SAFETY: as above — shared reads of an immutable, process-lifetime value.
+unsafe impl Sync for PdfiumHandle {}
 
 /// Fraction of private-use codepoints above which extraction is suspect.
 const PUA_UNRELIABLE_RATIO: f32 = 0.10;
@@ -65,57 +80,114 @@ fn text_is_reliable(text: &str) -> bool {
     (private_use as f32 / total as f32) < PUA_UNRELIABLE_RATIO
 }
 
-/// Retry a fallible bind with linear backoff, returning the last error.
-///
-/// Binding PDFium is not reliably idempotent across processes on a cold
-/// cache: when several sandboxed workers start at once, `LoadLibraryExW`
-/// on the shared `pdfium.dll` can fail with `ERROR_SHARING_VIOLATION` (32)
-/// even though the file is complete and no process holds it open. Observed
-/// as `fault_injection` passing 8/8 serially but 5/8 in parallel. A worker
-/// that fails here aborts, which the coordinator can only report as
-/// "transport disconnected". [ADR-022, ADR-005]
-fn retry_bind<T, E>(
-    attempts: u32,
-    delay: std::time::Duration,
-    mut bind: impl FnMut() -> Result<T, E>,
-) -> Result<T, E> {
-    let mut last = None;
-    for attempt in 0..attempts.max(1) {
-        match bind() {
-            Ok(value) => return Ok(value),
-            Err(error) => {
-                last = Some(error);
-                if attempt + 1 < attempts {
-                    std::thread::sleep(delay * (attempt + 1));
-                }
-            }
-        }
+/// Manifest platform id for this build, matching `third_party/pdfium/provenance.toml`.
+const fn platform_id() -> &'static str {
+    if cfg!(target_os = "windows") {
+        if cfg!(target_arch = "aarch64") { "win-arm64" } else { "win-x64" }
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") { "mac-arm64" } else { "mac-x64" }
+    } else if cfg!(target_arch = "aarch64") {
+        "linux-arm64"
+    } else {
+        "linux-x64"
     }
-    Err(last.expect("at least one attempt always runs"))
 }
 
-fn pdfium() -> &'static Pdfium {
-    // SAFETY: INIT ensures this runs exactly once. The pointer is written
-    // before any reader can see it (Once::call_once is a barrier).
-    unsafe {
-        INIT.call_once(|| {
-            let pdfium = retry_bind(
-                5,
-                std::time::Duration::from_millis(40),
-                pdfium_auto::bind_pdfium_silent,
-            )
-            .expect("failed to initialize PDFium");
-            let leaked = Box::leak(Box::new(pdfium));
-            PDFIUM_PTR = leaked as *const Pdfium;
-        });
-        &*PDFIUM_PTR
+/// Shared-library file name PDFium ships under on this platform.
+const fn library_file_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "pdfium.dll"
+    } else if cfg!(target_os = "macos") {
+        "libpdfium.dylib"
+    } else {
+        "libpdfium.so"
     }
+}
+
+/// Where the engine may be found, in priority order. [SDS §13.4, ADR-028 §3]
+///
+/// Nothing here reaches the network. PDFium is a setup-time input installed by
+/// `tools/provision_engine.py`; Z1 has no network at all (GR-1) and the product
+/// transmits nothing without an explicit user action (GR-9), so a worker that
+/// cannot find the library says so rather than fetching it.
+fn candidate_paths() -> Vec<PathBuf> {
+    candidate_paths_from(
+        std::env::var_os("PDFIUM_LIB_PATH").map(PathBuf::from),
+        std::env::current_exe().ok(),
+    )
+}
+
+/// Resolution order, with the two environment lookups injected so it is testable.
+fn candidate_paths_from(override_path: Option<PathBuf>, current_exe: Option<PathBuf>) -> Vec<PathBuf> {
+    let file_name = library_file_name();
+    let mut candidates = Vec::new();
+
+    // 1. Explicit override, for a packaged install or a local PDFium build.
+    //    Accepts either the library itself or the directory holding it.
+    if let Some(path) = override_path {
+        if path.is_dir() {
+            candidates.push(path.join(file_name));
+        } else {
+            candidates.push(path);
+        }
+    }
+
+    // 2. Beside the executable, which is how a shipped build carries it.
+    if let Some(dir) = current_exe.as_deref().and_then(Path::parent) {
+        candidates.push(dir.join(file_name));
+    }
+
+    // 3. The provisioned tree in a source checkout. CARGO_MANIFEST_DIR is
+    //    core/engine-pdfium, so the repository root is two levels up.
+    let vendored = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/pdfium/prebuilt")
+        .join(platform_id())
+        .join(file_name);
+    candidates.push(vendored);
+
+    candidates
+}
+
+/// Bind PDFium from the first candidate path that exists.
+fn bind_pdfium() -> Result<Pdfium, String> {
+    let candidates = candidate_paths();
+    let mut attempted = Vec::new();
+    for path in &candidates {
+        if !path.is_file() {
+            attempted.push(format!("{} (not found)", path.display()));
+            continue;
+        }
+        match Pdfium::bind_to_library(path) {
+            Ok(bindings) => return Ok(Pdfium::new(bindings)),
+            Err(error) => attempted.push(format!("{}: {error}", path.display())),
+        }
+    }
+    // FR-DIAG-1 and GR-8: name the fault and the fix, never a silent stub.
+    Err(format!(
+        "PDFium is not installed for {}. Run `python tools/provision_engine.py`          to install the pinned artifact recorded in third_party/pdfium/provenance.toml,          or set PDFIUM_LIB_PATH to an existing {}. Looked at: {}",
+        platform_id(),
+        library_file_name(),
+        attempted.join("; ")
+    ))
+}
+
+fn pdfium() -> Result<&'static Pdfium, String> {
+    // Leaked on purpose: PDFium is designed to live for the process lifetime,
+    // and a &'static keeps documents borrowing from it valid for as long.
+    let handle = PDFIUM
+        .get_or_init(|| {
+            bind_pdfium().map(|engine| PdfiumHandle(Box::leak(Box::new(engine)) as *const Pdfium))
+        })
+        .clone()?;
+    // SAFETY: the pointer came from `Box::leak` above, so it is non-null,
+    // aligned, and valid for the rest of the process.
+    Ok(unsafe { &*handle.0 })
 }
 
 impl PdfiumEngine {
     /// Load a PDF file from disk with an optional password.
     pub fn from_file(path: &std::path::Path, password: Option<&str>) -> Result<Self, String> {
-        let document = pdfium()
+        let document = pdfium()?
             .load_pdf_from_file(path, password)
             .map_err(|e| format!("pdfium load failed: {e}"))?;
 
@@ -162,7 +234,7 @@ impl PdfiumEngine {
 
     /// Load a PDF from raw bytes with an optional password.
     pub fn from_bytes_with_password(data: Vec<u8>, password: Option<&str>) -> Result<Self, String> {
-        let document = pdfium()
+        let document = pdfium()?
             .load_pdf_from_byte_vec(data, password)
             .map_err(|e| format!("pdfium load failed: {e}"))?;
 
@@ -547,49 +619,6 @@ mod reliability_tests {
     }
 }
 
-#[cfg(test)]
-mod retry_tests {
-    use super::retry_bind;
-    use std::cell::Cell;
-    use std::time::Duration;
-
-    #[test]
-    fn returns_immediately_when_the_first_attempt_succeeds() {
-        let calls = Cell::new(0);
-        let result: Result<u8, ()> = retry_bind(5, Duration::ZERO, || {
-            calls.set(calls.get() + 1);
-            Ok(7)
-        });
-        assert_eq!(result, Ok(7));
-        assert_eq!(calls.get(), 1, "a successful bind must not be retried");
-    }
-
-    #[test]
-    fn retries_a_transient_failure_until_it_succeeds() {
-        let calls = Cell::new(0);
-        let result: Result<u8, &str> = retry_bind(5, Duration::ZERO, || {
-            calls.set(calls.get() + 1);
-            if calls.get() < 3 {
-                Err("sharing violation")
-            } else {
-                Ok(1)
-            }
-        });
-        assert_eq!(result, Ok(1));
-        assert_eq!(calls.get(), 3);
-    }
-
-    #[test]
-    fn gives_up_after_the_attempt_budget_and_reports_the_last_error() {
-        let calls = Cell::new(0);
-        let result: Result<u8, u32> = retry_bind(4, Duration::ZERO, || {
-            calls.set(calls.get() + 1);
-            Err(calls.get())
-        });
-        assert_eq!(calls.get(), 4, "must not exceed its attempt budget");
-        assert_eq!(result, Err(4), "must surface the final error, not the first");
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -735,5 +764,63 @@ mod tests {
         drop(file);
         std::fs::remove_file(&path).ok();
         let _ = std::io::stdout().flush();
+    }
+}
+
+#[cfg(test)]
+mod engine_resolution_tests {
+    use super::{bind_pdfium, candidate_paths_from, library_file_name, pdfium, platform_id};
+    use std::path::PathBuf;
+
+    #[test]
+    fn override_is_tried_before_anything_else() {
+        let explicit = PathBuf::from("/opt/custom/mypdfium.bin");
+        let candidates = candidate_paths_from(
+            Some(explicit.clone()),
+            Some(PathBuf::from("/apps/pdf-platform/worker")),
+        );
+        assert_eq!(candidates.first(), Some(&explicit), "{candidates:?}");
+    }
+
+    #[test]
+    fn override_directory_gets_the_platform_library_name() {
+        let candidates = candidate_paths_from(Some(std::env::temp_dir()), None);
+        assert_eq!(
+            candidates[0],
+            std::env::temp_dir().join(library_file_name()),
+            "a directory override must resolve to the library inside it"
+        );
+    }
+
+    #[test]
+    fn executable_directory_precedes_the_source_checkout() {
+        let candidates =
+            candidate_paths_from(None, Some(PathBuf::from("/apps/pdf-platform/worker")));
+        assert_eq!(candidates[0], PathBuf::from("/apps/pdf-platform").join(library_file_name()));
+        let vendored = candidates.last().expect("vendored fallback is always present");
+        assert!(
+            vendored.to_string_lossy().contains("third_party"),
+            "last resort must be the provisioned tree: {vendored:?}"
+        );
+        assert!(vendored.to_string_lossy().contains(platform_id()), "{vendored:?}");
+    }
+
+    #[test]
+    fn a_missing_engine_reports_how_to_install_it_and_never_downloads() {
+        // Provisioning is a setup step; Z1 has no network (GR-1). The only
+        // honest response to an absent library is a diagnostic (GR-8, FR-DIAG-1).
+        let candidates = candidate_paths_from(None, None);
+        if candidates.iter().any(|path| path.is_file()) {
+            // Engine provisioned on this machine: the error path cannot be
+            // exercised without uninstalling it, so assert the resolver is
+            // sane instead. Go through `pdfium()`, never `bind_pdfium()`:
+            // dropping a bound `Pdfium` calls FPDF_DestroyLibrary and takes
+            // the library down for the whole process, aborting later tests.
+            assert!(pdfium().is_ok(), "an installed engine must bind");
+            return;
+        }
+        let error = bind_pdfium().expect_err("no engine installed, bind must fail");
+        assert!(error.contains("provision_engine.py"), "{error}");
+        assert!(error.contains("PDFIUM_LIB_PATH"), "{error}");
     }
 }

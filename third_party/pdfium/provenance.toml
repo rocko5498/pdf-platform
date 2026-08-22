@@ -1,0 +1,38 @@
+# PDFium prebuilt artifact provenance. [ADR-028 §1, ADR-028 §3, SDS §13.4]
+#
+# The engine is a setup-time input, never a runtime download: no zone, and Z1
+# least of all, may fetch it (GR-1, GR-9, NFR-PRIV-2). `tools/provision_engine.py`
+# reads this file, downloads the artifact for the host platform, rejects it
+# unless the SHA-256 matches, and installs it under `prebuilt/<platform>/`.
+#
+# `prebuilt/` is gitignored; only this manifest is committed (SDS §13.4).
+
+upstream = "https://pdfium.googlesource.com/pdfium"
+license = "BSD-3-Clause"
+
+# The artifact is a third-party rebuild, not a Google release. ADR-028 wants
+# pinned provenance, which a fixed ref plus a recorded SHA-256 gives; the
+# adoption note ADR-038 records the publisher risk that remains.
+publisher = "https://github.com/bblanchon/pdfium-binaries"
+upstream_ref = "chromium/7690"
+url_template = "https://github.com/bblanchon/pdfium-binaries/releases/download/{ref}/{archive}"
+
+[platform.win-x64]
+archive = "pdfium-win-x64.tgz"
+sha256 = "06ef95ac4f9b8897731224639ddf0f185693cb48bc9ee650f1e92f71e0d2a94e"
+library = "bin/pdfium.dll"
+
+[platform.linux-x64]
+archive = "pdfium-linux-x64.tgz"
+sha256 = "addd9f59beea62536ad45f0ca6d38fb6088ba20a7260443deb595852fb51eac3"
+library = "lib/libpdfium.so"
+
+[platform.mac-x64]
+archive = "pdfium-mac-x64.tgz"
+sha256 = "04bc0a7696452c903f006812d877250cdbc462bfe785ec79bb41b7d145f5774f"
+library = "lib/libpdfium.dylib"
+
+[platform.mac-arm64]
+archive = "pdfium-mac-arm64.tgz"
+sha256 = "0617e90556273ebe484d5f4a9981f366e10b4874f997896a4d27fe87d3c71ecf"
+library = "lib/libpdfium.dylib"
