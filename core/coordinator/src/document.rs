@@ -433,10 +433,17 @@ impl DocumentCoordinator {
         file.write_all(&original_bytes)
             .map_err(|e| SessionError::Io(e))?;
 
+        // The previous xref offset comes from the original file's own
+        // `startxref`. This used to pass a literal 0 with a comment claiming
+        // the writer derived it; the writer only printed it, so every
+        // incremental save emitted `/Prev 0` and chained to nothing.
+        // [SDS §3.3, FR-SAVE, PRIN-1]
+        let prev_xref_offset = pdf_cos::scan::find_startxref(&original_bytes).unwrap_or(0) as u32;
+
         let result = IncrementalWriter::write_incremental(
             &mut file,
             &self.overlay,
-            0, // prev_xref_offset will be set by the writer from the original
+            prev_xref_offset,
             self.next_obj_num,
             &self.summary.original_offsets,
             original_len,
@@ -1307,6 +1314,20 @@ mod tests {
         // Verify the file exists and has content.
         let meta = fs::metadata(&save_path).expect("save file exists");
         assert!(meta.len() > 0);
+
+        // The appended revision must chain to the xref it supersedes. Until
+        // 2026-08-22 the caller passed a literal 0 and every save emitted
+        // `/Prev 0`, a pointer at the file header: a malformed incremental
+        // update that readers are entitled to reject. [SDS §3.3, FR-SAVE]
+        let original = fs::read(&pdf).expect("read fixture");
+        let expected = pdf_cos::scan::find_startxref(&original).expect("fixture has startxref");
+        let saved = fs::read(&save_path).expect("read saved");
+        let text = String::from_utf8_lossy(&saved);
+        assert!(
+            text.contains(&format!("/Prev {expected}")),
+            "saved revision must point at the original xref at {expected}"
+        );
+        assert!(!text.contains("/Prev 0 "), "a zero back-pointer is not a chain");
 
         fs::remove_file(&save_path).ok();
     }
