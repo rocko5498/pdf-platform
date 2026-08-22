@@ -20,6 +20,8 @@
 #include <QFocusEvent>
 #include <QInputDialog>
 #include <QKeySequence>
+
+#include "registry.h"
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QMouseEvent>
@@ -125,43 +127,40 @@ void CanvasWidget::paintEvent(QPaintEvent* event) {
 }
 
 void CanvasWidget::keyPressEvent(QKeyEvent* event) {
-    switch (event->key()) {
-    case Qt::Key_PageDown:
-    case Qt::Key_Down:
-    case Qt::Key_Space:
+    // Bindings come from ui-registry.toml, never from this file. ADR-032 makes
+    // the registry the single source of truth, and DS-CONV-4 makes it the
+    // expression of PRIN-4: rebinding a key is a reviewable one-line diff there
+    // plus a profile_version bump, with no C++ change. [ADR-032, ADR-030, RQA-1]
+    const auto& keys = chrome::shortcuts();
+    if (keys.matches(QStringLiteral("nav.next_page"), event)) {
         emit pageStepRequested(+1);
         event->accept();
         return;
-    case Qt::Key_PageUp:
-    case Qt::Key_Up:
+    }
+    if (keys.matches(QStringLiteral("nav.prev_page"), event)) {
         emit pageStepRequested(-1);
         event->accept();
         return;
-    case Qt::Key_Home:
+    }
+    if (keys.matches(QStringLiteral("nav.first_page"), event)) {
         emit pageStepRequested(-100000);
         event->accept();
         return;
-    case Qt::Key_End:
+    }
+    if (keys.matches(QStringLiteral("nav.last_page"), event)) {
         emit pageStepRequested(+100000);
         event->accept();
         return;
-    case Qt::Key_Plus:
-    case Qt::Key_Equal:
-        if (event->modifiers() & Qt::ControlModifier) {
-            emit zoomStepRequested(+1);
-            event->accept();
-            return;
-        }
-        break;
-    case Qt::Key_Minus:
-        if (event->modifiers() & Qt::ControlModifier) {
-            emit zoomStepRequested(-1);
-            event->accept();
-            return;
-        }
-        break;
-    default:
-        break;
+    }
+    if (keys.matches(QStringLiteral("view.zoom_in"), event)) {
+        emit zoomStepRequested(+1);
+        event->accept();
+        return;
+    }
+    if (keys.matches(QStringLiteral("view.zoom_out"), event)) {
+        emit zoomStepRequested(-1);
+        event->accept();
+        return;
     }
     PDF_CANVAS_BASE::keyPressEvent(event);
 }
@@ -1058,15 +1057,18 @@ void MainWindow::exportAnnotationsXfdf() {
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event) {
-    if (event->matches(QKeySequence::Open)) {
+    // As in CanvasWidget: every binding below is resolved through the registry.
+    // [ADR-032, DS-CONV-4, PRIN-4]
+    const auto& keys = chrome::shortcuts();
+    if (keys.matches(QStringLiteral("document.open"), event)) {
         QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Open PDF"), {},
                                                     QStringLiteral("PDF (*.pdf)"));
         if (!path.isEmpty()) openDocument(path);
         event->accept();
         return;
     }
-    if (event->matches(QKeySequence::Find)) {
-        // Ctrl+F: focus search panel input. [FR-SRCH-1, M2]
+    if (keys.matches(QStringLiteral("document.find"), event)) {
+        // Focus the search panel input. [FR-SRCH-1, M2]
         if (search_) {
             if (auto* dock = findChild<QDockWidget*>(QStringLiteral("searchDock"))) {
                 dock->show();
@@ -1079,9 +1081,10 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
-    if (event->key() == Qt::Key_F3) {
-        // F3: find next; Shift+F3: find previous. [FR-SRCH-3, M2]
-        if (event->modifiers() & Qt::ShiftModifier) {
+    if (keys.matches(QStringLiteral("document.find_next"), event) ||
+        keys.matches(QStringLiteral("document.find_previous"), event)) {
+        // find next; the shifted binding walks backwards. [FR-SRCH-3, M2]
+        if (keys.matches(QStringLiteral("document.find_previous"), event)) {
             findPrevious();
         } else {
             findNext();
@@ -1089,12 +1092,12 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
-    if (event->matches(QKeySequence::Copy)) {
+    if (keys.matches(QStringLiteral("edit.copy"), event)) {
         copyPageText();
         event->accept();
         return;
     }
-    if (event->key() == Qt::Key_F6) {
+    if (keys.matches(QStringLiteral("focus.canvas"), event)) {
         // Focus cycling: canvas → left panels → right panels → canvas [DS-FOCUS-5, M1]
         // Determine current focus region
         QWidget* focused = focusWidget();
@@ -1135,7 +1138,7 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
-    if (event->modifiers() & Qt::ControlModifier && event->key() == Qt::Key_S) {
+    if (keys.matches(QStringLiteral("document.save"), event)) {
         QString path = QFileDialog::getSaveFileName(
             this, QStringLiteral("Save PDF"), path_,
             QStringLiteral("PDF files (*.pdf)"));
@@ -1150,8 +1153,8 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
-    if (event->modifiers() & Qt::ControlModifier && event->key() == Qt::Key_Z) {
-        // Ctrl+Z: undo. [FR-ANNOT-4, FR-FORM-6, M4]
+    if (keys.matches(QStringLiteral("edit.undo"), event)) {
+        // undo. [FR-ANNOT-4, FR-FORM-6, M4]
         try {
             QString msg = QString::fromStdString(undo());
             statusBar()->showMessage(msg, 3000);
@@ -1162,8 +1165,8 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
-    if (event->modifiers() & Qt::ControlModifier && event->key() == Qt::Key_Y) {
-        // Ctrl+Y: redo. [FR-ANNOT-4, FR-FORM-6, M4]
+    if (keys.matches(QStringLiteral("edit.redo"), event)) {
+        // redo. [FR-ANNOT-4, FR-FORM-6, M4]
         try {
             QString msg = QString::fromStdString(redo());
             statusBar()->showMessage(msg, 3000);
@@ -1174,18 +1177,18 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
-    if (event->modifiers() & Qt::ControlModifier && event->key() == Qt::Key_E) {
+    if (keys.matches(QStringLiteral("annot.export"), event)) {
         exportAnnotationsXfdf();
         event->accept();
         return;
     }
-    if (event->modifiers() & Qt::ControlModifier && event->key() == Qt::Key_G) {
+    if (keys.matches(QStringLiteral("forms.calculate"), event)) {
         runFormsCalc();
         event->accept();
         return;
     }
     // Place annotation at center of page on Enter when a tool is active
-    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+    if (keys.matches(QStringLiteral("ui.activate"), event)) {
         if (annot_tool_ > 0 && page_count_ > 0) {
             static const char* types[] = {"",     "highlight", "underline", "note",
                                           "freetext", "ink",       "rect",      "stamp"};
@@ -1210,7 +1213,7 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         }
     }
     // Delete key: delete last annotation on current page. [FR-ANNOT-4, M4]
-    if (event->key() == Qt::Key_Delete && page_count_ > 0) {
+    if (keys.matches(QStringLiteral("annot.delete"), event) && page_count_ > 0) {
         try {
             // Find the last annotation on the current page
             uint32_t count = annotation_count();

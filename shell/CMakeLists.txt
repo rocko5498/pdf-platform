@@ -36,6 +36,7 @@ endif()
 add_subdirectory(bridge)
 add_subdirectory(panels)
 add_subdirectory(a11y)
+add_subdirectory(chrome)
 add_subdirectory(canvas)
 add_subdirectory(app)
 

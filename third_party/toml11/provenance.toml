@@ -1,0 +1,17 @@
+# toml11 single-header vendoring record. [ADR-028 §1, ADR-028 §3, ADR-032]
+#
+# Unlike PDFium, this is source, not a per-platform binary, so it is committed
+# rather than fetched: a fresh clone builds the shell with no network at all,
+# and any future bump is a reviewable diff. The digest below lets the pin be
+# checked against upstream.
+
+upstream = "https://github.com/ToruNiina/toml11"
+upstream_ref = "v4.4.0"
+license = "MIT"
+source_url = "https://raw.githubusercontent.com/ToruNiina/toml11/v4.4.0/single_include/toml.hpp"
+vendored_file = "toml.hpp"
+sha256 = "71a65e312d8375f4fdbca3b921c6e3d9255058ea964071dd36f674183047d260"
+
+# ADR-032 names toml11 as the parser for shell/chrome/ui-registry.toml, the
+# interface-stability contract. Exit seam: only shell/chrome/ includes it.
+used_by = "shell/chrome"

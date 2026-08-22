@@ -12,6 +12,7 @@ target_include_directories(shell-canvas PUBLIC
 target_link_libraries(shell-canvas PUBLIC
     shell-bridge
     shell-panels
+    shell-chrome
     Qt6::Widgets
 )
 if(PDF_PLATFORM_USE_OPENGL)

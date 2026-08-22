@@ -243,3 +243,9 @@ jobs:
 
       - name: Test shell
         run: ctest --test-dir build/shell -C Release --output-on-failure
+
+      # ADR-032: no shortcut binding may appear in C++ source. Runs beside the
+      # shell tests because that is the code it governs. [ADR-032, DS-CONV-4]
+      - name: Shortcut registry gate (ADR-032)
+        working-directory: .
+        run: cargo run -q --manifest-path tools/check-ui-registry/Cargo.toml
