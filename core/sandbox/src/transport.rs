@@ -50,13 +50,22 @@ mod unix {
         }
 
         fn recv_timeout(&mut self, timeout: Duration) -> Result<Vec<u8>, TransportError> {
-            // macOS may return EINVAL if the peer already closed the socket.
-            if let Err(e) = self.stream.set_read_timeout(Some(timeout)) {
-                return Err(map_dead_socket(e));
-            }
+            // macOS can fail this with EINVAL once the peer has closed — even
+            // when a frame the peer wrote before closing is still sitting in
+            // the receive buffer. Returning Disconnected here threw that frame
+            // away: a worker that answered and exited immediately looked like a
+            // worker that never answered. Attempt the read regardless and let
+            // the read report a genuine disconnect; only if the read also fails
+            // does the failed socket option get to decide the error.
+            // [SDS §4.6, GR-8]
+            let timeout_error = self.stream.set_read_timeout(Some(timeout)).err();
             let result = read_frame_into(&mut self.stream, &mut self.decoder);
             let _ = self.stream.set_read_timeout(None);
-            result
+            match (result, timeout_error) {
+                (Ok(frame), _) => Ok(frame),
+                (Err(_), Some(error)) => Err(map_dead_socket(error)),
+                (Err(error), None) => Err(error),
+            }
         }
     }
 
@@ -513,6 +522,25 @@ mod tests {
         let reply = a.recv_timeout(Duration::from_secs(2)).expect("reply");
         assert_eq!(reply, b"tile-ping");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn frame_survives_a_peer_that_closes_immediately() {
+        // The echo peer drops its socket the moment it has written. On macOS
+        // that made `set_read_timeout` fail with EINVAL and the buffered frame
+        // was reported as Disconnected instead of delivered. [GR-8]
+        let (mut a, mut b) = pair().expect("pair");
+        a.send(b"tile-ping").expect("send");
+        let handle = thread::spawn(move || {
+            let msg = b.recv_timeout(Duration::from_secs(2)).expect("recv");
+            b.send(&msg).expect("echo");
+            drop(b);
+        });
+        handle.join().unwrap();
+        let reply = a
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a frame written before the peer closed must still arrive");
+        assert_eq!(reply, b"tile-ping");
     }
 
     #[test]
