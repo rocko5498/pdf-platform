@@ -19,6 +19,7 @@ cargo test -p engine-pdfium --test extraction_accuracy     # real PDF through PD
 cd ..
 python tools/a11y_audit.py
 python tools/bench/check_p95_gates.py
+python tools/verapdf_writer_gate.py   # needs a JRE; writer output must parse
 ```
 
 ### What `extraction_correctness` does and does not cover
