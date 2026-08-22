@@ -572,13 +572,32 @@ impl Extract for PdfiumEngine {
         let mut current_line_y: f32 = char_data[0].2; // Y of first char in current line.
 
         for &c in &char_data {
-            if (c.2 - current_line_y).abs() > line_threshold && !current_line_chars.is_empty() {
+            // PDFium synthesizes a space between text runs that are drawn
+            // separately, and those characters carry no bounds at all. Letting
+            // one decide line membership split a line at every run boundary:
+            // a right-to-left fixture drawn glyph by glyph came back as five
+            // lines — "alef", " ", "bet", " ", "gimel" — instead of one, which
+            // is wrong for selection, hit-testing and any consumer that walks
+            // lines. A character with no geometry joins the current line and
+            // never starts or ends one. [FR-SRCH-2, ADR-019]
+            let has_geometry = c.3 > 0.0 || c.4 > 0.0;
+
+            if has_geometry
+                && (c.2 - current_line_y).abs() > line_threshold
+                && !current_line_chars.is_empty()
+            {
                 // Flush current line.
                 let line = build_line(lines.len() as u32, &current_line_chars);
                 lines.push(line);
                 current_line_chars.clear();
             }
             if current_line_chars.is_empty() {
+                // A boundless character carries no position, so it cannot
+                // establish where a line sits; drop it rather than let it
+                // anchor one at the origin.
+                if !has_geometry {
+                    continue;
+                }
                 current_line_y = c.2;
             }
             current_line_chars.push(c);
