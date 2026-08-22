@@ -150,11 +150,19 @@ fn render_tile_page_out_of_range_returns_error() {
 fn render_tile_real_pdf_via_pdfium() {
     // Render a real PDF document through the full pipeline with PDFium.
     // The valid-1page.pdf is a minimal 1-page PDF with a white page.
+    //
+    // Every degraded outcome is a failure here. The test used to return early
+    // on a missing fixture and to accept a RenderError as "the pipeline works",
+    // so it passed on a machine with no engine at all — which is precisely what
+    // M0's exit criterion needs proven. PDFium is provisioned before the build
+    // now (ADR-038), so an unavailable engine is a real defect, not the
+    // environment. [AGENTS §11, ADR-022 T-5, PRIN-6, GR-8]
     let pdf = fixture_pdf();
-    if !pdf.is_file() {
-        eprintln!("skip: fixture PDF not found at {}", pdf.display());
-        return;
-    }
+    assert!(
+        pdf.is_file(),
+        "fixture PDF missing at {} — the M0 tile criterion cannot be shown without it",
+        pdf.display()
+    );
 
     let brokered = open_read_only(&pdf).expect("broker open");
     let region = SharedRegion::create(TILE_RGBA8_BYTES).expect("create shmem");
@@ -204,17 +212,20 @@ fn render_tile_real_pdf_via_pdfium() {
         other => panic!("expected TileReady or RenderError, got {other:?}"),
     }
 
-    // Verify pixels are rendered (not all zeros).
     let _ = region.flush();
     let bytes = region.as_slice();
     assert_eq!(bytes.len(), TILE_RGBA8_BYTES);
 
-    // A real PDF page should have some non-zero pixels.
-    let has_content = bytes.iter().any(|&b| b != 0);
-    assert!(has_content, "rendered tile should have non-zero pixels");
-
-    // Alpha should be 255 for rendered content.
-    assert_eq!(bytes[3], 255, "alpha should be 255");
+    // The fixture is a white page, so every pixel must be opaque white. "Some
+    // byte is non-zero" was too weak to tell a rasterized page from a partly
+    // written region; this distinguishes both from a stub.
+    let opaque_white = bytes.chunks_exact(4).filter(|px| px == &[255u8, 255, 255, 255]).count();
+    assert_eq!(
+        opaque_white,
+        TILE_RGBA8_BYTES / 4,
+        "expected a fully opaque white page; got {opaque_white} of {} pixels —          an unwritten shared region or a stub engine",
+        TILE_RGBA8_BYTES / 4
+    );
 
     child.transport.send(b"CMD:QUIT\n").expect("quit");
     let _ = child.child.wait();
