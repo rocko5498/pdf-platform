@@ -1542,6 +1542,9 @@ fn cmd_compare(path1: &Path, path2: &Path) {
     // Extract and compare text from each page.
     let max_pages = pages1.max(pages2);
     let mut total_diffs = 0u32;
+    // Moves are counted separately: a relocation is not a content change,
+    // and folding it into the change count overstates the edit. [FR-CMP-2]
+    let mut total_moves = 0;
     let mut pages_with_diffs = 0u32;
 
     for page in 0..max_pages {
@@ -1579,16 +1582,28 @@ fn cmd_compare(path1: &Path, path2: &Path) {
             fell_back = true;
         }
 
+        // FR-CMP-2 wants the *nature* of each change and a location to
+        // navigate to, so line numbers are printed and a relocation is
+        // reported as one move rather than as an unrelated deletion and
+        // insertion. Line numbers are 1-based for a reader.
         for op in &ops {
             match op {
-                LineDiff::Same(_) => {}
-                LineDiff::Removed(line) => {
-                    println!("  - {line}");
+                LineDiff::Same { .. } => {}
+                LineDiff::Removed { text, before_index } => {
+                    println!("  - [line {}] {text}", before_index + 1);
                     total_diffs += 1;
                 }
-                LineDiff::Added(line) => {
-                    println!("  + {line}");
+                LineDiff::Added { text, after_index } => {
+                    println!("  + [line {}] {text}", after_index + 1);
                     total_diffs += 1;
+                }
+                LineDiff::Moved { text, before_index, after_index } => {
+                    println!(
+                        "  ~ [line {} -> {}] {text}",
+                        before_index + 1,
+                        after_index + 1
+                    );
+                    total_moves += 1;
                 }
             }
         }
@@ -1600,6 +1615,7 @@ fn cmd_compare(path1: &Path, path2: &Path) {
     println!("  Pages compared: {}", max_pages);
     println!("  Pages with differences: {}", pages_with_diffs);
     println!("  Total line changes: {}", total_diffs);
+    println!("  Lines moved: {}", total_moves);
     if fell_back {
         println!();
         println!("Note: at least one page exceeded the alignment bound, so its lines");
