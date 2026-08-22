@@ -135,7 +135,11 @@ pub(crate) struct XrefEntry {
 }
 
 /// Scan last 1024 bytes for `startxref\n<N>`, return N as a file offset.
-pub(crate) fn find_startxref(data: &[u8]) -> Option<usize> {
+/// Byte offset recorded by the file's last `startxref`, if any.
+///
+/// Public because an incremental writer cannot honour `/Prev` without it: the
+/// new xref section must point at the one it supersedes. [SDS §3.3, FR-SAVE]
+pub fn find_startxref(data: &[u8]) -> Option<usize> {
     const NEEDLE: &[u8] = b"startxref";
     let search_start = data.len().saturating_sub(1024);
     let tail = &data[search_start..];

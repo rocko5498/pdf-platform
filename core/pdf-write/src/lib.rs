@@ -121,9 +121,16 @@ impl IncrementalWriter {
         }
 
         // Write trailer.
-        let trailer = format!(
-            "trailer\n<< /Size {max_obj} /Root 1 0 R /Prev {prev_xref_offset} >>\n"
-        );
+        //
+        // `/Prev 0` is not "no previous section", it is a pointer at byte 0. A
+        // reader that follows it lands on the file header rather than an xref,
+        // so the incremental update is malformed. Omit the key entirely when
+        // there is nothing to chain to. [SDS §3.3, PRIN-1, GR-8]
+        let trailer = if prev_xref_offset > 0 {
+            format!("trailer\n<< /Size {max_obj} /Root 1 0 R /Prev {prev_xref_offset} >>\n")
+        } else {
+            format!("trailer\n<< /Size {max_obj} /Root 1 0 R >>\n")
+        };
         writer.write_all(trailer.as_bytes())?;
         current_pos += trailer.len() as u32;
 
@@ -271,5 +278,32 @@ mod tests {
         // startxref should reference the correct position.
         let startxref_line = format!("startxref\n{xref_pos}\n%%EOF");
         assert!(text.contains(&startxref_line));
+    }
+
+    #[test]
+    fn a_first_revision_omits_prev_rather_than_pointing_at_byte_zero() {
+        let mut overlay = CowOverlay::new();
+        overlay.set_object(1, b"1 0 obj
+<< /Type /Catalog >>
+endobj
+".to_vec());
+
+        let mut output = Vec::new();
+        IncrementalWriter::write_incremental(
+            &mut output,
+            &overlay,
+            0, // nothing to chain to
+            2,
+            &HashMap::new(),
+            0,
+        )
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("trailer"), "{text}");
+        assert!(
+            !text.contains("/Prev"),
+            "`/Prev 0` points at the file header, not at an xref section: {text}"
+        );
     }
 }
