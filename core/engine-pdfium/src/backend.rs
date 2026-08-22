@@ -488,6 +488,14 @@ impl Extract for PdfiumEngine {
         let mut char_data: Vec<(char, f32, f32, f32, f32)> = Vec::new(); // (char, x, y, w, h)
         for ch in &chars {
             let unicode = ch.unicode_char().unwrap_or('\u{FFFD}');
+            // PDFium synthesizes CR/LF between drawn runs; they are separators,
+            // not glyphs, and carry no bounds. Keeping them produced a phantom
+            // `TextLine` whose text was a bare line break at zero width and
+            // height, which any consumer walking lines reads as real content.
+            // [ADR-019, FR-SRCH-2]
+            if unicode == '\r' || unicode == '\n' {
+                continue;
+            }
             let rect = ch.loose_bounds().unwrap_or_else(|_| {
                 // Fallback: use a zero-size rect at origin.
                 PdfRect::new(PdfPoints::zero(), PdfPoints::zero(), PdfPoints::zero(), PdfPoints::zero())
@@ -495,7 +503,13 @@ impl Extract for PdfiumEngine {
             let x = rect.left().value;
             let y = rect.top().value;
             let w = rect.right().value - rect.left().value;
-            let h = rect.bottom().value - rect.top().value;
+            // PDF user space is bottom-up, so `top` is the larger value and
+            // `bottom - top` is negative. Every extracted line and span carried
+            // a negative height — the geometry search hit-testing, selection
+            // rectangles and OCR block placement all read. Take the magnitude;
+            // `y` remains the top edge, which is what the consumers expect.
+            // [FR-SRCH-2, SDS §3.3, ADR-019]
+            let h = (rect.top().value - rect.bottom().value).abs();
             char_data.push((unicode, x, y, w, h));
         }
 
