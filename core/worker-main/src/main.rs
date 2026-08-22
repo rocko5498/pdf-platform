@@ -1128,6 +1128,7 @@ mod utility_ocr_tests {
             _raster: &[u8],
             width: u32,
             height: u32,
+            _source_dpi: u32,
             page_index: u32,
             _options: &PreprocessOptions,
         ) -> OcrPageResult {
