@@ -18,6 +18,10 @@ CMakeFiles/
 # Vendored engine build artifacts (keep source refs, ignore outputs)
 /third_party/**/out/
 
+# Provisioned engine binaries. SDS §13.4 fetches these with a setup step, so
+# only third_party/pdfium/provenance.toml is committed. [ADR-028 §3]
+/third_party/pdfium/prebuilt/
+
 # Node (Claude Code / tooling)
 node_modules/
 

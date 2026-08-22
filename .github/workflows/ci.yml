@@ -120,6 +120,24 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $bin
           & $qpdfExe.FullName --version
 
+      # PDFium is a setup-time input with recorded provenance, never a runtime
+      # download: Z1 has no network (GR-1) and nothing transmits without an
+      # explicit user action (GR-9). The step verifies the artifact against the
+      # SHA-256 in third_party/pdfium/provenance.toml and fails on a mismatch.
+      # [ADR-028 §1, ADR-029, SDS §13.4]
+      - name: Cache provisioned engine
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: third_party/pdfium/prebuilt
+          key: pdfium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('third_party/pdfium/provenance.toml') }}
+
+      - name: Provision PDFium
+        working-directory: .
+        run: |
+          python tools/test_provision_engine.py
+          python tools/provision_engine.py
+          python tools/provision_engine.py --check
+
       - name: Build workspace
         run: cargo build --workspace
 
