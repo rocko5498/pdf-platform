@@ -1499,6 +1499,7 @@ fn cmd_validate_pdf_a(path: &Path, rest: &[String]) {
 /// Shows page-by-page comparison with added/removed/changed content.
 fn cmd_compare(path1: &Path, path2: &Path) {
     use coordinator::document::DocumentCoordinator;
+    use coordinator::visual_compare::{compare_pages, RenderedPage, DEFAULT_CHANNEL_TOLERANCE};
     use text_extract::compare::{diff_lines, DiffQuality, LineDiff};
 
     // Set when any page exceeded the alignment bound, so the summary can say
@@ -1545,6 +1546,13 @@ fn cmd_compare(path1: &Path, path2: &Path) {
     // Moves are counted separately: a relocation is not a content change,
     // and folding it into the change count overstates the edit. [FR-CMP-2]
     let mut total_moves = 0;
+    // FR-CMP-1 requires appearance differences too, not only text. Rendered at
+    // a modest scale: this answers "did the page change" rather than grading
+    // rendering fidelity, and it keeps the raster inside the transport frame
+    // cap. [FR-CMP-1, SDS §4.6]
+    const VISUAL_SCALE: f32 = 0.5;
+    let mut pages_visually_changed = 0u32;
+    let mut visual_unavailable: Option<String> = None;
     let mut pages_with_diffs = 0u32;
 
     for page in 0..max_pages {
@@ -1564,7 +1572,41 @@ fn cmd_compare(path1: &Path, path2: &Path) {
             String::new()
         };
 
-        if text1 == text2 {
+        // Appearance is compared for every page, including pages whose text is
+        // identical — a moved figure, a swapped logo, a box drawn over content
+        // or a substituted font all leave the text untouched, and those are
+        // exactly the changes a text-only diff cannot see. [FR-CMP-1]
+        let visual = if visual_unavailable.is_none() && page < pages1 && page < pages2 {
+            match (
+                coord1.render_page(page, VISUAL_SCALE),
+                coord2.render_page(page, VISUAL_SCALE),
+            ) {
+                (Ok(before), Ok(after)) => {
+                    match compare_pages(&before, &after, DEFAULT_CHANNEL_TOLERANCE) {
+                        Ok(diff) => Some(diff),
+                        Err(error) => {
+                            visual_unavailable = Some(error.to_string());
+                            None
+                        }
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    // Say why appearance was not compared rather than printing
+                    // a text-only verdict that looks complete. [GR-8]
+                    visual_unavailable = Some(error.to_string());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let visual_changed = visual.as_ref().is_some_and(|diff| !diff.is_identical());
+        if visual_changed {
+            pages_visually_changed += 1;
+        }
+
+        if text1 == text2 && !visual_changed {
             continue;
         }
 
@@ -1607,6 +1649,23 @@ fn cmd_compare(path1: &Path, path2: &Path) {
                 }
             }
         }
+
+        if let Some(diff) = &visual {
+            if diff.is_identical() {
+                println!("  appearance: unchanged");
+            } else if diff.geometry_differs {
+                println!(
+                    "  appearance: page size differs; {:.2}% of pixels differ",
+                    f64::from(diff.changed_fraction()) * 100.0
+                );
+            } else {
+                println!(
+                    "  appearance: {:.2}% of pixels differ (max channel delta {})",
+                    f64::from(diff.changed_fraction()) * 100.0,
+                    diff.max_channel_delta
+                );
+            }
+        }
         println!();
     }
 
@@ -1616,6 +1675,12 @@ fn cmd_compare(path1: &Path, path2: &Path) {
     println!("  Pages with differences: {}", pages_with_diffs);
     println!("  Total line changes: {}", total_diffs);
     println!("  Lines moved: {}", total_moves);
+    println!("  Pages with appearance changes: {}", pages_visually_changed);
+    if let Some(reason) = &visual_unavailable {
+        println!();
+        println!("Note: appearance comparison did not run ({reason}).");
+        println!("Text differences above are complete; visual differences are unknown.");
+    }
     if fell_back {
         println!();
         println!("Note: at least one page exceeded the alignment bound, so its lines");
@@ -1627,7 +1692,11 @@ fn cmd_compare(path1: &Path, path2: &Path) {
 
     if pages_with_diffs == 0 {
         println!();
-        println!("Documents are identical (text content).");
+        if visual_unavailable.is_some() {
+            println!("Documents are identical (text content); appearance was not compared.");
+        } else {
+            println!("Documents are identical (text content and rendered appearance).");
+        }
         process::exit(0);
     } else {
         process::exit(1);

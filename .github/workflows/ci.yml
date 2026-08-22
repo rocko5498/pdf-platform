@@ -196,6 +196,10 @@ jobs:
       - name: Malformed documents never kill the worker (M1)
         run: cargo test -p coordinator --test malformed_open_e2e
 
+      # FR-CMP-1: a change that leaves the text identical must still be found.
+      - name: Appearance comparison (M12, FR-CMP-1)
+        run: cargo test -p coordinator --test visual_compare_e2e
+
       - name: Forms JS subset + confinement + assembly ops
         run: |
           cargo test -p pdf-model forms_js
