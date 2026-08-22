@@ -12,16 +12,61 @@ use pdfium_render::prelude::*;
 
 /// PDFium-backed rasterizer. Holds a loaded document. [ADR-005]
 ///
-/// Thread-safe: `Pdfium` is `Send + Sync`; rendering borrows the document
-/// immutably. Multiple tiles can be rasterized concurrently.
+/// Shareable across threads, but **not** concurrent: PDFium itself is not
+/// thread-safe, so every entry point serializes on `PDFIUM_CALL`. This comment
+/// used to claim "multiple tiles can be rasterized concurrently", which is what
+/// the Send/Sync impls assert and what the library does not provide.
 pub struct PdfiumEngine {
-    document: PdfDocument<'static>,
+    /// `Option` only so `Drop` can destroy it *inside* the lock. Dropping a
+    /// `PdfDocument` calls into PDFium like any other operation, so a document
+    /// going out of scope on one thread while another is mid-extraction is the
+    /// same data race as two concurrent extractions — and it is the one the
+    /// guarded entry points cannot cover, because field destruction runs after
+    /// any guard a method held. Always `Some` between construction and drop.
+    document: Option<PdfDocument<'static>>,
     page_count: u32,
 }
 
-// SAFETY: Pdfium's internal state is protected by its own synchronization.
-// The document is accessed only through immutable borrows during rasterization.
+impl Drop for PdfiumEngine {
+    fn drop(&mut self) {
+        let _guard = PDFIUM_CALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(self.document.take());
+    }
+}
+
+impl PdfiumEngine {
+    /// The loaded document. Callers must already hold `PDFIUM_CALL`.
+    fn document(&self) -> &PdfDocument<'static> {
+        self.document
+            .as_ref()
+            .expect("document is taken only in Drop, after which no method runs")
+    }
+}
+
+/// Serializes every call into PDFium.
+///
+/// PDFium is not thread-safe: one library instance, and documents and text
+/// pages derived from it, must not be touched concurrently. The Send/Sync
+/// impls below say `PdfiumEngine` may cross and be shared between threads,
+/// which is true only because every entry point takes this lock first.
+///
+/// Two `extraction_accuracy` tests running in parallel threads of one test
+/// binary proved the cost of not having it: on Windows the extracted text came
+/// back with characters missing ("Hello extraction" as "Helo xtracion"), and
+/// on Linux the process died with `free(): invalid pointer`. Silent corruption
+/// of a document's text is exactly the failure PRIN-1 puts first.
+///
+/// ponytail: one global lock, not per-document. The worker is single-writer
+/// per document (SDS §7.4) so contention is a coordinator-side concern only;
+/// move to a per-document lock if parallel utility jobs ever need it.
+/// [ADR-005, ADR-027, CR-4, PRIN-1, GR-8]
+static PDFIUM_CALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// SAFETY: every path that touches the document or the library goes through
+// `with_pdfium`, so no two threads are inside PDFium at once. Without that
+// lock these impls would be unsound, not merely optimistic. [ADR-027]
 unsafe impl Send for PdfiumEngine {}
+// SAFETY: as above — shared access is serialized by `PDFIUM_CALL`.
 unsafe impl Sync for PdfiumEngine {}
 
 /// Global PDFium instance, bound once per process. [ADR-005]
@@ -187,6 +232,7 @@ fn pdfium() -> Result<&'static Pdfium, String> {
 impl PdfiumEngine {
     /// Load a PDF file from disk with an optional password.
     pub fn from_file(path: &std::path::Path, password: Option<&str>) -> Result<Self, String> {
+        let _guard = PDFIUM_CALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let document = pdfium()?
             .load_pdf_from_file(path, password)
             .map_err(|e| format!("pdfium load failed: {e}"))?;
@@ -199,7 +245,7 @@ impl PdfiumEngine {
             std::mem::transmute::<PdfDocument<'_>, PdfDocument<'static>>(document)
         };
 
-        Ok(Self { document, page_count })
+        Ok(Self { document: Some(document), page_count })
     }
 
     /// Load a PDF from an already-opened file handle with an optional password.
@@ -234,6 +280,7 @@ impl PdfiumEngine {
 
     /// Load a PDF from raw bytes with an optional password.
     pub fn from_bytes_with_password(data: Vec<u8>, password: Option<&str>) -> Result<Self, String> {
+        let _guard = PDFIUM_CALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let document = pdfium()?
             .load_pdf_from_byte_vec(data, password)
             .map_err(|e| format!("pdfium load failed: {e}"))?;
@@ -245,7 +292,7 @@ impl PdfiumEngine {
             std::mem::transmute::<PdfDocument<'_>, PdfDocument<'static>>(document)
         };
 
-        Ok(Self { document, page_count })
+        Ok(Self { document: Some(document), page_count })
     }
 
     /// Load a PDF from raw bytes (no password).
@@ -256,6 +303,7 @@ impl PdfiumEngine {
 
 impl Rasterize for PdfiumEngine {
     fn rasterize(&self, req: &RasterizeRequest) -> Result<TileOutput, RasterizeError> {
+        let _guard = PDFIUM_CALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if req.page_index >= self.page_count {
             return Err(RasterizeError::PageOutOfRange {
                 requested: req.page_index,
@@ -263,7 +311,7 @@ impl Rasterize for PdfiumEngine {
             });
         }
 
-        let pages = self.document.pages();
+        let pages = self.document().pages();
         let page = pages.iter().nth(req.page_index as usize)
             .ok_or_else(|| RasterizeError::Engine("failed to get page".into()))?;
 
@@ -324,7 +372,8 @@ impl Rasterize for PdfiumEngine {
 
 impl engine_api::structure::Structure for PdfiumEngine {
     fn outline(&self) -> Result<engine_api::structure::Outline, engine_api::structure::StructureError> {
-        let bookmarks = self.document.bookmarks();
+        let _guard = PDFIUM_CALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bookmarks = self.document().bookmarks();
         let mut entries = Vec::new();
 
         if let Some(root) = bookmarks.root() {
@@ -335,6 +384,7 @@ impl engine_api::structure::Structure for PdfiumEngine {
     }
 
     fn layers(&self) -> Result<engine_api::structure::Layers, engine_api::structure::StructureError> {
+        let _guard = PDFIUM_CALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // PDFium's optional content group API is complex and requires per-page queries.
         // For M1, we return a basic layer list from the document's OCG entries.
         // A proper implementation would query FPDFOCGContext_GetOCGCount/GetOCG.
@@ -342,7 +392,8 @@ impl engine_api::structure::Structure for PdfiumEngine {
     }
 
     fn attachments(&self) -> Result<engine_api::structure::Attachments, engine_api::structure::StructureError> {
-        let attachments_api = self.document.attachments();
+        let _guard = PDFIUM_CALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let attachments_api = self.document().attachments();
         let count = attachments_api.len() as usize;
         let mut files = Vec::with_capacity(count);
 
@@ -366,7 +417,8 @@ impl engine_api::structure::Structure for PdfiumEngine {
     }
 
     fn page_meta(&self) -> Result<Vec<engine_api::structure::PageMeta>, engine_api::structure::StructureError> {
-        let pages = self.document.pages();
+        let _guard = PDFIUM_CALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pages = self.document().pages();
         let mut metas = Vec::with_capacity(self.page_count as usize);
         for (i, page) in pages.iter().enumerate() {
             let width = page.width().value;
@@ -449,6 +501,7 @@ fn collect_bookmarks_recursive(bookmark: &pdfium_render::prelude::PdfBookmark<'_
 
 impl Extract for PdfiumEngine {
     fn extract_page(&self, page_index: u32) -> Result<PageTextModel, ExtractError> {
+        let _guard = PDFIUM_CALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if page_index >= self.page_count {
             return Err(ExtractError::PageOutOfRange {
                 requested: page_index,
@@ -456,7 +509,7 @@ impl Extract for PdfiumEngine {
             });
         }
 
-        let pages = self.document.pages();
+        let pages = self.document().pages();
         let page = pages.iter().nth(page_index as usize)
             .ok_or_else(|| ExtractError::Engine("failed to get page".into()))?;
 
@@ -488,6 +541,14 @@ impl Extract for PdfiumEngine {
         let mut char_data: Vec<(char, f32, f32, f32, f32)> = Vec::new(); // (char, x, y, w, h)
         for ch in &chars {
             let unicode = ch.unicode_char().unwrap_or('\u{FFFD}');
+            // PDFium synthesizes CR/LF between drawn runs; they are separators,
+            // not glyphs, and carry no bounds. Keeping them produced a phantom
+            // `TextLine` whose text was a bare line break at zero width and
+            // height, which any consumer walking lines reads as real content.
+            // [ADR-019, FR-SRCH-2]
+            if unicode == '\r' || unicode == '\n' {
+                continue;
+            }
             let rect = ch.loose_bounds().unwrap_or_else(|_| {
                 // Fallback: use a zero-size rect at origin.
                 PdfRect::new(PdfPoints::zero(), PdfPoints::zero(), PdfPoints::zero(), PdfPoints::zero())
@@ -495,7 +556,13 @@ impl Extract for PdfiumEngine {
             let x = rect.left().value;
             let y = rect.top().value;
             let w = rect.right().value - rect.left().value;
-            let h = rect.bottom().value - rect.top().value;
+            // PDF user space is bottom-up, so `top` is the larger value and
+            // `bottom - top` is negative. Every extracted line and span carried
+            // a negative height — the geometry search hit-testing, selection
+            // rectangles and OCR block placement all read. Take the magnitude;
+            // `y` remains the top edge, which is what the consumers expect.
+            // [FR-SRCH-2, SDS §3.3, ADR-019]
+            let h = (rect.top().value - rect.bottom().value).abs();
             char_data.push((unicode, x, y, w, h));
         }
 

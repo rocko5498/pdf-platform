@@ -14,7 +14,8 @@ cargo run -q -p corpus-diff
 cargo test -p pdf-model --test interop_matrix
 cargo test -p pdf-model forms_js
 cargo test -p sandbox confinement
-cargo test -p text-extract --test extraction_correctness   # see note below
+cargo test -p text-extract --test extraction_correctness   # normalization only; see note
+cargo test -p engine-pdfium --test extraction_accuracy     # real PDF through PDFium
 cd ..
 python tools/a11y_audit.py
 python tools/bench/check_p95_gates.py
@@ -34,9 +35,15 @@ The suite's own header says as much ("Full multi-engine corpus remains a
 separate gate with PDFium fixtures"); this note carries that qualifier into the
 checklist a release decision is actually made from. [MET-FEAT-4, T-2, PRIN-6, GR-8]
 
-The CI step is likewise named "Extraction correctness suite (M2)". Renaming it
-is deliberately left out of this change to avoid a third concurrent editor of
-`.github/workflows/ci.yml`.
+The CI step is now named "Text normalization suite (M2, no PDF parsed)", which
+is what it does.
+
+`extraction_accuracy` (added 2026-08-22) is the first gate that measures the
+thing MET-FEAT-4 names: `tools/corpus-diff/fixtures/text-latin.pdf` is a
+hand-written content stream, so its text is known exactly, and the test opens it
+through PDFium and compares. It covers **one page of base-14 Latin text** — not
+ligatures, soft hyphens, CJK, RTL or ToUnicode pathologies, which need
+embedded-font fixtures. MET-FEAT-4 is advanced by this, not discharged.
 
 ### The engine must be provisioned first
 

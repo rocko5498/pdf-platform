@@ -178,8 +178,16 @@ jobs:
       - name: Interop matrix (unit)
         run: cargo test -p pdf-model --test interop_matrix
 
-      - name: Extraction correctness suite (M2)
+      # Two different claims, named for what each actually proves.
+      # `extraction_correctness` drives a StaticEngine over hand-written text
+      # models: normalization and search, no PDF parsed. `extraction_accuracy`
+      # opens a real fixture through PDFium and compares the extracted string
+      # to the content stream that drew it. [MET-FEAT-4, T-2, GR-8]
+      - name: Text normalization suite (M2, no PDF parsed)
         run: cargo test -p text-extract --test extraction_correctness
+
+      - name: Extraction accuracy against a real PDF (M2)
+        run: cargo test -p engine-pdfium --test extraction_accuracy
 
       - name: Forms JS subset + confinement + assembly ops
         run: |
