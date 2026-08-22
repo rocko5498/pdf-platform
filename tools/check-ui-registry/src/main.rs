@@ -207,6 +207,11 @@ fn check_no_cxx_bindings(name: &str, source: &str) -> Vec<String> {
     let mut findings = Vec::new();
     for (index, line) in source.lines().enumerate() {
         if let Some(key) = identifier_after(line, "Qt::Key_") {
+            // `unknown` is Qt's "this named no key" sentinel: a parser rejecting
+            // it is enforcing the contract, not writing a binding.
+            if key == "unknown" {
+                continue;
+            }
             findings.push(format!(
                 "{name}:{}: Qt::Key_{key} in production source — bindings belong in                  ui-registry.toml, ask chrome::shortcuts().matches(action, event) [ADR-032]",
                 index + 1

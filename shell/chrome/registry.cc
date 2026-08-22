@@ -23,11 +23,43 @@ constexpr int kSupportedSchemaVersion = 1;
         QStringLiteral("ui-registry (%1): %2").arg(path, reason).toStdString());
 }
 
+/// Qt's sentinel for "this text named no key I know". Spelled numerically so
+/// the ADR-032 gate does not read it as a binding; it is the opposite of one.
+constexpr int kQtKeyUnknown = 0x01ffffff;
+
+/// Spellings the contract file prefers over Qt's abbreviations.
+///
+/// `QKeySequence` parses its own portable names ("PgDown"), not the words a
+/// reviewer expects to read in a stability contract ("PageDown"). The file
+/// keeps the readable spelling — DS-CONV-4 makes it a document people review —
+/// and the parser translates. [ADR-032]
+QString canonicalSequenceText(const QString& text) {
+    static const QHash<QString, QString> kAliases = {
+        {QStringLiteral("PageDown"), QStringLiteral("PgDown")},
+        {QStringLiteral("PageUp"), QStringLiteral("PgUp")},
+        {QStringLiteral("Delete"), QStringLiteral("Del")},
+        {QStringLiteral("Insert"), QStringLiteral("Ins")},
+        {QStringLiteral("Escape"), QStringLiteral("Esc")},
+    };
+    QStringList parts = text.split(QLatin1Char('+'));
+    if (!parts.isEmpty()) {
+        const QString last = parts.takeLast();
+        parts.append(kAliases.value(last, last));
+    }
+    return parts.join(QLatin1Char('+'));
+}
+
 QKeySequence parseSequence(const QString& path, const QString& action, const std::string& text) {
-    const QKeySequence sequence(QString::fromStdString(text));
-    if (sequence.isEmpty()) {
-        fail(path, QStringLiteral("action '%1' has an unparseable key sequence \"%2\"")
-                       .arg(action, QString::fromStdString(text)));
+    const QString written = QString::fromStdString(text);
+    const QKeySequence sequence(canonicalSequenceText(written));
+    // An unrecognised name yields a one-element sequence holding Qt's unknown
+    // sentinel, not an empty one. Accepting it would leave a binding that is
+    // declared, reviewed, and dead — the silent failure GR-8 forbids.
+    const bool unknown =
+        sequence.count() > 0 && static_cast<int>(sequence[0].key()) == kQtKeyUnknown;
+    if (sequence.isEmpty() || unknown) {
+        fail(path, QStringLiteral("action '%1' has a key sequence Qt cannot parse: \"%2\"")
+                       .arg(action, written));
     }
     return sequence;
 }

@@ -47,6 +47,7 @@ private slots:
     void a_newer_schema_is_rejected();
     void a_missing_file_is_fatal();
     void an_unparseable_sequence_is_rejected();
+    void an_unknown_key_name_is_rejected();
     void the_shipped_registry_declares_every_action_the_shell_dispatches();
 };
 
@@ -143,6 +144,28 @@ broken = { key = "", action = "nav.next_page" }
         threw = true;
     }
     QVERIFY2(threw, "an empty key sequence is a broken contract, not a no-op binding");
+}
+
+void RegistryBindingTest::an_unknown_key_name_is_rejected() {
+    // "PageDwn" is not a Qt key name. Qt answers with its unknown sentinel
+    // rather than an empty sequence, so a parser that only checks isEmpty()
+    // accepts it and ships a binding that can never fire. [GR-8, PRIN-6]
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeRegistry(dir, QStringLiteral(R"(
+schema_version = 1
+profile_version = "9.9.9"
+[shortcuts]
+typo = { key = "PageDwn", action = "nav.next_page" }
+)"));
+    bool threw = false;
+    try {
+        ShortcutRegistry::load(path);
+    } catch (const std::runtime_error& error) {
+        threw = true;
+        QVERIFY(QString::fromUtf8(error.what()).contains(QStringLiteral("PageDwn")));
+    }
+    QVERIFY2(threw, "a key name Qt cannot parse must be rejected, not silently dead");
 }
 
 void RegistryBindingTest::the_shipped_registry_declares_every_action_the_shell_dispatches() {
