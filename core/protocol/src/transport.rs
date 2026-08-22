@@ -109,9 +109,17 @@ pub fn decode_length(prefix: [u8; 4]) -> Result<usize, TransportError> {
 /// Write one framed message to `w`.
 pub fn write_frame<W: Write>(w: &mut W, body: &[u8]) -> Result<(), TransportError> {
     let framed = encode_frame(body)?;
+    // `write_all` already retries on Interrupted; `flush` does not on every
+    // implementation, so it is retried here for the same reason as the read
+    // side. [SDS §4.6, GR-8]
     w.write_all(&framed)?;
-    w.flush()?;
-    Ok(())
+    loop {
+        match w.flush() {
+            Ok(()) => return Ok(()),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Incremental decoder for length-prefixed frames (handles partial reads).
@@ -172,6 +180,13 @@ pub fn read_frame_into<R: Read>(
                 return Err(TransportError::Disconnected);
             }
             Ok(n) => decoder.push(&chunk[..n]),
+            // EINTR is not a failure: a signal arrived while the read was
+            // blocked and the kernel unwound it. Reporting it as a transport
+            // error made unrelated work fail whenever a child process exited
+            // and SIGCHLD landed on a thread waiting here — which is every OCR
+            // job, since Tesseract is a subprocess. Retry, as the contract for
+            // `Interrupted` requires. [SDS §4.6, GR-8]
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
     }

@@ -487,9 +487,19 @@ mod unix {
         })?;
 
         listener.set_nonblocking(false)?;
-        let (stream, _) = listener
-            .accept()
-            .map_err(|e| io::Error::new(e.kind(), format!("accept worker IPC: {e}")))?;
+        // A signal — SIGCHLD from any exiting child, and every OCR job spawns
+        // Tesseract — unwinds a blocked accept with EINTR. That is not a failed
+        // handshake, so retry rather than reporting the open as broken.
+        // [SDS §4.6, GR-8]
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(io::Error::new(e.kind(), format!("accept worker IPC: {e}")))
+                }
+            }
+        };
         drop(unlink);
 
         let transport = Box::new(UnixWorkerTransport::from_stream(stream));
