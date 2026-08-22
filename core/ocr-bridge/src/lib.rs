@@ -107,6 +107,7 @@ pub trait OcrEngine: Send + Sync {
         raster: &[u8],
         width: u32,
         height: u32,
+        source_dpi: u32,
         page_index: u32,
         options: &PreprocessOptions,
     ) -> OcrPageResult;
@@ -200,7 +201,16 @@ pub fn execute_utility_ocr(
     if !engine.is_available() {
         return Err(OcrUtilityExecutionError::EngineUnavailable);
     }
-    let result = engine.recognize(raster, width, height, request.page_index, &request.options);
+    // The worker renders the page itself at `target_dpi`, so that is the
+    // raster's real resolution — not 72. [FR-OCR-1, FR-OCR-3]
+    let result = engine.recognize(
+        raster,
+        width,
+        height,
+        request.options.target_dpi,
+        request.page_index,
+        &request.options,
+    );
     if result.page_index != request.page_index {
         return Err(OcrUtilityExecutionError::PageIdentityMismatch);
     }
@@ -582,14 +592,28 @@ pub fn preprocess_page(
     raster: &[u8],
     width: u32,
     height: u32,
+    source_dpi: u32,
     options: &PreprocessOptions,
 ) -> (Vec<u8>, u32, u32, PreprocessResult) {
     let mut result = PreprocessResult::default();
 
-    // DPI normalization: resize if needed.
-    let (resized, new_w, new_h) = if options.target_dpi != 72 {
-        // Assume input is at 72 DPI; resize to target.
-        let scale = options.target_dpi as f32 / 72.0;
+    // DPI normalization: resize only when the raster is not already at the
+    // target.
+    //
+    // This assumed every input was 72 DPI. The worker renders the page itself
+    // at `target_dpi` (worker-main: `dpi_scale = target_dpi / 72`), so a
+    // 300-DPI raster was scaled by 300/72 a *second* time: a 2550x3300 letter
+    // page became 10625x13749 — 17x the pixels and a 584 MB RGBA buffer,
+    // allocated after the 128 MB MAX_UTILITY_RASTER_BYTES admission check had
+    // already passed (GR-7). It also fed Tesseract a blurred upscale, which is
+    // slower *and* worse. A source DPI of 0 means "unknown"; the old 72
+    // assumption is kept for that case so callers who genuinely do not know
+    // are no worse off. [FR-OCR-3, GR-7, PRIN-1]
+    let effective_source_dpi = if source_dpi == 0 { 72 } else { source_dpi };
+    let (resized, new_w, new_h) = if options.target_dpi != effective_source_dpi
+        && options.target_dpi != 0
+    {
+        let scale = options.target_dpi as f32 / effective_source_dpi as f32;
         let new_w = (width as f32 * scale) as u32;
         let new_h = (height as f32 * scale) as u32;
         let resized = resize_bilinear(raster, width, height, new_w, new_h);
@@ -597,6 +621,7 @@ pub fn preprocess_page(
         result.output_dpi = options.target_dpi;
         (resized, new_w, new_h)
     } else {
+        result.output_dpi = effective_source_dpi;
         (raster.to_vec(), width, height)
     };
 
@@ -728,6 +753,7 @@ impl OcrEngine for TesseractEngine {
         raster: &[u8],
         width: u32,
         height: u32,
+        source_dpi: u32,
         page_index: u32,
         options: &PreprocessOptions,
     ) -> OcrPageResult {
@@ -748,7 +774,7 @@ impl OcrEngine for TesseractEngine {
 
         // Preprocess the raster.
         let (processed, proc_w, proc_h, _preprocess_result) =
-            preprocess_page(raster, width, height, options);
+            preprocess_page(raster, width, height, source_dpi, options);
 
         // Write RGBA raster to a temporary PNG file for Tesseract input.
         let tmp_dir = std::env::temp_dir().join(format!("ocr_page_{page_index}"));
@@ -1116,6 +1142,7 @@ mod tests {
             _raster: &[u8],
             width: u32,
             height: u32,
+            _source_dpi: u32,
             page_index: u32,
             _options: &PreprocessOptions,
         ) -> OcrPageResult {
@@ -1362,6 +1389,7 @@ mod tests {
             &raster,
             4,
             4,
+            72, // a 72-DPI source really does need upscaling to 300
             &PreprocessOptions {
                 target_dpi: 300,
                 ..Default::default()
@@ -1389,6 +1417,7 @@ mod tests {
             &raster,
             8,
             8,
+            72,
             &PreprocessOptions {
                 despeckle: true,
                 target_dpi: 72, // no resize
@@ -1412,7 +1441,7 @@ mod tests {
         for (width, height) in [(0, 0), (0, 4), (4, 0), (1, 1)] {
             let raster = vec![255u8; (width * height * 4) as usize];
             let (output, out_w, out_h, _) =
-                preprocess_page(&raster, width, height, &PreprocessOptions::default());
+                preprocess_page(&raster, width, height, 300, &PreprocessOptions::default());
             assert_eq!(
                 output.len(),
                 (out_w * out_h * 4) as usize,
@@ -1421,6 +1450,48 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn a_raster_already_at_target_dpi_is_not_scaled_again() {
+        // The worker renders at target_dpi, so preprocessing must not treat
+        // that raster as 72-DPI input. It used to: a 2550x3300 letter page at
+        // 300 DPI became 10625x13749 — 146 megapixels, a 584 MB RGBA buffer —
+        // past MAX_UTILITY_RASTER_BYTES (128 MB), which had already admitted
+        // the job on the *input* size. [FR-OCR-3, GR-7, PRIN-1]
+        let width = 64;
+        let height = 96;
+        let raster = vec![200u8; (width * height * 4) as usize];
+        let (output, out_w, out_h, result) = preprocess_page(
+            &raster,
+            width,
+            height,
+            300,
+            &PreprocessOptions {
+                target_dpi: 300,
+                deskew: false,
+                despeckle: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!((out_w, out_h), (width, height), "a matched DPI must not resize");
+        assert!(!result.resized);
+        assert_eq!(result.output_dpi, 300);
+        assert_eq!(output.len(), (width * height * 4) as usize);
+    }
+
+    #[test]
+    fn an_unknown_source_dpi_keeps_the_old_seventy_two_assumption() {
+        let raster = vec![200u8; 4 * 4 * 4];
+        let (_, w, h, result) = preprocess_page(
+            &raster,
+            4,
+            4,
+            0, // unknown
+            &PreprocessOptions { target_dpi: 300, ..Default::default() },
+        );
+        assert!(w > 4 && h > 4, "unknown source still scales from 72");
+        assert!(result.resized);
+    }
 
     #[test]
     fn escape_ocr_str_handles_specials() {
@@ -1434,7 +1505,7 @@ mod tests {
         let engine = TesseractEngine::new();
         // On this system, Tesseract may or may not be installed.
         // The engine should gracefully handle both cases.
-        let result = engine.recognize(&[], 0, 0, 0, &PreprocessOptions::default());
+        let result = engine.recognize(&[], 0, 0, 300, 0, &PreprocessOptions::default());
         // If Tesseract is not installed, we get an error message.
         // If it is installed, we get a result (possibly with no text).
         if engine.is_available() {

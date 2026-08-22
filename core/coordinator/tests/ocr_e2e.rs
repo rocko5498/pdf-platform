@@ -19,6 +19,18 @@ use jobs::{JobEvent, JobGraph, JobPriority, JobScheduler, JobSpec};
 use coordinator::ocr::{run_ocr_for_page, OcrOutcome, OcrPageContext, DEFAULT_CONFIDENCE_THRESHOLD};
 use ocr_bridge::PreprocessOptions;
 
+/// True when this run must prove OCR really works rather than tolerate its
+/// absence.
+///
+/// These tests are environment-tolerant by design: a contributor without
+/// Tesseract still gets a meaningful dispatch check. That tolerance also means
+/// they pass on a machine where OCR is completely broken, so CI — which
+/// installs Tesseract — sets `PDF_PLATFORM_REQUIRE_OCR=1` and the tolerance
+/// turns into a gate. [ADR-018, ADR-022, GR-8, PRIN-6]
+fn ocr_required() -> bool {
+    std::env::var_os("PDF_PLATFORM_REQUIRE_OCR").is_some()
+}
+
 fn worker_path() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let target_dir = manifest_dir.parent().unwrap().join("target");
@@ -168,6 +180,10 @@ fn ocr_dispatch_reaches_render_recognize_and_decode() {
             !lower.contains("unsupported utility operation"),
             "ocr job hit the unsupported-operation fallback: {message}"
         );
+        assert!(
+            !ocr_required(),
+            "PDF_PLATFORM_REQUIRE_OCR is set, so the engine is installed and the              job must reach a recognition outcome; it failed with: {message}"
+        );
         return;
     }
 
@@ -183,6 +199,10 @@ fn ocr_dispatch_reaches_render_recognize_and_decode() {
         }
         OcrOutcome::Failed(message) => {
             let lower = message.to_lowercase();
+            assert!(
+                !ocr_required() || !lower.contains("unavailable"),
+                "PDF_PLATFORM_REQUIRE_OCR is set but the engine reported itself                  unavailable — CI installs Tesseract, so this is a real defect: {message}"
+            );
             assert!(
                 lower.contains("tesseract")
                     || lower.contains("unavailable")

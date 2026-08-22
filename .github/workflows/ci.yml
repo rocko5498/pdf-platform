@@ -138,10 +138,38 @@ jobs:
           python tools/provision_engine.py
           python tools/provision_engine.py --check
 
+      # OCR is a real capability with real tests; without Tesseract they pass by
+      # tolerating its absence, which is no coverage at all. Installed here and
+      # PDF_PLATFORM_REQUIRE_OCR turns that tolerance into a gate.
+      # [ADR-018, ADR-022, GR-8]
+      - name: Install Tesseract (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y tesseract-ocr
+          tesseract --version
+
+      - name: Install Tesseract (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install tesseract
+          tesseract --version
+
+      - name: Install Tesseract (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install tesseract --no-progress -y
+          $bin = "C:\Program Files\Tesseract-OCR"
+          if (-not (Test-Path (Join-Path $bin 'tesseract.exe'))) { throw "tesseract.exe not found in $bin" }
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & (Join-Path $bin 'tesseract.exe') --version
+
       - name: Build workspace
         run: cargo build --workspace
 
       - name: Test workspace
+        env:
+          PDF_PLATFORM_REQUIRE_OCR: "1"
         run: cargo test --workspace
 
       - name: Run corpus-diff gate
