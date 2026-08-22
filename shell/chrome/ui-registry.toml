@@ -1,7 +1,7 @@
 # Shortcut and menu registry. [ADR-032, ADR-030, PRIN-4]
 # CI will reject any PR that bumps schema_version without a corresponding migration.
 schema_version = 1
-profile_version = "0.1.0"
+profile_version = "0.2.0"
 
 # ---------------------------------------------------------------------------
 # Shortcuts — M1 chrome set. [UX-KEY-1, DS-PHIL-5]
@@ -12,14 +12,29 @@ open_document   = { key = "Ctrl+O", action = "document.open" }
 close_document  = { key = "Ctrl+W", action = "document.close" }
 quit_app        = { key = "Ctrl+Q", action = "app.quit" }
 find            = { key = "Ctrl+F", action = "document.find" }
-zoom_in         = { key = "Ctrl+=", action = "view.zoom_in" }
+zoom_in         = { key = "Ctrl+=", action = "view.zoom_in", alternates = ["Ctrl++"] }
 zoom_out        = { key = "Ctrl+-", action = "view.zoom_out" }
 zoom_fit        = { key = "Ctrl+0", action = "view.zoom_fit" }
-next_page       = { key = "PageDown", action = "nav.next_page" }
-prev_page       = { key = "PageUp", action = "nav.prev_page" }
+next_page       = { key = "PageDown", action = "nav.next_page", alternates = ["Down", "Space"] }
+prev_page       = { key = "PageUp", action = "nav.prev_page", alternates = ["Up"] }
 first_page      = { key = "Home", action = "nav.first_page" }
 last_page       = { key = "End", action = "nav.last_page" }
 focus_canvas    = { key = "F6", action = "focus.canvas" }
+
+# Added at 0.2.0: these were bound in shell/canvas/canvas.cc and declared
+# nowhere, which is what ADR-032 forbids and tools/check-ui-registry reported.
+# Moving them here changes no key a user presses; it changes where the binding
+# is written down. [ADR-032, ADR-030, PRIN-4, RQA-1]
+save_document   = { key = "Ctrl+S", action = "document.save" }
+find_next       = { key = "F3", action = "document.find_next" }
+forms_calculate = { key = "Ctrl+G", action = "forms.calculate" }
+find_previous   = { key = "Shift+F3", action = "document.find_previous" }
+copy_selection  = { key = "Ctrl+C", action = "edit.copy" }
+undo            = { key = "Ctrl+Z", action = "edit.undo" }
+redo            = { key = "Ctrl+Y", action = "edit.redo" }
+export_xfdf     = { key = "Ctrl+E", action = "annot.export" }
+activate        = { key = "Return", action = "ui.activate", alternates = ["Enter"] }
+delete_selected = { key = "Delete", action = "annot.delete" }
 
 # ---------------------------------------------------------------------------
 # Menus — M1 taxonomy (Acrobat-familiar). [DS-MENU-*, PRIN-4]

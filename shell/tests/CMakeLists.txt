@@ -11,7 +11,7 @@ target_link_libraries(shell-canvas-input-test PRIVATE
 
 add_test(NAME shell.canvas_input COMMAND shell-canvas-input-test)
 set_tests_properties(shell.canvas_input PROPERTIES
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;PDF_PLATFORM_UI_REGISTRY=${CMAKE_SOURCE_DIR}/chrome/ui-registry.toml"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
 )
 
@@ -53,3 +53,22 @@ if(DEFINED WORKER_BIN AND EXISTS "${WORKER_BIN}")
 else()
     message(STATUS "shell.canvas_tile skipped: WORKER_BIN not set or missing")
 endif()
+
+# ADR-032: bindings live in ui-registry.toml, not in C++. The rebinding test is
+# the one that can tell the difference. [ADR-032, T-8]
+add_executable(shell-registry-binding-test
+    registry_binding_test.cc
+)
+target_link_libraries(shell-registry-binding-test PRIVATE
+    shell-chrome
+    Qt6::Test
+    Qt6::Widgets
+)
+target_compile_definitions(shell-registry-binding-test PRIVATE
+    PDF_PLATFORM_UI_REGISTRY_SOURCE="${CMAKE_SOURCE_DIR}/chrome/ui-registry.toml"
+)
+add_test(NAME shell.registry_binding COMMAND shell-registry-binding-test)
+set_tests_properties(shell.registry_binding PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
+)

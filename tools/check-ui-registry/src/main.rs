@@ -93,6 +93,29 @@ fn check_registry(source: &str) -> Vec<String> {
                 ));
             }
             keys_for_action.entry(action).or_default().insert(key);
+
+            // `alternates` are declared bindings too: PageDown carries Down and
+            // Space, zoom-in carries the shifted and keypad spellings of plus.
+            // They are as much a part of the contract as the primary key, so a
+            // C++ site that binds one is compliant, and a duplicate across two
+            // actions is still a conflict. [ADR-032]
+            let alternates = entry
+                .get("alternates")
+                .and_then(toml::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for alternate in alternates {
+                let Some(alternate) = alternate.as_str() else {
+                    findings.push(format!("shortcut {name:?} has a non-string alternate"));
+                    continue;
+                };
+                if let Some(previous) = owner_of_key.insert(alternate, name) {
+                    findings.push(format!(
+                        "duplicate key {alternate:?} bound by {previous:?} and {name:?}"
+                    ));
+                }
+                keys_for_action.entry(action).or_default().insert(alternate);
+            }
         }
     }
 
@@ -169,6 +192,41 @@ fn with_modifiers(key: &str, guard: &str) -> String {
     } else {
         shifted
     }
+}
+
+
+/// Reject any key binding written in production C++ source. [ADR-032]
+///
+/// `check_cxx_source` asks whether a literal is *declared*; this asks whether
+/// it exists at all. Both are needed: the first catches a registry that has
+/// drifted from the code, the second enforces the rule that makes drift
+/// impossible. `QKeySequence::ExactMatch` and its siblings are match results,
+/// not bindings, so they are allowed.
+fn check_no_cxx_bindings(name: &str, source: &str) -> Vec<String> {
+    const MATCH_RESULTS: &[&str] = &["ExactMatch", "PartialMatch", "NoMatch"];
+    let mut findings = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if let Some(key) = identifier_after(line, "Qt::Key_") {
+            // `unknown` is Qt's "this named no key" sentinel: a parser rejecting
+            // it is enforcing the contract, not writing a binding.
+            if key == "unknown" {
+                continue;
+            }
+            findings.push(format!(
+                "{name}:{}: Qt::Key_{key} in production source — bindings belong in                  ui-registry.toml, ask chrome::shortcuts().matches(action, event) [ADR-032]",
+                index + 1
+            ));
+        }
+        if let Some(sequence) = identifier_after(line, "QKeySequence::") {
+            if !MATCH_RESULTS.contains(&sequence) {
+                findings.push(format!(
+                    "{name}:{}: QKeySequence::{sequence} in production source — the registry                      decides bindings, not Qt's standard-key table [ADR-032]",
+                    index + 1
+                ));
+            }
+        }
+    }
+    findings
 }
 
 /// Report C++ key bindings that the registry does not declare.
@@ -287,11 +345,23 @@ fn main() -> ExitCode {
         .ok()
         .and_then(|doc| doc.get("shortcuts").and_then(toml::Value::as_table).cloned())
         .map(|table| {
-            table
-                .values()
-                .filter_map(|entry| entry.get("key").and_then(toml::Value::as_str))
-                .map(str::to_owned)
-                .collect()
+            // Primary keys and their declared alternates alike: a C++ site that
+            // binds `Down` is compliant when `nav.next_page` lists it. [ADR-032]
+            let mut keys: BTreeSet<String> = BTreeSet::new();
+            for entry in table.values() {
+                if let Some(key) = entry.get("key").and_then(toml::Value::as_str) {
+                    keys.insert(key.to_owned());
+                }
+                let alternates = entry
+                    .get("alternates")
+                    .and_then(toml::Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for alternate in alternates.iter().filter_map(toml::Value::as_str) {
+                    keys.insert(alternate.to_owned());
+                }
+            }
+            keys
         })
         .unwrap_or_default();
 
@@ -300,9 +370,19 @@ fn main() -> ExitCode {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            cxx_findings.extend(check_cxx_source(&name, &text, &declared));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // A test that presses a key simulates a user; it does not define the
+        // contract, and the rebinding test ADR-032 needs must be free to press
+        // a key no shipped profile declares. Production source is held to the
+        // ADR's actual words: no binding may appear in C++ at all, declared or
+        // not, because a declared literal still puts the binding in two places.
+        if name.ends_with("_test.cc") {
+            continue;
         }
+        cxx_findings.extend(check_cxx_source(&name, &text, &declared));
+        cxx_findings.extend(check_no_cxx_bindings(&name, &text));
     }
 
     for finding in &findings {
@@ -479,5 +559,37 @@ items = [
         );
         assert!(findings.iter().any(|f| f.contains("Space")), "{findings:?}");
         assert!(!findings.iter().any(|f| f.contains("Ctrl+")), "{findings:?}");
+    }
+
+    #[test]
+    fn production_source_may_not_bind_a_key_even_when_declared() {
+        // The declared-key check would pass this; the contract still forbids it.
+        let source = "if (event->key() == Qt::Key_PageDown) { next(); }";
+        let findings = check_no_cxx_bindings("canvas.cc", source);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("ui-registry.toml"), "{findings:?}");
+    }
+
+    #[test]
+    fn production_source_may_not_use_qt_standard_sequences() {
+        let source = "if (event->matches(QKeySequence::Copy)) { copy(); }";
+        assert_eq!(check_no_cxx_bindings("canvas.cc", source).len(), 1);
+    }
+
+    #[test]
+    fn match_results_are_not_bindings() {
+        let source = "if (pressed.matches(key) == QKeySequence::ExactMatch) { return true; }";
+        assert!(check_no_cxx_bindings("registry.cc", source).is_empty());
+    }
+
+    #[test]
+    fn registry_alternates_count_as_declared() {
+        let registry = "schema_version = 1
+profile_version = \"1.0.0\"
+                        [shortcuts]
+                        next_page = { key = \"PageDown\", action = \"nav.next\", alternates = [\"Down\"] }
+";
+        let findings = check_registry(registry);
+        assert!(findings.is_empty(), "{findings:?}");
     }
 }
