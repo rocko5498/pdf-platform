@@ -10,10 +10,15 @@
 //! the content stream was written by hand, opened through PDFium, with the
 //! extracted string compared to it exactly.
 //!
-//! Scope, stated rather than implied: one page, base-14 Helvetica, ASCII Latin.
-//! Ligatures, soft hyphens, CJK, RTL and ToUnicode pathologies are not covered
-//! here — those need embedded-font fixtures and are the corpus work MET-FEAT-4
-//! still wants. [ADR-019, ADR-022 T-2, MET-FEAT-4, PRIN-6, GR-8]
+//! The corpus covers the cases M2's exit criteria name — ligatures, soft
+//! hyphens, CJK, RTL — plus the ToUnicode pathology FR-SRCH-5's reliability
+//! flag exists for. Each fixture carries an explicit `/ToUnicode` CMap, so the
+//! text a conformant extractor must produce is fixed by the file rather than by
+//! whatever our engine happens to do today.
+//!
+//! Scope, stated rather than implied: single-page, single-byte codes, base-14
+//! font programs. No embedded font subsets, no CID-keyed fonts, no vertical
+//! writing. [ADR-019, ADR-022 T-2, MET-FEAT-4, FR-SRCH-5, PRIN-6, GR-8]
 
 use std::path::PathBuf;
 
@@ -128,4 +133,86 @@ fn concurrent_extraction_returns_the_same_text_every_time() {
             "concurrent extraction returned different text"
         );
     }
+}
+
+/// Extract one page and return its lines, dropping empties.
+fn lines_of(name: &str) -> (Vec<String>, bool) {
+    let path = fixture(name);
+    assert!(path.is_file(), "fixture missing: {}", path.display());
+    let engine = PdfiumEngine::from_file(&path, None)
+        .unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    let model = engine.extract_page(0).expect("extract page 0");
+    let lines = model
+        .lines
+        .iter()
+        .map(|line| line.text.trim_end().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect();
+    (lines, model.reliable)
+}
+
+#[test]
+fn a_ligature_extracts_as_searchable_letters() {
+    // The file maps its single drawn code to U+FB01. Whether the engine hands
+    // back the ligature or its decomposition, what must not happen is losing
+    // the characters: "fi ne" is searchable, U+FB01 alone is not without
+    // normalization, and a dropped glyph is silent data loss. [MET-FEAT-4]
+    let (lines, reliable) = lines_of("text-ligature.pdf");
+    assert_eq!(lines, vec!["fi ne"], "ligature lost or mangled");
+    assert!(reliable);
+}
+
+#[test]
+fn a_soft_hyphen_survives_extraction_for_the_normalizer_to_elide() {
+    // U+00AD must reach the text model rather than being dropped by the
+    // engine: `search::normalize` elides it so "cooperate" matches, and it can
+    // only do that if extraction preserved it. [FR-SRCH-1, ADR-019]
+    let (lines, _) = lines_of("text-soft-hyphen.pdf");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains('\u{00AD}'),
+        "soft hyphen was dropped before the normalizer could see it: {:?}",
+        lines[0]
+    );
+    assert_eq!(lines[0].replace('\u{00AD}', ""), "cooperate");
+}
+
+#[test]
+fn right_to_left_text_extracts_in_logical_order_on_one_line() {
+    // Alef, bet, gimel — laid out right-to-left in the file, so the first
+    // logical character sits at the right margin. Extraction must return
+    // logical order, because search and copy operate on logical text.
+    //
+    // This also pins the line grouping: PDFium synthesizes spaces between
+    // separately drawn runs and gives them no bounds, which used to split this
+    // single line into five. [FR-SRCH-2, MET-FEAT-4]
+    let (lines, reliable) = lines_of("text-rtl.pdf");
+    assert_eq!(lines.len(), 1, "one line of Hebrew came back as {lines:?}");
+    let letters: Vec<char> = lines[0].chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        letters,
+        vec!['\u{05D0}', '\u{05D1}', '\u{05D2}'],
+        "expected logical order alef, bet, gimel"
+    );
+    assert!(reliable);
+}
+
+#[test]
+fn cjk_text_extracts_unchanged() {
+    let (lines, reliable) = lines_of("text-cjk.pdf");
+    assert_eq!(lines, vec!["\u{6587}\u{5B57}"], "CJK text was altered");
+    assert!(reliable);
+}
+
+#[test]
+fn private_use_output_is_flagged_unreliable_on_a_real_document() {
+    // ADR-019 §4's honesty mechanism, verified against a document for the first
+    // time: a font whose ToUnicode maps into the Private Use Area is what a
+    // subset font extracting raw glyph ids looks like. The text is returned —
+    // it is not our place to hide it — but the page is marked unreliable so a
+    // caller never presents it as searchable truth. [FR-SRCH-5, ADR-019 §4]
+    let (lines, reliable) = lines_of("text-unreliable.pdf");
+    assert!(!reliable, "PUA-only text must not be reported as reliable: {lines:?}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].chars().all(|c| ('\u{E000}'..='\u{F8FF}').contains(&c)));
 }

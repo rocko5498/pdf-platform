@@ -38,12 +38,16 @@ checklist a release decision is actually made from. [MET-FEAT-4, T-2, PRIN-6, GR
 The CI step is now named "Text normalization suite (M2, no PDF parsed)", which
 is what it does.
 
-`extraction_accuracy` (added 2026-08-22) is the first gate that measures the
-thing MET-FEAT-4 names: `tools/corpus-diff/fixtures/text-latin.pdf` is a
-hand-written content stream, so its text is known exactly, and the test opens it
-through PDFium and compares. It covers **one page of base-14 Latin text** — not
-ligatures, soft hyphens, CJK, RTL or ToUnicode pathologies, which need
-embedded-font fixtures. MET-FEAT-4 is advanced by this, not discharged.
+`extraction_accuracy` measures the thing MET-FEAT-4 names. Its fixtures carry
+explicit `/ToUnicode` CMaps, so the expected text is fixed by the file rather
+than by engine behaviour, and it covers the cases M2's exit criteria list:
+Latin, ligature, soft hyphen, RTL, CJK, and a Private-Use mapping that must be
+flagged unreliable.
+
+It does **not** cover embedded font subsets, CID-keyed fonts or vertical
+writing, and it says nothing about rendering fidelity — that is `corpus-diff`.
+MET-FEAT-4 is substantially advanced, not discharged: the long tail is
+real-world documents, which this corpus is not.
 
 ### The engine must be provisioned first
 
