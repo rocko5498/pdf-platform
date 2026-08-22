@@ -141,14 +141,21 @@ def validate(binary: Path, files: list[Path]) -> int:
             failures += 1
             continue
 
-        compliant = validation.get("compliant")
-        flavour = validation.get("profileName", "unknown profile")
-        details = validation.get("details", {})
-        failed_rules = details.get("failedRules", 0)
-        print(
-            f"ok   {name}: parsed. conformance ({flavour}): "
-            f"{'compliant' if compliant else f'{failed_rules} rule(s) not met'}"
-        )
+        # veraPDF reports one entry per flavour it validated against, and
+        # emits a list when there is more than one. Normalise both shapes
+        # rather than assuming the one this machine happened to produce.
+        results = validation if isinstance(validation, list) else [validation]
+        summaries = []
+        for entry in results:
+            if not isinstance(entry, dict):
+                continue
+            flavour = entry.get("profileName", "unknown profile")
+            details = entry.get("details", {}) or {}
+            failed_rules = details.get("failedRules", 0)
+            state = "compliant" if entry.get("compliant") else f"{failed_rules} rule(s) not met"
+            summaries.append(f"{flavour}: {state}")
+        conformance = "; ".join(summaries) if summaries else "no conformance profile applied"
+        print(f"ok   {name}: parsed. conformance ({conformance})")
 
     if not jobs:
         print("error: veraPDF reported no jobs; nothing was checked")
