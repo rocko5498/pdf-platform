@@ -189,6 +189,13 @@ jobs:
       - name: Extraction accuracy against a real PDF (M2)
         run: cargo test -p engine-pdfium --test extraction_accuracy
 
+      # SDS §14 M1: "repair corpus opens without crashes". pdf-cos proves the
+      # parser survives in-process; this proves the real path does, where a
+      # panic in Z1 reaches the coordinator only as a dead transport.
+      # [SDS §10.6, SDS §14, PRIN-1, GR-8]
+      - name: Malformed documents never kill the worker (M1)
+        run: cargo test -p coordinator --test malformed_open_e2e
+
       - name: Forms JS subset + confinement + assembly ops
         run: |
           cargo test -p pdf-model forms_js
