@@ -715,6 +715,27 @@ impl DocumentCoordinator {
     }
 
     /// Page count from the structural summary.
+    /// Render one page to an RGBA8 raster, for appearance comparison. [FR-CMP-1]
+    ///
+    /// Goes through the worker like every other parse of document bytes: the
+    /// coordinator never rasterizes in its own process (GR-4, zone rules).
+    /// `scale` is relative to 72 DPI, so 1.0 is a 612x792 letter page; keep it
+    /// modest, because this raster crosses the IPC frame and the transport caps
+    /// it. [SDS §4.6]
+    pub fn render_page(
+        &mut self,
+        page_index: u32,
+        scale: f32,
+    ) -> Result<crate::visual_compare::RenderedPage, SessionError> {
+        let raster = self.session.render_page_for_ocr(page_index, scale)?;
+        Ok(crate::visual_compare::RenderedPage {
+            page_index,
+            width: raster.width,
+            height: raster.height,
+            pixels: raster.pixels,
+        })
+    }
+
     pub fn page_count(&self) -> u32 {
         self.summary.page_count
     }

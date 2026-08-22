@@ -12,4 +12,5 @@ pub mod ocr; // OCR job scheduling: render + recognize + text-layer Command [ADR
 pub mod plugin; // CoordinatorPluginHost: Z0 plugin control plane [SDS §2.2.7, ADR-014]
 pub mod render; // RenderScheduler: viewport → tile requests [SDS §2.2.2]
 pub mod session; // WorkerSession: spawn/poll/death/inspect/respawn [SDS §10.1, §3.1]
+pub mod visual_compare; // Appearance diff between two rendered pages [FR-CMP-1]
 pub mod settings; // Settings: UI prefs + enterprise policy overlay [SDS §2.2.11]
