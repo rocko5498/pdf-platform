@@ -1113,7 +1113,14 @@ fn extract_docmdp_level(dict: &str) -> Option<sign::DocMDPLevel> {
 /// Runs Tesseract OCR on each page, generates invisible text layers,
 /// and saves the result. Pages with existing text are skipped unless
 /// --with-text is specified. [FR-OCR-3]
-fn cmd_ocr(path: &Path, rest: &[String]) {
+/// Run OCR over a document, returning a summary or an error.
+///
+/// Split out of `cmd_ocr` so the batch executor can run the same code path:
+/// FR-BATCH requires identical behaviour whether an operation is invoked
+/// singly or as a pipeline step, and a second implementation for batch is how
+/// the two drift apart. Errors are returned rather than exiting so a pipeline
+/// can report which step failed and stop. [FR-BATCH, M6+]
+fn run_ocr(path: &Path, rest: &[String]) -> Result<String, String> {
     use coordinator::ocr::{run_ocr_for_page, OcrOutcome, OcrPageContext, DEFAULT_CONFIDENCE_THRESHOLD};
     use jobs::utility_pool::UtilityPool;
     use jobs::{JobEvent, JobGraph, JobPriority, JobScheduler, JobSpec};
@@ -1163,7 +1170,7 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
         eprintln!("  Windows: https://github.com/UB-Mannheim/tesseract/wiki");
         eprintln!("  macOS:   brew install tesseract");
         eprintln!("  Linux:   sudo apt install tesseract-ocr");
-        process::exit(2);
+        return Err("Tesseract is not installed".into());
     }
 
     println!("OCR engine: {} ({})", engine.name(), lang);
@@ -1183,8 +1190,7 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
     let mut coord = match DocumentCoordinator::open(&worker, path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: open failed: {e}");
-            process::exit(2);
+            return Err(format!("open failed: {e}"));
         }
     };
 
@@ -1245,22 +1251,24 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
         println!("  Pages processed: 0");
         println!("  Pages skipped:   {skip_count}");
         let _ = coord.close();
-        process::exit(if skip_count > 0 { 2 } else { 0 });
+        return if skip_count > 0 {
+            Err(format!("no pages to OCR; {skip_count} page(s) were out of range"))
+        } else {
+            Ok("no pages needed OCR".into())
+        };
     }
 
     let worker = find_worker();
     let pool = match UtilityPool::new(&worker, 1) {
         Ok(p) => Arc::new(p),
         Err(e) => {
-            eprintln!("error: utility pool spawn failed: {e:?}");
-            process::exit(2);
+            return Err(format!("utility pool spawn failed: {e:?}"));
         }
     };
     let document = match std::fs::File::open(path) {
         Ok(f) => Arc::new(f),
         Err(e) => {
-            eprintln!("error: reopen for OCR failed: {e}");
-            process::exit(2);
+            return Err(format!("reopen for OCR failed: {e}"));
         }
     };
 
@@ -1295,8 +1303,7 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
     }) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: job scheduler init failed: {e:?}");
-            process::exit(2);
+            return Err(format!("job scheduler init failed: {e:?}"));
         }
     };
 
@@ -1308,13 +1315,11 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
     let graph = match JobGraph::new(specs) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("error: OCR job graph construction failed: {e:?}");
-            process::exit(2);
+            return Err(format!("OCR job graph construction failed: {e:?}"));
         }
     };
     if let Err(e) = scheduler.submit(graph) {
-        eprintln!("error: OCR job submission failed: {e:?}");
-        process::exit(2);
+        return Err(format!("OCR job submission failed: {e:?}"));
     }
 
     let mut remaining = job_count;
@@ -1379,18 +1384,32 @@ fn cmd_ocr(path: &Path, rest: &[String]) {
     println!("  Errors:          {}", error_count);
 
     if ocr_count > 0 {
-        match coord.save_incremental(&out) {
-            Ok(_) => println!("Saved: {}", out.display()),
-            Err(e) => {
-                eprintln!("error: save failed: {e}");
-                let _ = coord.close();
-                process::exit(2);
-            }
+        if let Err(e) = coord.save_incremental(&out) {
+            let _ = coord.close();
+            return Err(format!("save failed: {e}"));
         }
+        println!("Saved: {}", out.display());
     }
 
     let _ = coord.close();
-    process::exit(if error_count > 0 { 1 } else { 0 });
+    if error_count > 0 {
+        return Err(format!("{error_count} page(s) failed OCR"));
+    }
+    Ok(format!("{ocr_count} page(s) OCR'd -> {}", out.display()))
+}
+
+/// `ocr` subcommand: run OCR and translate the outcome into an exit code.
+fn cmd_ocr(path: &Path, rest: &[String]) {
+    match run_ocr(path, rest) {
+        Ok(summary) => {
+            println!("{summary}");
+            process::exit(0);
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            process::exit(2);
+        }
+    }
 }
 
 /// Validate PDF/A conformance. [FR-STD-1, FR-STD-2, M10]
@@ -1741,6 +1760,8 @@ fn cmd_batch(pipeline_path: &Path) {
     let mut current_first: u32 = 1;
     let mut current_last: u32 = 1;
     let mut current_text: Option<String> = None;
+    let mut current_language: Option<String> = None;
+    let mut current_with_text = false;
     let mut current_profile: Option<String> = None;
     let mut current_start: u32 = 1;
     let mut current_width: usize = 6;
@@ -1763,6 +1784,7 @@ fn cmd_batch(pipeline_path: &Path) {
                     current_output.as_deref(), current_output_dir.as_deref(),
                     current_pages_per_file, current_first, current_last,
                     current_text.as_deref(), current_profile.as_deref(),
+                    current_language.as_deref(), current_with_text,
                     current_start, current_width,
                 );
             }
@@ -1772,6 +1794,8 @@ fn cmd_batch(pipeline_path: &Path) {
             current_output_dir = None;
             current_text = None;
             current_profile = None;
+            current_language = None;
+            current_with_text = false;
         } else if let Some(val) = line.strip_prefix("input=") {
             current_inputs.push(PathBuf::from(val));
         } else if let Some(val) = line.strip_prefix("output=") {
@@ -1786,6 +1810,10 @@ fn cmd_batch(pipeline_path: &Path) {
             current_last = val.parse().unwrap_or(1);
         } else if let Some(val) = line.strip_prefix("text=") {
             current_text = Some(val.to_string());
+        } else if let Some(val) = line.strip_prefix("lang=") {
+            current_language = Some(val.to_string());
+        } else if let Some(val) = line.strip_prefix("with_text=") {
+            current_with_text = val.trim() == "true" || val.trim() == "1";
         } else if let Some(val) = line.strip_prefix("profile=") {
             current_profile = Some(val.to_string());
         } else if let Some(val) = line.strip_prefix("start=") {
@@ -1801,6 +1829,7 @@ fn cmd_batch(pipeline_path: &Path) {
             current_output.as_deref(), current_output_dir.as_deref(),
             current_pages_per_file, current_first, current_last,
             current_text.as_deref(), current_profile.as_deref(),
+            current_language.as_deref(), current_with_text,
             current_start, current_width,
         );
     }
@@ -2075,6 +2104,8 @@ fn flush_batch_step(
     last: u32,
     text: Option<&str>,
     profile: Option<&str>,
+    language: Option<&str>,
+    include_pages_with_text: bool,
     start: u32,
     width: usize,
 ) {
@@ -2117,6 +2148,18 @@ fn flush_batch_step(
                         input: inp.clone(),
                         first,
                         last,
+                        output: out.to_path_buf(),
+                    });
+                }
+            }
+        }
+        "ocr" => {
+            if let Some(inp) = inputs.first() {
+                if let Some(out) = output {
+                    pipeline.add_step(pdf_model::batch::BatchStep::Ocr {
+                        input: inp.clone(),
+                        language: language.unwrap_or("eng").to_string(),
+                        include_pages_with_text,
                         output: out.to_path_buf(),
                     });
                 }
@@ -2442,6 +2485,20 @@ fn execute_cli_pipeline(
             // Stamps go through the coordinator injection path above; every
             // other step keeps the verified candidate/publish safety net
             // `optimize` gets standalone. [FR-BATCH, ADR-013]
+            // One implementation for single and batch invocation (FR-BATCH):
+            // this is the same `run_ocr` the `ocr` subcommand calls.
+            BatchStep::Ocr { input, language, include_pages_with_text, output } => {
+                let mut args = vec![
+                    "--lang".to_string(),
+                    language.clone(),
+                    "-o".to_string(),
+                    output.display().to_string(),
+                ];
+                if *include_pages_with_text {
+                    args.push("--with-text".to_string());
+                }
+                run_ocr(input, &args).map(|_| vec![output.clone()])
+            }
             _ => pdf_model::batch::execute_step(step, &|input, output, profile| {
                 coordinator::broker::optimize_with_verification(output, |candidate_path| {
                     pdf_model::assembly_ops::optimize_pdf(input, candidate_path, profile)

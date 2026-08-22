@@ -63,6 +63,23 @@ pub enum BatchStep {
         /// Output path.
         output: PathBuf,
     },
+    /// Recognize text on pages that have none, adding a text layer.
+    ///
+    /// FR-BATCH requires an operation to behave identically whether invoked
+    /// singly or as a pipeline step. Like the stamp steps, OCR needs the
+    /// coordinator and a sandboxed worker, so `execute_step` refuses it and the
+    /// CLI executor runs it through the same `run_ocr` the `ocr` subcommand
+    /// uses — one implementation, not two. [FR-BATCH, FR-OCR-1]
+    Ocr {
+        /// Input file path.
+        input: PathBuf,
+        /// Tesseract language selection, e.g. `eng` or `eng+deu`.
+        language: String,
+        /// Whether to OCR pages that already carry text.
+        include_pages_with_text: bool,
+        /// Output path.
+        output: PathBuf,
+    },
     /// Apply Bates numbering to all pages.
     BatesNumber {
         /// Input file path.
@@ -148,6 +165,20 @@ impl BatchPipeline {
                     out.push_str(&format!("input={}\n", input.display()));
                     out.push_str(&format!("pages_per_file={pages_per_file}\n"));
                     out.push_str(&format!("output_dir={}\n", output_dir.display()));
+                }
+                BatchStep::Ocr { input, language, include_pages_with_text, output } => {
+                    out.push_str("type=ocr
+");
+                    out.push_str(&format!("input={}
+", input.display()));
+                    out.push_str(&format!("lang={language}
+"));
+                    if *include_pages_with_text {
+                        out.push_str("with_text=true
+");
+                    }
+                    out.push_str(&format!("output={}
+", output.display()));
                 }
                 BatchStep::ExtractPages { input, first, last, output } => {
                     out.push_str("type=extract_pages\n");
@@ -277,6 +308,15 @@ pub fn execute_step(
         // it is wired through, refusing with a reason is the required
         // behaviour: correctness before capability, and never a false
         // success. [PRIN-1, PRIN-6, GR-8, UX-ERR-3, FR-STAMP]
+        // Same reasoning as the stamp steps below: this needs the coordinator
+        // and a sandboxed worker, which `pdf-model` does not and should not
+        // reach. The CLI executor runs it; refusing here is honest about what
+        // this function can do. [FR-BATCH, ADR-025, GR-8]
+        BatchStep::Ocr { input, .. } => Err(format!(
+            "OCR of {} not run: it needs the coordinator's worker path, which \
+             the model-level executor does not have. Run it through the CLI.",
+            input.display()
+        )),
         BatchStep::Watermark { text, .. } => Err(format!(
             "watermark '{text}' not applied: batch stamping needs the \
              coordinator page injection path, which is not wired up. \

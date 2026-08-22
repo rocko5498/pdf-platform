@@ -405,3 +405,75 @@ fn ocr_job_never_dispatches_to_the_pool_when_cancelled_before_start() {
         "a cancelled ocr job must never actually run recognition"
     );
 }
+
+/// A page with visible text must actually be recognized. [FR-OCR-1, MET-FEAT-*]
+///
+/// Every other test here proves the job reaches the engine. None proved the
+/// engine read the image, and it did not: the PNG handed to Tesseract lacked
+/// its zlib header, so Leptonica rejected every page and OCR recognized
+/// nothing, anywhere, while the suite stayed green. This runs only where the
+/// engine is guaranteed (CI sets PDF_PLATFORM_REQUIRE_OCR) because it asserts
+/// a recognition result, not a dispatch path.
+#[test]
+fn a_page_with_visible_text_is_actually_recognized() {
+    if !ocr_required() {
+        eprintln!("skip: PDF_PLATFORM_REQUIRE_OCR is not set, so no engine is guaranteed");
+        return;
+    }
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tools")
+        .join("corpus-diff")
+        .join("fixtures")
+        .join("text-latin.pdf");
+    assert!(fixture.is_file(), "fixture missing: {}", fixture.display());
+
+    let engine = ocr_bridge::TesseractEngine::new();
+    assert!(
+        ocr_bridge::OcrEngine::is_available(&engine),
+        "PDF_PLATFORM_REQUIRE_OCR is set but Tesseract is not available"
+    );
+
+    let worker = worker_path();
+    let mut coord = coordinator::document::DocumentCoordinator::open(&worker, &fixture)
+        .expect("open fixture");
+    // 150 DPI, not 300: this test drives the legacy render-over-IPC path, whose
+    // frames are capped at 16 MB (a 300-DPI letter page is 44 MB). The real OCR
+    // job renders inside the worker for exactly this reason; here the point is
+    // recognition, and 150 DPI is ample for 12pt text. [SDS §4.6, FR-OCR-1]
+    const OCR_TEST_DPI: u32 = 150;
+    let raster = coord
+        .render_page(0, OCR_TEST_DPI as f32 / 72.0)
+        .expect("render page for recognition");
+    let _ = coord.close();
+
+    let options = ocr_bridge::PreprocessOptions {
+        deskew: false,
+        despeckle: false,
+        target_dpi: OCR_TEST_DPI,
+        ocr_pages_with_text: true,
+    };
+    let result = ocr_bridge::OcrEngine::recognize(
+        &engine,
+        &raster.pixels,
+        raster.width,
+        raster.height,
+        OCR_TEST_DPI,
+        0,
+        &options,
+    );
+
+    assert!(
+        result.success,
+        "recognition failed on a page that plainly has text: {:?}",
+        result.error
+    );
+    let text = result.full_text.to_lowercase();
+    assert!(
+        text.contains("hello") || text.contains("extraction"),
+        "expected the drawn words back, got {:?}",
+        result.full_text
+    );
+}
