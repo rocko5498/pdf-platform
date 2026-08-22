@@ -70,8 +70,15 @@ fn one_page_pdf() -> Vec<u8> {
 }
 
 fn temp_pdf(bytes: &[u8]) -> PathBuf {
+    // One path per call, not one per process. Every test in this binary runs in
+    // a thread of the same process, so a pid-only name gave them all the same
+    // file: whichever test finished first removed it, and a test still opening
+    // it got NotFound. Latent until the engine was provisioned on Linux and the
+    // timing shifted. [ADR-022 T-5, AI-7]
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "pdf-platform-ocr-e2e-{}.pdf",
+        "pdf-platform-ocr-e2e-{}-{unique}.pdf",
         std::process::id()
     ));
     std::fs::write(&path, bytes).unwrap();
