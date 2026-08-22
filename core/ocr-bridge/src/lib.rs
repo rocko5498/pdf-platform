@@ -777,7 +777,18 @@ impl OcrEngine for TesseractEngine {
             preprocess_page(raster, width, height, source_dpi, options);
 
         // Write RGBA raster to a temporary PNG file for Tesseract input.
-        let tmp_dir = std::env::temp_dir().join(format!("ocr_page_{page_index}"));
+        // One scratch directory per recognition, not per page index. Naming it
+        // by page alone meant two OCR jobs for page 0 — different documents,
+        // different processes, or simply two tests — wrote `input.png` over
+        // each other, and the loser handed Tesseract a half-written file. It
+        // surfaced as "internal png error", which reads like a bad encoder
+        // rather than a collision. [FR-OCR-3, GR-8, PRIN-1]
+        static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ocr_page_{page_index}_{}_{unique}",
+            std::process::id()
+        ));
         let _ = std::fs::create_dir_all(&tmp_dir);
         let png_path = tmp_dir.join("input.png");
         let tsv_path = tmp_dir.join("output.tsv");
@@ -1096,7 +1107,21 @@ fn crc32(chunk_type: &[u8], data: &[u8]) -> u32 {
 
 /// Deflate STORE method (no compression, block size 65535).
 fn deflate_store(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() + data.len() / 65535 * 5 + 5);
+    let mut out = Vec::with_capacity(data.len() + data.len() / 65535 * 5 + 7);
+
+    // PNG's IDAT carries a *zlib* stream, not bare deflate blocks (RFC 1950
+    // wrapping RFC 1951). This header was missing, so every PNG this function
+    // produced was rejected by the decoder on the other side: Leptonica
+    // answered "internal png error" and Tesseract received no image at all,
+    // which means OCR never recognized anything on any page. The suite did not
+    // catch it because the OCR tests assert that dispatch reaches the engine,
+    // not that recognition succeeded.
+    //
+    // 0x78 = CM 8 (deflate), CINFO 7 (32K window); 0x01 = FCHECK making
+    // (0x78 << 8 | 0x01) a multiple of 31, FDICT 0, FLEVEL 0. [FR-OCR-3, GR-8]
+    out.push(0x78);
+    out.push(0x01);
+
     let mut pos = 0;
     while pos < data.len() {
         let remaining = data.len() - pos;
@@ -1491,6 +1516,52 @@ mod tests {
         );
         assert!(w > 4 && h > 4, "unknown source still scales from 72");
         assert!(result.resized);
+    }
+
+    #[test]
+    fn the_png_we_hand_tesseract_carries_a_zlib_header() {
+        // PNG's IDAT is a zlib stream (RFC 1950 around RFC 1951), and this
+        // encoder emitted bare deflate blocks. Leptonica answered "internal
+        // png error", Tesseract received no image, and OCR recognized nothing
+        // on any page — while the OCR tests passed, because they assert that
+        // dispatch reaches the engine rather than that recognition worked.
+        // [FR-OCR-3, GR-8, PRIN-1]
+        let dir = std::env::temp_dir().join("pdf-platform-png-header-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("probe.png");
+        let pixels = vec![255u8; 4 * 4 * 4];
+        write_rgba_png(&path, &pixels, 4, 4).expect("write png");
+
+        let bytes = std::fs::read(&path).expect("read png");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
+
+        // Walk the chunks to the IDAT payload rather than guessing an offset.
+        let mut offset = 8usize;
+        let mut idat: Option<&[u8]> = None;
+        while offset + 8 <= bytes.len() {
+            let length =
+                u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            let kind = &bytes[offset + 4..offset + 8];
+            let payload = &bytes[offset + 8..offset + 8 + length];
+            if kind == b"IDAT" {
+                idat = Some(payload);
+                break;
+            }
+            offset += 12 + length;
+        }
+        let idat = idat.expect("no IDAT chunk");
+        assert!(idat.len() >= 2, "IDAT too short to hold a zlib header");
+
+        let cmf = idat[0];
+        let flg = idat[1];
+        assert_eq!(cmf & 0x0F, 8, "zlib compression method must be deflate");
+        assert_eq!(
+            (u16::from(cmf) * 256 + u16::from(flg)) % 31,
+            0,
+            "zlib header check bits are wrong: {cmf:#04x} {flg:#04x}"
+        );
     }
 
     #[test]
