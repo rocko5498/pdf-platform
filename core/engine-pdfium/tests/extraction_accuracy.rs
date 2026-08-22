@@ -91,3 +91,41 @@ fn line_geometry_is_inside_the_page_box() {
         assert!(line.height > 0.0, "zero-height line: {line:?}");
     }
 }
+
+#[test]
+fn concurrent_extraction_returns_the_same_text_every_time() {
+    // `PdfiumEngine` carries `unsafe impl Send + Sync`, so the type system
+    // permits exactly this. PDFium is not thread-safe, and before the engine
+    // serialized its calls two threads in one process were enough to corrupt
+    // each other: Windows returned "Hello extraction" as "Helo xtracion" and
+    // Linux aborted with `free(): invalid pointer`. Silent text corruption is
+    // worse than a crash, because nothing downstream can tell. [CR-4, PRIN-1]
+    use std::sync::Arc;
+
+    let path = fixture("text-latin.pdf");
+    let engine = Arc::new(PdfiumEngine::from_file(&path, None).expect("open fixture"));
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let model = engine.extract_page(0).expect("extract page 0");
+                model
+                    .lines
+                    .iter()
+                    .map(|line| line.text.trim().to_owned())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let extracted = handle.join().expect("extraction thread panicked");
+        assert_eq!(
+            extracted,
+            EXPECTED_LINES.map(str::to_owned).to_vec(),
+            "concurrent extraction returned different text"
+        );
+    }
+}
