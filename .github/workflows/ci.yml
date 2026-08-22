@@ -193,9 +193,21 @@ jobs:
           version: 6.10.3
           cache: true
 
-      - name: Build FFI bridge
+      # The tile test needs the engine the worker binds and the worker the
+      # bridge spawns. Both are inputs to the M0 criterion, so both are
+      # provisioned here rather than assumed. [AGENTS §11, ADR-038]
+      - name: Cache provisioned engine
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: third_party/pdfium/prebuilt
+          key: pdfium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('third_party/pdfium/provenance.toml') }}
+
+      - name: Provision PDFium
+        run: python tools/provision_engine.py
+
+      - name: Build FFI bridge and worker
         working-directory: core
-        run: cargo build -p ffi-bridge
+        run: cargo build -p ffi-bridge -p worker-main
 
       - name: Locate FFI bridge
         id: ffi
@@ -209,10 +221,20 @@ jobs:
           if (-not (Test-Path -LiteralPath $path)) { throw "Missing FFI bridge: $path" }
           "path=$path" >> $env:GITHUB_OUTPUT
 
+      - name: Locate worker binary
+        id: worker
+        shell: pwsh
+        run: |
+          $name = if ($IsWindows) { 'worker.exe' } else { 'worker' }
+          $path = Join-Path $env:GITHUB_WORKSPACE "core/target/debug/$name"
+          if (-not (Test-Path -LiteralPath $path)) { throw "Missing worker binary: $path" }
+          "path=$path" >> $env:GITHUB_OUTPUT
+
       - name: Configure shell
         run: >-
           cmake -S shell -B build/shell
           -DFFI_BRIDGE_LIB=${{ steps.ffi.outputs.path }}
+          -DWORKER_BIN=${{ steps.worker.outputs.path }}
           -DPDF_PLATFORM_USE_OPENGL=OFF
           -DBUILD_TESTING=ON
 
