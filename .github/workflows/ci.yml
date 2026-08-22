@@ -206,6 +206,22 @@ jobs:
           cargo test -p pdf-model assembly_ops
           cargo test -p sandbox confinement
 
+      # ADR-022 §6: "veraPDF validation of everything our writer emits". Runs
+      # on Linux only — it is one independent opinion on the bytes, and the
+      # bytes do not vary by host. veraPDF needs a JRE, which is a test-
+      # environment dependency and never a product one. [ADR-022 §6, CMP-STD-2]
+      - name: Cache veraPDF
+        if: runner.os == 'Linux'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: third_party/verapdf/install
+          key: verapdf-${{ runner.os }}-${{ hashFiles('tools/verapdf_gate.py') }}
+
+      - name: Writer output parses in veraPDF
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: python tools/verapdf_writer_gate.py
+
       - name: A11y static audit + p95 gate table
         working-directory: .
         run: |
