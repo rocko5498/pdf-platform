@@ -80,6 +80,17 @@ pub enum BatchStep {
         /// Output path.
         output: PathBuf,
     },
+    /// Index every PDF under an enrolled root, so a pipeline can leave the
+    /// cross-document index current after the documents it just produced.
+    ///
+    /// Like the OCR and stamp steps, this needs the coordinator and a
+    /// sandboxed worker to extract text, so `execute_step` refuses it and the
+    /// CLI executor runs it through the same code path `index reindex` uses —
+    /// one implementation, not two. [FR-BATCH, ADR-019 §3]
+    Index {
+        /// The enrolled root to rescan. Must already be enrolled.
+        root: PathBuf,
+    },
     /// Apply Bates numbering to all pages.
     BatesNumber {
         /// Input file path.
@@ -199,6 +210,10 @@ impl BatchPipeline {
                     out.push_str(&format!("text={text}\n"));
                     out.push_str(&format!("output={}\n", output.display()));
                 }
+                BatchStep::Index { root } => {
+                    out.push_str("type=index\n");
+                    out.push_str(&format!("root={}\n", root.display()));
+                }
                 BatchStep::BatesNumber { input, start, width, output } => {
                     out.push_str("type=bates_number\n");
                     out.push_str(&format!("input={}\n", input.display()));
@@ -317,6 +332,12 @@ pub fn execute_step(
              the model-level executor does not have. Run it through the CLI.",
             input.display()
         )),
+        BatchStep::Index { root } => Err(format!(
+            "indexing of {} not run: it needs the coordinator's worker path to \
+             extract text, which the model-level executor does not have. Run it \
+             through the CLI.",
+            root.display()
+        )),
         BatchStep::Watermark { text, .. } => Err(format!(
             "watermark '{text}' not applied: batch stamping needs the \
              coordinator page injection path, which is not wired up. \
@@ -333,6 +354,34 @@ pub fn execute_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_executor_refuses_indexing_and_says_why() {
+        // Refusing is the honest answer here: `pdf-model` cannot reach the
+        // coordinator's worker, and a step that quietly reported success would
+        // leave the index stale while the pipeline claimed it was current.
+        let step = BatchStep::Index {
+            root: PathBuf::from("/enrolled/root"),
+        };
+        let refusal = execute_step(&step, &|_, _, _| Ok(String::new()))
+            .expect_err("the model-level executor cannot index");
+        assert!(
+            refusal.contains("coordinator") && refusal.contains("CLI"),
+            "the refusal must say what is missing and where to run it: {refusal}"
+        );
+    }
+
+    #[test]
+    fn an_index_step_round_trips_through_the_pipeline_format() {
+        let mut pipeline = BatchPipeline::new("indexing");
+        pipeline.add_step(BatchStep::Index {
+            root: PathBuf::from("/enrolled/root"),
+        });
+        let text = pipeline.serialize();
+        assert!(text.contains("type=index"), "{text}");
+        assert!(text.contains("root=/enrolled/root"), "{text}");
+    }
+
 
     #[test]
     fn pipeline_new_and_add_step() {
