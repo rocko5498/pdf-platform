@@ -18,6 +18,12 @@ pub struct DocumentStructure {
     /// Parsed xref offsets: maps object number -> byte offset in the file.
     /// Used by IncrementalWriter for correct xref entries during incremental save. [ADR-012]
     pub xref_offsets: std::collections::HashMap<u32, u32>,
+    /// Object number of the document catalog, from the trailer's `/Root`.
+    ///
+    /// Nothing may assume this is 1. Plenty of producers number the catalog
+    /// last, and the incremental writer used to hard-code `/Root 1 0 R` into
+    /// every trailer it wrote. [FR-SAVE, SDS §3.3]
+    pub root_obj_num: u32,
 }
 
 /// Fatal scanner errors (not tolerable leniency events).
@@ -149,6 +155,7 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
         .collect();
 
     Ok(DocumentStructure {
+        root_obj_num: root_ref.0,
         page_count,
         has_acroform,
         has_xfa,
@@ -255,7 +262,7 @@ fn parse_section(
 /// A document written entirely with xref streams has **no `trailer` keyword at
 /// all** — `/Root` lives in the stream dictionary — so a reader that insists on
 /// finding one rejects every modern PDF. [FR-VIEW-2, SDS §3.1]
-pub(crate) fn section_dictionary(data: &[u8], offset: usize) -> Option<Vec<u8>> {
+pub fn section_dictionary(data: &[u8], offset: usize) -> Option<Vec<u8>> {
     if data.get(offset..).is_some_and(|d| d.starts_with(b"xref")) {
         return find_trailer(data, offset).map(<[u8]>::to_vec);
     }

@@ -32,6 +32,7 @@ pub fn inspect(path: &Path) -> Result<StructuralSummary, InspectError> {
     // ponytail: exhaustive field map — when DocumentStructure gains fields,
     // update StructuralSummary in protocol::inspect and this mapping together.
     Ok(StructuralSummary {
+        root_obj_num: ds.root_obj_num,
         page_count: ds.page_count,
         has_acroform: ds.has_acroform,
         has_xfa: ds.has_xfa,

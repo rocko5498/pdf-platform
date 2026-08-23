@@ -27,6 +27,11 @@ pub struct StructuralSummary {
     /// Original xref table: maps object number -> byte offset in the original file.
     /// Populated by the worker during bootstrap parse for incremental save. [ADR-012]
     pub original_offsets: std::collections::HashMap<u32, u32>,
+    /// Object number of the document catalog, from the trailer's `/Root`.
+    ///
+    /// The coordinator needs it to find the page tree and to write a trailer
+    /// that points at the right object; both used to assume 1. [FR-SAVE]
+    pub root_obj_num: u32,
 }
 
 impl StructuralSummary {
@@ -72,6 +77,7 @@ impl std::error::Error for SummaryDecodeError {}
 /// Encode a summary as a control-frame body (`SUMMARY` / `v1` text).
 pub fn encode_summary(s: &StructuralSummary) -> Vec<u8> {
     let mut out = String::from("SUMMARY\nv1\n");
+    out.push_str(&format!("root={}\n", s.root_obj_num));
     out.push_str(&format!("page_count={}\n", s.page_count));
     out.push_str(&format!("has_acroform={}\n", u8::from(s.has_acroform)));
     out.push_str(&format!("has_xfa={}\n", u8::from(s.has_xfa)));
@@ -119,6 +125,7 @@ pub fn decode_summary(body: &[u8]) -> Result<StructuralSummary, SummaryDecodeErr
     let mut leniency_events = Vec::new();
     let mut page_dimensions = Vec::new();
     let mut original_offsets = std::collections::HashMap::new();
+    let mut root_obj_num: Option<u32> = None;
 
     for line in lines {
         if line.is_empty() {
@@ -165,6 +172,9 @@ pub fn decode_summary(body: &[u8]) -> Result<StructuralSummary, SummaryDecodeErr
                     page_dimensions.push((w.to_bits(), h.to_bits(), r));
                 }
             }
+            "root" => {
+                root_obj_num = v.parse().ok();
+            }
             "xref_off" => {
                 if let Some((obj_s, off_s)) = v.split_once(':') {
                     if let (Ok(obj), Ok(off)) = (obj_s.parse::<u32>(), off_s.parse::<u32>()) {
@@ -177,6 +187,9 @@ pub fn decode_summary(body: &[u8]) -> Result<StructuralSummary, SummaryDecodeErr
     }
 
     Ok(StructuralSummary {
+        // A document whose trailer named no /Root never reaches here: the scan
+        // fails first. Defaulting to 1 would put the old assumption back.
+        root_obj_num: root_obj_num.ok_or(SummaryDecodeError::BadField("root"))?,
         page_count: page_count.ok_or(SummaryDecodeError::BadField("page_count"))?,
         has_acroform: has_acroform.ok_or(SummaryDecodeError::BadField("has_acroform"))?,
         has_xfa: has_xfa.ok_or(SummaryDecodeError::BadField("has_xfa"))?,
