@@ -213,8 +213,9 @@ pub fn encode_worker_event(event: &WorkerEvent) -> Vec<u8> {
         } => {
             let mut out = format!(
                 "EVT:SUMMARY:{correlation_id}\n\
-                 page_count={}\nhas_acroform={}\nhas_xfa={}\nhas_js={}\n\
-                 sig_count={}\nleniency_count={}\n",
+                 root={}\npage_count={}\nhas_acroform={}\nhas_xfa={}\n\
+                 has_js={}\nsig_count={}\nleniency_count={}\n",
+                summary.root_obj_num,
                 summary.page_count,
                 u8::from(summary.has_acroform),
                 u8::from(summary.has_xfa),
@@ -515,6 +516,7 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
             let mut leniency_events = Vec::new();
             let mut page_dimensions = Vec::new();
             let mut original_offsets = std::collections::HashMap::new();
+            let mut root_obj_num: Option<u32> = None;
             for line in lines {
                 let Some((k, v)) = line.split_once('=') else {
                     continue;
@@ -574,6 +576,7 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
                             }
                         }
                     }
+                    "root" => root_obj_num = v.parse().ok(),
                     "xref_off" => {
                         if let Some((obj_s, off_s)) = v.split_once(':') {
                             if let (Ok(obj), Ok(off)) = (obj_s.parse::<u32>(), off_s.parse::<u32>()) {
@@ -587,6 +590,7 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
             Ok(WorkerEvent::Summary {
                 correlation_id,
                 summary: StructuralSummary {
+                    root_obj_num: root_obj_num.ok_or(EventDecodeError::BadField("root"))?,
                     page_count: page_count.ok_or(EventDecodeError::BadField("page_count"))?,
                     has_acroform: has_acroform.ok_or(EventDecodeError::BadField("has_acroform"))?,
                     has_xfa: has_xfa.ok_or(EventDecodeError::BadField("has_xfa"))?,
@@ -1038,6 +1042,7 @@ mod tests {
         let event = WorkerEvent::Summary {
             correlation_id: 99,
             summary: StructuralSummary {
+                root_obj_num: 1,
                 page_count: 42,
                 has_acroform: true,
                 has_xfa: false,

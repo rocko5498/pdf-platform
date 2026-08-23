@@ -29,6 +29,22 @@ pub struct WriteResult {
 /// Incremental-save serializer. [ADR-012]
 ///
 /// Appends changed objects and a new xref section to the existing file.
+/// What the new trailer must say, taken from the document being saved.
+///
+/// Every field here was once assumed: `/Root` was written as `1 0 R`, and
+/// `/Info`, `/Encrypt` and `/ID` were dropped. [FR-SAVE, SDS §3.3]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrailerInfo {
+    /// Object number of the document catalog.
+    pub root_obj_num: u32,
+    /// Object number of the document information dictionary, if it has one.
+    pub info_obj_num: Option<u32>,
+    /// Object number of the encryption dictionary, if the document is encrypted.
+    pub encrypt_obj_num: Option<u32>,
+    /// The `/ID` array exactly as the source wrote it, brackets included.
+    pub id: Option<String>,
+}
+
 /// The original file bytes are never modified — only new bytes are appended.
 pub struct IncrementalWriter;
 
@@ -52,6 +68,7 @@ impl IncrementalWriter {
         next_obj_num: u32,
         original_offsets: &HashMap<u32, u32>,
         original_len: u32,
+        trailer: &TrailerInfo,
     ) -> Result<WriteResult, std::io::Error> {
         let mut objects_written = 0u32;
 
@@ -137,13 +154,29 @@ impl IncrementalWriter {
         // reader that follows it lands on the file header rather than an xref,
         // so the incremental update is malformed. Omit the key entirely when
         // there is nothing to chain to. [SDS §3.3, PRIN-1, GR-8]
-        let trailer = if prev_xref_offset > 0 {
-            format!("trailer\n<< /Size {max_obj} /Root 1 0 R /Prev {prev_xref_offset} >>\n")
-        } else {
-            format!("trailer\n<< /Size {max_obj} /Root 1 0 R >>\n")
-        };
-        writer.write_all(trailer.as_bytes())?;
-        current_pos += trailer.len() as u32;
+        // `/Root 1 0 R` used to be written literally. A document that numbers
+        // its catalog anything but 1 — which the format allows and producers do
+        // — was handed back with a trailer pointing at the wrong object, and
+        // reopening it found no pages. Everything the source trailer said that
+        // still applies is carried forward: an encrypted document whose /Encrypt
+        // is dropped cannot be decrypted, and losing /ID breaks the file's
+        // identity for signatures and for update chains. [FR-SAVE, SDS §3.3]
+        let mut entries = format!("/Size {max_obj} /Root {} 0 R", trailer.root_obj_num);
+        if let Some(info) = trailer.info_obj_num {
+            entries.push_str(&format!(" /Info {info} 0 R"));
+        }
+        if let Some(encrypt) = trailer.encrypt_obj_num {
+            entries.push_str(&format!(" /Encrypt {encrypt} 0 R"));
+        }
+        if let Some(id) = &trailer.id {
+            entries.push_str(&format!(" /ID {id}"));
+        }
+        if prev_xref_offset > 0 {
+            entries.push_str(&format!(" /Prev {prev_xref_offset}"));
+        }
+        let trailer_text = format!("trailer\n<< {entries} >>\n");
+        writer.write_all(trailer_text.as_bytes())?;
+        current_pos += trailer_text.len() as u32;
 
         let startxref = format!("startxref\n{xref_start}\n%%EOF\n");
         writer.write_all(startxref.as_bytes())?;
@@ -199,6 +232,7 @@ mod tests {
             5,   // next obj num is 5
             &offsets,
             0,   // original_len: writing to empty buffer
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         assert!(result.objects_written >= 2);
@@ -226,6 +260,7 @@ mod tests {
             5,
             &offsets,
             0,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         let text = String::from_utf8_lossy(&output);
@@ -258,6 +293,7 @@ mod tests {
             3,
             &HashMap::new(),
             0,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         assert_eq!(result.objects_written, 0);
@@ -279,6 +315,7 @@ mod tests {
             2,
             &HashMap::new(),
             0,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         // The xref_offset should equal the byte position of "xref\n" in the output.
@@ -307,6 +344,7 @@ endobj
             2,
             &HashMap::new(),
             0,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         )
         .unwrap();
 

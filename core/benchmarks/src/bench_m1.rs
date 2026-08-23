@@ -85,6 +85,7 @@ fn bench_incremental_save(c: &mut Criterion) {
                             num_pages + 3,
                             offs,
                             bytes.len() as u32,
+                            &pdf_write::TrailerInfo { root_obj_num: 1, ..Default::default() },
                         );
                         total += start.elapsed();
                     }

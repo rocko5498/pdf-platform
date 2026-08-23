@@ -180,6 +180,8 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
         page_width: 595.0,
         page_height: 842.0,
         summary: StructuralSummary {
+            // Placeholder until `inspect_document` replaces it below.
+            root_obj_num: 0,
             page_count: 1,
             has_acroform: false,
             has_xfa: false,
@@ -917,6 +919,12 @@ fn save_document_impl(out_path: &str) -> Result<String, String> {
 
         let mut out = original.clone();
         let original_len = out.len() as u32;
+        // The document's own catalog, not object 1: the writer used to put
+        // `/Root 1 0 R` in every trailer it wrote. [FR-SAVE, SDS §3.3]
+        let trailer = pdf_write::TrailerInfo {
+            root_obj_num: session.summary.root_obj_num,
+            ..pdf_write::TrailerInfo::default()
+        };
         let result = IncrementalWriter::write_incremental(
             &mut out,
             &overlay,
@@ -924,6 +932,7 @@ fn save_document_impl(out_path: &str) -> Result<String, String> {
             next_obj,
             &session.summary.original_offsets,
             original_len,
+            &trailer,
         )
         .map_err(|e| format!("incremental write: {e}"))?;
 

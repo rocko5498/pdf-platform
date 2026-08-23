@@ -996,6 +996,7 @@ fn scan_and_encode(
     // Prefer page meta from the already-loaded engine — never re-open the handle. [ADR-005]
     let page_dimensions = page_dimensions_from_engine(pdfium);
     Ok(StructuralSummary {
+        root_obj_num: ds.root_obj_num,
         page_count: ds.page_count,
         has_acroform: ds.has_acroform,
         has_xfa: ds.has_xfa,

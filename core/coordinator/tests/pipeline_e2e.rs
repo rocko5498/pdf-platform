@@ -219,6 +219,7 @@ fn e2e_incremental_save_debug() {
         6,
         &original_offsets,
         original_bytes.len() as u32,
+        &pdf_write::TrailerInfo { root_obj_num: 1, ..Default::default() },
     )
     .expect("incremental write");
 
@@ -319,6 +320,7 @@ fn e2e_coordinator_full_pipeline() {
         8,
         &summary.original_offsets,
         pdf_bytes.len() as u32,
+        &pdf_write::TrailerInfo { root_obj_num: 1, ..Default::default() },
     )
     .expect("incremental save");
 
@@ -403,6 +405,7 @@ fn e2e_scan_save_rescan_preserves_structure() {
         13,
         &offsets,
         pdf_bytes.len() as u32,
+        &pdf_write::TrailerInfo { root_obj_num: 1, ..Default::default() },
     )
     .expect("save");
 

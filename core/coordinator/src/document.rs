@@ -440,6 +440,9 @@ impl DocumentCoordinator {
         // [SDS §3.3, FR-SAVE, PRIN-1]
         let prev_xref_offset = pdf_cos::scan::find_startxref(&original_bytes).unwrap_or(0) as u32;
 
+        // What the source trailer said, carried into the one we append.
+        let trailer = source_trailer(&original_bytes, self.summary.root_obj_num);
+
         let result = IncrementalWriter::write_incremental(
             &mut file,
             &self.overlay,
@@ -447,6 +450,7 @@ impl DocumentCoordinator {
             self.next_obj_num,
             &self.summary.original_offsets,
             original_len,
+            &trailer,
         ).map_err(|e| SessionError::Io(e))?;
 
         self.saved_revision = self.overlay.revision();
@@ -580,8 +584,13 @@ impl DocumentCoordinator {
 
     /// Find the Pages parent object number by reading the catalog. [SDS §3.1]
     fn find_pages_object(&mut self) -> Result<u32, SessionError> {
-        // Read the catalog (object 1) to find /Pages reference.
-        let catalog_bytes = self.session.get_object(1)?;
+        // The catalog is whatever the trailer's /Root names. This read object 1
+        // and fell back to object 2, so a document that numbered its catalog
+        // anywhere else resolved the wrong object: on a file whose object 1 is
+        // a content stream, stamping failed with "stamping nested page trees is
+        // not yet supported" — a message about a shape the document did not
+        // have. [FR-SAVE, SDS §3.3, PRIN-1]
+        let catalog_bytes = self.session.get_object(self.summary.root_obj_num)?;
         let catalog_text = String::from_utf8_lossy(&catalog_bytes);
 
         // Parse "/Pages N 0 R" from the catalog.
@@ -607,8 +616,10 @@ impl DocumentCoordinator {
             }
         }
 
-        // Fallback: assume object 2 (common in simple PDFs).
-        Ok(2)
+        Err(SessionError::Protocol(format!(
+            "catalog (object {}) names no /Pages",
+            self.summary.root_obj_num
+        )))
     }
 
     /// Extract the raw Kids array bytes from a Pages object string.
@@ -1197,11 +1208,50 @@ impl DocumentCoordinator {
     // utility pool, no raster crossing IPC, and calling `scale_blocks_to_page`
     // before generating the text layer.
 
+
     /// Ask the worker to quit, then wait for it. [SDS §7]
     pub fn close_worker(&mut self) -> Result<(), SessionError> {
         let _ = self.session.send(b"CMD:QUIT\n");
         let _ = self.session.kill_worker();
         Ok(())
+    }
+}
+
+/// Read `/Info`, `/Encrypt` and `/ID` from the document being saved.
+///
+/// `/Root` comes from the summary, which the scanner took from the same
+/// trailer. The rest are read here because nothing else needed them until the
+/// writer stopped inventing a trailer of its own. [FR-SAVE, SDS §3.3]
+fn source_trailer(bytes: &[u8], root_obj_num: u32) -> pdf_write::TrailerInfo {
+    let dictionary = pdf_cos::scan::find_startxref(bytes)
+        .and_then(|offset| pdf_cos::scan::section_dictionary(bytes, offset))
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&dictionary);
+
+    let reference = |key: &str| -> Option<u32> {
+        let at = text.find(key)?;
+        text[at + key.len()..]
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    };
+
+    // `/ID [<hex> <hex>]` is copied verbatim: it identifies the file, and a
+    // re-derived value is a different document as far as a signature or an
+    // update chain is concerned.
+    let id = text.find("/ID").and_then(|at| {
+        let rest = &text[at + 3..];
+        let start = rest.find('[')?;
+        let end = rest[start..].find(']')? + start + 1;
+        Some(rest[start..end].to_string())
+    });
+
+    pdf_write::TrailerInfo {
+        root_obj_num,
+        info_obj_num: reference("/Info"),
+        encrypt_obj_num: reference("/Encrypt"),
+        id,
     }
 }
 
@@ -1579,6 +1629,7 @@ mod tests {
             2,
             &std::collections::HashMap::new(),
             0,
+            &pdf_write::TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         assert_eq!(result.objects_written, 1);
