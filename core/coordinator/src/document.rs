@@ -643,14 +643,6 @@ impl DocumentCoordinator {
         )))
     }
 
-    /// Extract the raw Kids array bytes from a Pages object string.
-    fn extract_kids_array(&self, pages_text: &str) -> Option<Vec<u8>> {
-        let start = pages_text.find("/Kids [")?;
-        let array_start = start + "/Kids [".len();
-        let end = pages_text[array_start..].find(']')?;
-        let array_content = &pages_text[array_start..array_start + end];
-        Some(array_content.as_bytes().to_vec())
-    }
 
     /// Parse kid references from a Pages object string into object numbers.
     fn parse_kid_references(&self, pages_text: &str) -> Vec<u32> {
@@ -672,27 +664,6 @@ impl DocumentCoordinator {
         refs
     }
 
-    /// Read the /Rotate value from a page object. Returns 0 if not present.
-    fn read_page_rotation(&mut self, page_obj_num: u32) -> u32 {
-        self.session.get_object(page_obj_num)
-            .ok()
-            .and_then(|bytes| {
-                let text = String::from_utf8_lossy(&bytes);
-                // Find /Rotate N
-                let pos = text.find("/Rotate")?;
-                let after = &text[pos + 7..];
-                let mut num_str = String::new();
-                for c in after.chars() {
-                    if c.is_ascii_digit() {
-                        num_str.push(c);
-                    } else if !num_str.is_empty() {
-                        break;
-                    }
-                }
-                num_str.parse().ok()
-            })
-            .unwrap_or(0)
-    }
 
     /// Whether the document has unsaved changes.
     pub fn is_dirty(&self) -> bool {
