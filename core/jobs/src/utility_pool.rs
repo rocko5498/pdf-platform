@@ -154,6 +154,23 @@ impl UtilityPool {
         self.workers.len()
     }
 
+    /// Read a worker's shared-memory region.
+    ///
+    /// The region is where a utility job puts its *output* — a thumbnail's
+    /// pixels never travel back through IPC — and nothing could observe it, so
+    /// a job that returned a well-formed descriptor and drew nothing looked
+    /// exactly like one that worked. Read-only and borrowed for the call, so a
+    /// caller cannot retain or mutate the region. [FR-VIEW-3, GR-8, PRIN-6]
+    pub fn inspect_shared_memory<T>(
+        &self,
+        worker_index: usize,
+        read: impl FnOnce(&[u8]) -> T,
+    ) -> Option<T> {
+        let worker = self.workers.get(worker_index)?;
+        let guard = worker.lock().ok()?;
+        Some(read(guard.shared_memory.as_slice()))
+    }
+
     /// Replace one worker and invalidate capabilities bound to its old generation.
     pub fn restart_worker(&self, slot: usize) -> Result<(), UtilityPoolError> {
         let worker = self
