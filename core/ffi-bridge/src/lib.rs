@@ -57,21 +57,100 @@ struct DocSession {
     form_import_notes: Vec<String>,
     /// Form undo stack. [FR-FORM-6]
     form_undo_stack: Vec<FormUndoEntry>,
+    // The undo/redo stacks below are deliberately unbounded: SDS §14 M3's
+    // deliverable is "unlimited undo/redo", so capping them would trade a
+    // stated product guarantee for memory. Everything else that grows with
+    // document size or session length carries a bound. [GR-7, SDS §14 M3]
     /// Form redo stack. [FR-FORM-6]
     form_redo_stack: Vec<FormUndoEntry>,
     /// Annotation undo stack. [FR-ANNOT-4, M4]
     annot_undo_stack: Vec<AnnotUndoEntry>,
     /// Annotation redo stack. [FR-ANNOT-4, M4]
     annot_redo_stack: Vec<AnnotUndoEntry>,
-        /// Cached page text for find/copy (page_index, full text + reliable).
-    text_cache: std::collections::HashMap<u32, CachedPageText>,
+    /// Cached page text for find/copy, bounded by total size. [GR-7]
+    text_cache: TextCache,
     path: String,
+}
+
+/// How much extracted text one session keeps.
+///
+/// `find_text` extracts *every* page, so a long document put its entire text
+/// into a `HashMap` that nothing ever evicted: the cache grew with document
+/// size and session length, which is precisely what GR-7 forbids without a
+/// declared bound. Eight mebibytes is roughly a 4,000-page text document; past
+/// that, the least recently used page is dropped and re-extracted if it is
+/// asked for again. [GR-7, ADR-011, SDS §9.4]
+const TEXT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// A least-recently-used cache of extracted page text. [GR-7]
+#[derive(Default)]
+struct TextCache {
+    pages: std::collections::HashMap<u32, CachedPageText>,
+    /// Least recently used first.
+    order: std::collections::VecDeque<u32>,
+    bytes: usize,
+}
+
+impl TextCache {
+    fn contains(&self, page: u32) -> bool {
+        self.pages.contains_key(&page)
+    }
+
+    fn get(&mut self, page: u32) -> Option<&CachedPageText> {
+        if self.pages.contains_key(&page) {
+            self.touch(page);
+        }
+        self.pages.get(&page)
+    }
+
+    fn touch(&mut self, page: u32) {
+        if let Some(at) = self.order.iter().position(|p| *p == page) {
+            self.order.remove(at);
+        }
+        self.order.push_back(page);
+    }
+
+    fn insert(&mut self, page: u32, text: CachedPageText) {
+        let size = text.size_bytes();
+        if let Some(previous) = self.pages.remove(&page) {
+            self.bytes = self.bytes.saturating_sub(previous.size_bytes());
+        }
+        self.pages.insert(page, text);
+        self.bytes += size;
+        self.touch(page);
+
+        // Never evict the page just inserted: a caller that asked for it is
+        // about to read it, and a page larger than the whole budget would
+        // otherwise be evicted immediately and re-extracted forever.
+        while self.bytes > TEXT_CACHE_MAX_BYTES && self.order.len() > 1 {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(dropped) = self.pages.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(dropped.size_bytes());
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+
 }
 
 struct CachedPageText {
     full_text: String,
     reliable: bool,
     line_geom: Vec<String>,
+}
+
+impl CachedPageText {
+    /// Roughly what this entry holds, for the cache's budget. [GR-7]
+    fn size_bytes(&self) -> usize {
+        self.full_text.len()
+            + self.line_geom.iter().map(String::len).sum::<usize>()
+            + std::mem::size_of::<Self>()
+    }
 }
 
 /// A single undoable form field change. [FR-FORM-6]
@@ -197,7 +276,7 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
         form_redo_stack: Vec::new(),
         annot_undo_stack: Vec::new(),
         annot_redo_stack: Vec::new(),
-        text_cache: std::collections::HashMap::new(),
+        text_cache: TextCache::default(),
         path: path.to_string(),
     };
 
@@ -404,7 +483,7 @@ fn get_attachments_impl() -> Result<String, String> {
 }
 
 fn ensure_page_text(session: &mut DocSession, page_index: u32) -> Result<(), String> {
-    if session.text_cache.contains_key(&page_index) {
+    if session.text_cache.contains(page_index) {
         return Ok(());
     }
     let correlation_id = next_cid(session);
@@ -443,7 +522,7 @@ fn extract_page_text_impl(page_index: u32) -> Result<String, String> {
         ensure_page_text(session, page_index)?;
         let cached = session
             .text_cache
-            .get(&page_index)
+            .get(page_index)
             .ok_or("text cache miss")?;
         Ok(format!(
             "reliable={}\n{}",
@@ -462,7 +541,7 @@ fn find_text_impl(query: &str) -> Result<String, String> {
         let mut total = 0u32;
         for page in 0..n {
             ensure_page_text(session, page)?;
-            let cached = session.text_cache.get(&page).unwrap();
+            let cached = session.text_cache.get(page).expect("just extracted");
             // Build a minimal PageTextModel for search crate
             let model = geom_to_model(page, cached);
             let opts = FindOptions::default();
@@ -1347,6 +1426,81 @@ mod ffi {
         fn validate_form_impl() -> Result<String>;
         /// Flatten all form fields into page content. [FR-FORM-4, M5]
         fn flatten_form_impl() -> Result<String>;
+    }
+}
+
+#[cfg(test)]
+mod text_cache_tests {
+    use super::{CachedPageText, TextCache, TEXT_CACHE_MAX_BYTES};
+
+    fn page_of(bytes: usize) -> CachedPageText {
+        CachedPageText {
+            full_text: "x".repeat(bytes),
+            reliable: true,
+            line_geom: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_cache_stops_growing_at_its_budget() {
+        // `find_text` extracts every page, so this used to hold an entire
+        // document's text with nothing ever evicting it. [GR-7]
+        let mut cache = TextCache::default();
+        let page_size = TEXT_CACHE_MAX_BYTES / 4;
+
+        for page in 0..20 {
+            cache.insert(page, page_of(page_size));
+        }
+
+        assert!(
+            cache.bytes <= TEXT_CACHE_MAX_BYTES,
+            "cache holds {} bytes, over its {TEXT_CACHE_MAX_BYTES}-byte budget",
+            cache.bytes
+        );
+        assert!(cache.len() < 20, "nothing was evicted");
+        assert!(cache.contains(19), "the most recent page must survive");
+        assert!(!cache.contains(0), "the oldest page should have gone first");
+    }
+
+    #[test]
+    fn reading_a_page_makes_it_recent() {
+        let mut cache = TextCache::default();
+        // Quarter-budget pages: two fit comfortably, four do not.
+        let page_size = TEXT_CACHE_MAX_BYTES / 4;
+        cache.insert(0, page_of(page_size));
+        cache.insert(1, page_of(page_size));
+
+        // Touch page 0, then push until something must go.
+        assert!(cache.get(0).is_some());
+        cache.insert(2, page_of(page_size));
+        cache.insert(3, page_of(page_size));
+
+        assert!(
+            cache.contains(0),
+            "page 0 was read most recently of the two and must outlive page 1"
+        );
+        assert!(!cache.contains(1), "page 1 was the least recently used");
+    }
+
+    #[test]
+    fn a_page_larger_than_the_whole_budget_is_still_returned() {
+        // Otherwise the caller that just asked for it re-extracts forever.
+        let mut cache = TextCache::default();
+        cache.insert(5, page_of(TEXT_CACHE_MAX_BYTES * 2));
+
+        assert!(cache.contains(5));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn re_inserting_a_page_does_not_double_count_it() {
+        let mut cache = TextCache::default();
+        cache.insert(1, page_of(1000));
+        let after_first = cache.bytes;
+        cache.insert(1, page_of(1000));
+
+        assert_eq!(cache.bytes, after_first, "the replaced entry was counted twice");
+        assert_eq!(cache.len(), 1);
     }
 }
 
