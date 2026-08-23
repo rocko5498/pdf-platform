@@ -49,13 +49,23 @@ pub struct Stamp {
     pub rotation: f32,
 }
 
+/// Resource name the stamp's font is registered under.
+///
+/// The content stream's `Tf` operator and the page's `/Resources /Font` entry
+/// must name the same resource or the reference does not resolve: the stream
+/// said `/F1` while the page declared `/FStamp`, so a strict reader had no font
+/// to draw with. It is deliberately not `F1` — that is the name documents most
+/// often already use, and overwriting a page's own `/F1` would restyle its
+/// text. [FR-STAMP, PRIN-1]
+pub const STAMP_FONT_RESOURCE: &str = "FStamp";
+
 impl Default for Stamp {
     fn default() -> Self {
         Self {
             text: String::new(),
             position: StampPosition::BottomCenter,
             font_size: 10.0,
-            font_name: "F1".into(),
+            font_name: STAMP_FONT_RESOURCE.into(),
             color: [0.0, 0.0, 0.0],
             opacity: 1.0,
             margin: 36.0,

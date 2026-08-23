@@ -1232,7 +1232,9 @@ fn build_stamp_group(
             page_bytes,
             content_obj_num,
             font_obj_num,
-            "FStamp",
+            // The stamp's own resource name, so the page's /Resources entry and
+            // the stream's Tf operator can never disagree. They did.
+            &stamp.font_name,
         )
         .map_err(SessionError::Protocol)?;
 
