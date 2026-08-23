@@ -808,6 +808,7 @@ void MainWindow::zoomToFitPage() {
     // declared taxonomy — since M1, and nothing implemented it: Ctrl+0 was a
     // key the stability contract promised and the application ignored, which is
     // the dead binding ADR-032 forbids. [ADR-032, FR-VIEW-1, GR-8]
+    if (true) return;  // EV-2 PROBE: zoom_fit does nothing, as before this PR
     if (!canvas_ || page_height_ <= 0.f) return;
     const float viewport = float(canvas_->height());
     if (viewport <= 0.f) return;
