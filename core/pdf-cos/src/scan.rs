@@ -81,7 +81,8 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
     }
 
     let xref_offset = find_startxref(data).ok_or(ScanError::NoStartxref)?;
-    let xref = parse_xref_table(data, xref_offset, &mut leniency)?;
+    // The whole chain, not just the newest section: see `parse_xref_chain`.
+    let xref = parse_xref_chain(data, xref_offset, &mut leniency)?;
     let trailer = find_trailer(data, xref_offset).ok_or(ScanError::NoTrailer)?;
 
     let root_ref = find_indirect_ref(trailer, b"/Root").ok_or(ScanError::NoRoot)?;
@@ -128,10 +129,13 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
 
 // --- private helpers ---
 
-#[derive(Clone, Default)]
-pub(crate) struct XrefEntry {
-    offset: u64,
-    in_use: bool,
+/// One cross-reference entry: where an object starts, and whether it is live.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XrefEntry {
+    /// Byte offset of the object in the file.
+    pub offset: u64,
+    /// Whether the entry is in use (`n`) rather than free (`f`).
+    pub in_use: bool,
 }
 
 /// Scan last 1024 bytes for `startxref\n<N>`, return N as a file offset.
@@ -169,6 +173,96 @@ pub fn find_startxref(data: &[u8]) -> Option<usize> {
 }
 
 /// Parse a classic (non-compressed) xref table at `offset`.
+/// Read the whole cross-reference chain, newest section first. [FR-VIEW-2]
+///
+/// `parse_xref_table` reads **one** section. An incrementally updated PDF
+/// writes a section listing only the objects that changed and points at the
+/// previous one with the trailer's `/Prev`; every unchanged object lives in an
+/// earlier section. Reading only the newest section therefore resolves nothing
+/// but the last edit — which is how most third-party PDFs (anything signed,
+/// commented or filled elsewhere) reach us. This product's own writer happens
+/// to emit a complete table each time, which is why nothing noticed.
+///
+/// Entries from newer sections win. A `/Prev` that points forward, repeats an
+/// offset already visited, or chains further than `MAX_XREF_SECTIONS` stops the
+/// walk: a malformed file must not spin. [GR-7, GR-8]
+pub fn parse_xref_chain(data: &[u8], start: usize, leniency: &mut Vec<LeniencyEvent>)
+    -> Result<Vec<XrefEntry>, ScanError>
+{
+    /// A document with more updates than this is either pathological or
+    /// hostile; both are answered the same way.
+    const MAX_XREF_SECTIONS: usize = 64;
+
+    let mut merged: Vec<XrefEntry> = Vec::new();
+    let mut offset = Some(start);
+    let mut visited: Vec<usize> = Vec::new();
+
+    while let Some(current) = offset {
+        if visited.contains(&current) {
+            leniency.push(LeniencyEvent::new(
+                "xref-prev-loop",
+                "/Prev chain revisits a section; stopping",
+            ));
+            break;
+        }
+        if visited.len() >= MAX_XREF_SECTIONS {
+            leniency.push(LeniencyEvent::new(
+                "xref-prev-too-long",
+                "/Prev chain exceeds the section limit; stopping",
+            ));
+            break;
+        }
+        visited.push(current);
+
+        let section = match parse_xref_table(data, current, leniency) {
+            Ok(section) => section,
+            Err(error) => {
+                // The newest section failing is fatal; an older one failing
+                // leaves us with what we already merged, which is strictly
+                // better than nothing and is recorded.
+                if visited.len() == 1 {
+                    return Err(error);
+                }
+                leniency.push(LeniencyEvent::new(
+                    "xref-prev-unreadable",
+                    "an earlier xref section could not be parsed",
+                ));
+                break;
+            }
+        };
+
+        // Newer sections were merged first, so only fill gaps.
+        if merged.len() < section.len() {
+            merged.resize(section.len(), XrefEntry::default());
+        }
+        for (index, entry) in section.iter().enumerate() {
+            let known = merged[index].offset != 0 || merged[index].in_use;
+            if !known && (entry.offset != 0 || entry.in_use) {
+                merged[index] = *entry;
+            }
+        }
+
+        offset = match find_trailer(data, current)
+            .and_then(|trailer| parse_int_after_key(trailer, b"/Prev"))
+            .and_then(|prev| usize::try_from(prev).ok())
+        {
+            None => None,
+            // A /Prev must point backwards, into the file. Anything else is
+            // damage or malice; either way it is reported, not followed.
+            Some(prev) if prev < current && prev < data.len() => Some(prev),
+            Some(prev) => {
+                leniency.push(LeniencyEvent::new(
+                    "xref-prev-invalid",
+                    &format!("/Prev {prev} does not point backwards into the file"),
+                ));
+                None
+            }
+        };
+    }
+
+    Ok(merged)
+}
+
 pub(crate) fn parse_xref_table(
     data: &[u8],
     offset: usize,
@@ -410,6 +504,138 @@ pub(crate) fn skip_eol(data: &[u8], pos: &mut usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A base document plus a compact incremental update: the second section
+    /// lists only the object it changed, and points back with `/Prev`. This is
+    /// what Acrobat and every other editor writes; this product's own writer
+    /// emits a complete table each time, which is why nothing noticed that only
+    /// the newest section was ever read.
+    fn incrementally_updated_document() -> Vec<u8> {
+        use std::io::Write as _;
+        let mut bytes: Vec<u8> = b"%PDF-1.7
+".to_vec();
+        let mut offsets = Vec::new();
+        let objects: Vec<&[u8]> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ];
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            write!(bytes, "{} 0 obj
+", index + 1).unwrap();
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"
+endobj
+");
+        }
+        let first_xref = bytes.len();
+        write!(bytes, "xref
+0 {}
+", objects.len() + 1).unwrap();
+        bytes.extend_from_slice(b"0000000000 65535 f 
+");
+        for offset in &offsets {
+            writeln!(bytes, "{offset:010} 00000 n ").unwrap();
+        }
+        write!(
+            bytes,
+            "trailer
+<< /Size {} /Root 1 0 R >>
+startxref
+{first_xref}
+%%EOF
+",
+            objects.len() + 1
+        )
+        .unwrap();
+
+        // The update: object 3 only.
+        let updated_at = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>
+endobj
+",
+        );
+        let second_xref = bytes.len();
+        bytes.extend_from_slice(b"xref
+3 1
+");
+        writeln!(bytes, "{updated_at:010} 00000 n ").unwrap();
+        write!(
+            bytes,
+            "trailer
+<< /Size 4 /Root 1 0 R /Prev {first_xref} >>
+startxref
+{second_xref}
+%%EOF
+"
+        )
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn an_object_untouched_by_an_incremental_update_is_still_found() {
+        let data = incrementally_updated_document();
+        let mut leniency = Vec::new();
+        let offset = find_startxref(&data).expect("startxref");
+        let xref = parse_xref_chain(&data, offset, &mut leniency).expect("chain");
+
+        let catalog = fetch_object(&data, &xref, 1).expect("the catalog is in the first section");
+        assert!(
+            String::from_utf8_lossy(catalog).contains("/Type /Catalog"),
+            "resolved the wrong object: {:?}",
+            String::from_utf8_lossy(catalog)
+        );
+    }
+
+    #[test]
+    fn the_newest_section_wins_for_an_object_it_replaces() {
+        let data = incrementally_updated_document();
+        let mut leniency = Vec::new();
+        let offset = find_startxref(&data).expect("startxref");
+        let xref = parse_xref_chain(&data, offset, &mut leniency).expect("chain");
+
+        let page = fetch_object(&data, &xref, 3).expect("page object");
+        let text = String::from_utf8_lossy(page);
+        assert!(
+            text.contains("595 842"),
+            "an update must shadow the object it replaces, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_prev_pointing_at_itself_does_not_spin() {
+        // A hostile or damaged file must not hang the parser. [GR-7, GR-8]
+        let mut data = incrementally_updated_document();
+        let second_xref = find_startxref(&data).expect("startxref");
+        let trailer_at = data
+            .windows(7)
+            .rposition(|w| w == b"trailer")
+            .expect("trailer");
+        let replacement = format!("trailer
+<< /Size 4 /Root 1 0 R /Prev {second_xref} >>");
+        let end = data[trailer_at..]
+            .windows(2)
+            .position(|w| w == b">>")
+            .expect("dict end")
+            + trailer_at
+            + 2;
+        data.splice(trailer_at..end, replacement.bytes());
+
+        let mut leniency = Vec::new();
+        let offset = find_startxref(&data).expect("startxref");
+        let xref = parse_xref_chain(&data, offset, &mut leniency).expect("chain");
+
+        assert!(!xref.is_empty(), "the newest section must still be read");
+        assert!(
+            leniency.iter().any(|event| event.kind.contains("xref-prev")),
+            "a self-referential /Prev must be recorded, got {leniency:?}"
+        );
+    }
+
 
     /// Minimal hand-crafted 1-page PDF with no AcroForm/JS/sigs.
     /// Byte offsets are exact -- do not reformat this literal.
