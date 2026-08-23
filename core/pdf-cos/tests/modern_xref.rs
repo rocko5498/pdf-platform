@@ -15,7 +15,7 @@ use std::io::Write as _;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use pdf_cos::scan::{fetch_object_bytes, find_startxref, parse_xref_chain};
+use pdf_cos::scan::{fetch_object_bytes, find_startxref, parse_xref_chain, scan_bytes};
 
 fn deflate(data: &[u8]) -> Vec<u8> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -183,4 +183,113 @@ fn flate_decode_reads_a_zlib_stream() {
         data.windows(2).any(|w| w == [0x78, 0x9c] || w == [0x78, 0x01]),
         "the fixture must carry a zlib header, or it proves nothing"
     );
+}
+
+/// A document whose catalog, page tree, page and AcroForm all live inside an
+/// object stream — the ordinary shape of a modern filled-in form.
+fn modern_form_document() -> Vec<u8> {
+    let mut bytes: Vec<u8> = b"%PDF-1.6
+".to_vec();
+
+    let payload: Vec<(u32, &str)> = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        (6, "<< /FT /Tx /T (full_name) /V (Ada Lovelace) >>"),
+    ];
+    let mut header = String::new();
+    let mut body = String::new();
+    for (num, text) in &payload {
+        header.push_str(&format!("{num} {} ", body.len()));
+        body.push_str(text);
+        body.push(' ');
+    }
+    let first = header.len();
+    let compressed = deflate(format!("{header}{body}").as_bytes());
+
+    let objstm_at = bytes.len();
+    write!(
+        bytes,
+        "4 0 obj
+<< /Type /ObjStm /N {} /First {first} /Filter /FlateDecode /Length {} >>
+stream
+",
+        payload.len(),
+        compressed.len()
+    )
+    .unwrap();
+    bytes.extend_from_slice(&compressed);
+    bytes.extend_from_slice(b"
+endstream
+endobj
+");
+
+    // Objects 1, 2, 3 and 6 are type 2 in stream 4; 4 and 5 are ordinary.
+    let xref_at = bytes.len();
+    let mut table = Vec::new();
+    let mut push_type2 = |table: &mut Vec<u8>, index: u16| {
+        table.push(2u8);
+        table.extend_from_slice(&4u32.to_be_bytes());
+        table.extend_from_slice(&index.to_be_bytes());
+    };
+    let mut push_type1 = |table: &mut Vec<u8>, offset: usize| {
+        table.push(1u8);
+        table.extend_from_slice(&(offset as u32).to_be_bytes());
+        table.extend_from_slice(&0u16.to_be_bytes());
+    };
+    // 0 free
+    table.push(0u8);
+    table.extend_from_slice(&0u32.to_be_bytes());
+    table.extend_from_slice(&65535u16.to_be_bytes());
+    push_type2(&mut table, 0); // 1 catalog
+    push_type2(&mut table, 1); // 2 pages
+    push_type2(&mut table, 2); // 3 page
+    push_type1(&mut table, objstm_at); // 4 object stream
+    push_type1(&mut table, xref_at); // 5 xref stream
+    push_type2(&mut table, 3); // 6 field
+
+    let compressed_table = deflate(&table);
+    write!(
+        bytes,
+        "5 0 obj
+<< /Type /XRef /Size 7 /W [1 4 2] /Root 1 0 R /Filter /FlateDecode /Length {} >>
+stream
+",
+        compressed_table.len()
+    )
+    .unwrap();
+    bytes.extend_from_slice(&compressed_table);
+    bytes.extend_from_slice(b"
+endstream
+endobj
+");
+    write!(bytes, "startxref
+{xref_at}
+%%EOF
+").unwrap();
+    bytes
+}
+
+#[test]
+fn a_modern_document_reports_its_pages_and_its_form() {
+    // Resolving compressed objects only in `fetch_object_bytes` was not enough:
+    // `scan_bytes` builds the summary the whole product opens with, and it read
+    // objects the old way. A modern PDF therefore reported **no pages and no
+    // form** — worse than an error, because it looks like an answer.
+    // [FR-VIEW-2, FR-FORM-1, GR-8]
+    let data = modern_form_document();
+    let summary = scan_bytes(&data).expect("a modern document must open");
+
+    assert_eq!(summary.page_count, 1, "the page tree is inside the object stream");
+    assert!(summary.has_acroform, "the AcroForm is inside the object stream");
+}
+
+#[test]
+fn a_modern_documents_form_fields_are_readable() {
+    let data = modern_form_document();
+    let scan = pdf_cos::acroform::extract_acroform_fields(&data).expect("scan");
+
+    assert_eq!(scan.fields.len(), 1, "notes: {:?}", scan.notes);
+    assert_eq!(scan.fields[0].name, "full_name");
+    assert_eq!(scan.fields[0].value, "Ada Lovelace");
 }

@@ -83,12 +83,16 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
     let xref_offset = find_startxref(data).ok_or(ScanError::NoStartxref)?;
     // The whole chain, not just the newest section: see `parse_xref_chain`.
     let xref = parse_xref_chain(data, xref_offset, &mut leniency)?;
+    // Objects a PDF 1.5+ producer stored inside object streams: on such a
+    // document the catalog and the page tree are among them, so without this
+    // the summary reports a document with no pages. [FR-VIEW-2]
+    let inflated = InflatedObjects::decode(data, &xref, &mut leniency);
     // A `startxref` pointing nowhere has no trailer at that offset, and the
     // whole point of reconstruction is to open the file anyway: fall back to
     // the last trailer in the file, then to the catalog itself.
     // [SDS §10.4, FR-VIEW-2]
-    let trailer = match find_trailer(data, xref_offset) {
-        Some(trailer) => trailer.to_vec(),
+    let trailer = match section_dictionary(data, xref_offset) {
+        Some(trailer) => trailer,
         None => match last_trailer(data) {
             Some(trailer) => {
                 leniency.push(LeniencyEvent::new(
@@ -114,24 +118,24 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
             None => return Err(ScanError::NoRoot),
         },
     };
-    let catalog = fetch_object(data, &xref, root_ref.0).unwrap_or(b"");
+    let catalog = fetch_object(data, &inflated, &xref, root_ref.0).unwrap_or(b"");
 
     let has_acroform = find_key(catalog, b"/AcroForm").is_some();
     let has_xfa = find_key(catalog, b"/XFA").is_some()
         || (has_acroform
-            && fetch_key_dict(data, &xref, catalog, b"/AcroForm")
+            && fetch_key_dict(data, &inflated, &xref, catalog, b"/AcroForm")
                 .map(|d| find_key(d, b"/XFA").is_some())
                 .unwrap_or(false));
     let has_js =
-        find_key(catalog, b"/JS").is_some() || names_tree_has_javascript(data, &xref, catalog);
+        find_key(catalog, b"/JS").is_some() || names_tree_has_javascript(data, &inflated, &xref, catalog);
 
     let page_count = find_indirect_ref(catalog, b"/Pages")
-        .and_then(|(n, _)| fetch_object(data, &xref, n))
+        .and_then(|(n, _)| fetch_object(data, &inflated, &xref, n))
         .and_then(|obj| parse_int_after_key(obj, b"/Count"))
         .unwrap_or(0) as u32;
 
     let sig_count = if has_acroform {
-        count_sig_field_pattern(fetch_key_dict(data, &xref, catalog, b"/AcroForm").unwrap_or(b""))
+        count_sig_field_pattern(fetch_key_dict(data, &inflated, &xref, catalog, b"/AcroForm").unwrap_or(b""))
     } else {
         0
     };
@@ -245,9 +249,13 @@ fn parse_section(
         .collect())
 }
 
-/// The dictionary carrying a section's `/Prev`: the trailer for a classic
-/// table, the stream's own dictionary for an xref stream.
-fn section_dictionary(data: &[u8], offset: usize) -> Option<Vec<u8>> {
+/// The dictionary carrying a section's `/Prev` and `/Root`: the trailer for a
+/// classic table, the stream's own dictionary for an xref stream.
+///
+/// A document written entirely with xref streams has **no `trailer` keyword at
+/// all** — `/Root` lives in the stream dictionary — so a reader that insists on
+/// finding one rejects every modern PDF. [FR-VIEW-2, SDS §3.1]
+pub(crate) fn section_dictionary(data: &[u8], offset: usize) -> Option<Vec<u8>> {
     if data.get(offset..).is_some_and(|d| d.starts_with(b"xref")) {
         return find_trailer(data, offset).map(<[u8]>::to_vec);
     }
@@ -280,8 +288,9 @@ fn last_trailer(data: &[u8]) -> Option<Vec<u8>> {
 
 /// The number of the object typed `/Catalog`, for a file whose trailer is gone.
 fn find_catalog_object(data: &[u8], xref: &[XrefEntry]) -> Option<u32> {
+    let empty = InflatedObjects::default();
     (1..xref.len() as u32).find(|num| {
-        fetch_object(data, xref, *num)
+        fetch_object(data, &empty, xref, *num)
             .map(|object| {
                 find_key(object, b"/Type /Catalog").is_some()
                     || (find_key(object, b"/Catalog").is_some()
@@ -289,6 +298,115 @@ fn find_catalog_object(data: &[u8], xref: &[XrefEntry]) -> Option<u32> {
             })
             .unwrap_or(false)
     })
+}
+
+/// Bodies of the objects that live inside object streams, decoded once.
+///
+/// A PDF 1.5+ producer puts the catalog, the page tree and the AcroForm inside
+/// compressed object streams. `fetch_object` returns a slice of the file, so it
+/// cannot reach them: the summary reported a document with no pages and no
+/// form, which is worse than an error because it looks like an answer. This
+/// holds the decompressed bodies so a slice can be returned for those too.
+/// [FR-VIEW-2, SDS §3.1, GR-8]
+#[derive(Default)]
+pub struct InflatedObjects {
+    bodies: std::collections::HashMap<u32, Vec<u8>>,
+}
+
+/// How much decompressed object-stream content one document may produce.
+///
+/// Object streams are attacker-controlled input; a small file can declare a
+/// very large one. [GR-7]
+const MAX_INFLATED_BYTES: usize = 64 * 1024 * 1024;
+
+impl InflatedObjects {
+    /// Decode every object stream the cross-reference table refers to.
+    #[must_use]
+    pub fn decode(data: &[u8], xref: &[XrefEntry], leniency: &mut Vec<LeniencyEvent>) -> Self {
+        let mut bodies = std::collections::HashMap::new();
+        let mut total = 0usize;
+
+        // Which container holds which object numbers.
+        let mut containers: std::collections::HashMap<u32, Vec<(u32, u32)>> =
+            std::collections::HashMap::new();
+        for (num, entry) in xref.iter().enumerate() {
+            if let Some((container, index)) = entry.compressed {
+                containers
+                    .entry(container)
+                    .or_default()
+                    .push((num as u32, index));
+            }
+        }
+
+        for (container, mut members) in containers {
+            let Some(entry) = xref.get(container as usize) else {
+                continue;
+            };
+            if entry.compressed.is_some() {
+                continue;
+            }
+            let Some(body) = usize::try_from(entry.offset)
+                .ok()
+                .and_then(|offset| object_body_at(data, offset))
+            else {
+                continue;
+            };
+            let decoded = match crate::xref::decode_object_stream(body) {
+                Ok(decoded) => decoded,
+                Err(message) => {
+                    leniency.push(LeniencyEvent::new("object-stream-unreadable", &message));
+                    continue;
+                }
+            };
+            if total.saturating_add(decoded.bytes.len()) > MAX_INFLATED_BYTES {
+                leniency.push(LeniencyEvent::new(
+                    "object-streams-too-large",
+                    "decompressed object streams exceed the per-document limit",
+                ));
+                break;
+            }
+            total += decoded.bytes.len();
+
+            let (offsets, first) = &decoded.index;
+            members.sort_by_key(|(_, index)| *index);
+            for (num, index) in members {
+                let Some((_, relative)) = offsets.get(index as usize).copied() else {
+                    continue;
+                };
+                let Some(start) = first.checked_add(relative) else {
+                    continue;
+                };
+                let end = offsets
+                    .get(index as usize + 1)
+                    .and_then(|(_, next)| first.checked_add(*next))
+                    .unwrap_or(decoded.bytes.len())
+                    .min(decoded.bytes.len());
+                if let Some(slice) = decoded.bytes.get(start..end) {
+                    bodies.insert(num, slice.to_vec());
+                }
+            }
+        }
+
+        Self { bodies }
+    }
+
+    /// The body of a compressed object, if this holds it.
+    #[must_use]
+    pub fn body(&self, num: u32) -> Option<&[u8]> {
+        self.bodies.get(&num).map(Vec::as_slice)
+    }
+
+    /// How many objects were recovered from object streams.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Whether no compressed object was recovered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
 }
 
 /// Fetch a whole object — `N G obj … endobj` — following an object stream when
@@ -521,8 +639,16 @@ pub(crate) fn find_trailer<'a>(data: &'a [u8], xref_offset: usize) -> Option<&'a
 }
 
 /// Fetch the body of an indirect object by number (between obj/endobj).
-pub(crate) fn fetch_object<'a>(data: &'a [u8], xref: &[XrefEntry], num: u32) -> Option<&'a [u8]> {
+pub(crate) fn fetch_object<'a>(
+    data: &'a [u8],
+    inflated: &'a InflatedObjects,
+    xref: &[XrefEntry],
+    num: u32,
+) -> Option<&'a [u8]> {
     let entry = xref.get(num as usize)?;
+    if entry.compressed.is_some() {
+        return inflated.body(num);
+    }
     if !entry.in_use {
         return None;
     }
@@ -569,12 +695,13 @@ pub(crate) fn find_indirect_ref(data: &[u8], key: &[u8]) -> Option<(u32, u16)> {
 /// Follow an indirect ref from a named key and return the target object body.
 pub(crate) fn fetch_key_dict<'a>(
     data: &'a [u8],
+    inflated: &'a InflatedObjects,
     xref: &[XrefEntry],
     parent: &'a [u8],
     key: &[u8],
 ) -> Option<&'a [u8]> {
     if let Some((n, _)) = find_indirect_ref(parent, key) {
-        return fetch_object(data, xref, n);
+        return fetch_object(data, inflated, xref, n);
     }
     // The value may be a direct dictionary. PDF 32000-1 allows it wherever a
     // dictionary is expected — `/AcroForm << /Fields [...] >>` written inline
@@ -637,8 +764,13 @@ pub(crate) fn parse_int_after_key(data: &[u8], key: &[u8]) -> Option<i64> {
 }
 
 /// Check if the /Names tree in the catalog has a /JavaScript entry.
-fn names_tree_has_javascript(data: &[u8], xref: &[XrefEntry], catalog: &[u8]) -> bool {
-    fetch_key_dict(data, xref, catalog, b"/Names")
+fn names_tree_has_javascript(
+    data: &[u8],
+    inflated: &InflatedObjects,
+    xref: &[XrefEntry],
+    catalog: &[u8],
+) -> bool {
+    fetch_key_dict(data, inflated, xref, catalog, b"/Names")
         .map(|names| find_key(names, b"/JavaScript").is_some())
         .unwrap_or(false)
 }
@@ -768,7 +900,9 @@ startxref
         let offset = find_startxref(&data).expect("startxref");
         let xref = parse_xref_chain(&data, offset, &mut leniency).expect("chain");
 
-        let catalog = fetch_object(&data, &xref, 1).expect("the catalog is in the first section");
+        let inflated = InflatedObjects::default();
+        let catalog = fetch_object(&data, &inflated, &xref, 1)
+            .expect("the catalog is in the first section");
         assert!(
             String::from_utf8_lossy(catalog).contains("/Type /Catalog"),
             "resolved the wrong object: {:?}",
@@ -783,7 +917,8 @@ startxref
         let offset = find_startxref(&data).expect("startxref");
         let xref = parse_xref_chain(&data, offset, &mut leniency).expect("chain");
 
-        let page = fetch_object(&data, &xref, 3).expect("page object");
+        let inflated = InflatedObjects::default();
+        let page = fetch_object(&data, &inflated, &xref, 3).expect("page object");
         let text = String::from_utf8_lossy(page);
         assert!(
             text.contains("595 842"),

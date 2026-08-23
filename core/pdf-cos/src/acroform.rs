@@ -6,6 +6,7 @@
 
 use crate::scan::{
     fetch_key_dict, fetch_object, find_indirect_ref, find_key, find_startxref, find_trailer,
+    InflatedObjects,
     parse_uint, skip_ws, XrefEntry,
 };
 
@@ -89,9 +90,15 @@ pub fn extract_acroform_fields(data: &[u8]) -> Result<AcroFormScan, String> {
     for e in &leniency {
         notes.push(format!("leniency:{}:{}", e.kind, e.detail));
     }
-    let trailer = find_trailer(data, xref_offset).ok_or_else(|| "no trailer".to_string())?;
-    let root_ref = find_indirect_ref(trailer, b"/Root").ok_or_else(|| "no /Root".to_string())?;
-    let catalog = fetch_object(data, &xref, root_ref.0).unwrap_or(b"");
+    // Objects a PDF 1.5+ producer put inside object streams — which on such a
+    // document is where the AcroForm and its fields live. [FR-FORM-1]
+    let inflated = InflatedObjects::decode(data, &xref, &mut leniency);
+    // The xref stream's own dictionary for a modern document, which has no
+    // `trailer` keyword at all; the trailer for a classic one. [FR-VIEW-2]
+    let trailer = crate::scan::section_dictionary(data, xref_offset)
+        .ok_or_else(|| "no trailer".to_string())?;
+    let root_ref = find_indirect_ref(&trailer, b"/Root").ok_or_else(|| "no /Root".to_string())?;
+    let catalog = fetch_object(data, &inflated, &xref, root_ref.0).unwrap_or(b"");
     if find_key(catalog, b"/AcroForm").is_none() {
         return Ok(AcroFormScan {
             notes,
@@ -99,7 +106,7 @@ pub fn extract_acroform_fields(data: &[u8]) -> Result<AcroFormScan, String> {
         });
     }
 
-    let acro: &[u8] = match fetch_key_dict(data, &xref, catalog, b"/AcroForm") {
+    let acro: &[u8] = match fetch_key_dict(data, &inflated, &xref, catalog, b"/AcroForm") {
         Some(d) => d,
         None => {
             notes.push("AcroForm present but not fetchable as indirect dict".into());
@@ -113,8 +120,8 @@ pub fn extract_acroform_fields(data: &[u8]) -> Result<AcroFormScan, String> {
     let need_appearances = find_pdf_key(acro, b"/NeedAppearances").is_some()
         && parse_bool_after_key(acro, b"/NeedAppearances").unwrap_or(true);
 
-    let page_map = build_page_object_map(data, &xref, catalog);
-    let field_refs = collect_field_refs(data, &xref, acro, &mut notes);
+    let page_map = build_page_object_map(data, &inflated, &xref, catalog);
+    let field_refs = collect_field_refs(data, &inflated, &xref, acro, &mut notes);
     let mut fields = Vec::new();
     let mut tab = 0u32;
     let mut visited = std::collections::HashSet::new();
@@ -122,6 +129,7 @@ pub fn extract_acroform_fields(data: &[u8]) -> Result<AcroFormScan, String> {
     for obj_num in field_refs {
         walk_field(
             data,
+            &inflated,
             &xref,
             obj_num,
             "",
@@ -146,11 +154,12 @@ pub fn extract_acroform_fields(data: &[u8]) -> Result<AcroFormScan, String> {
 
 fn build_page_object_map(
     data: &[u8],
+    inflated: &InflatedObjects,
     xref: &[XrefEntry],
     catalog: &[u8],
 ) -> std::collections::HashMap<u32, u32> {
     let mut map = std::collections::HashMap::new();
-    let Some(pages) = fetch_key_dict(data, xref, catalog, b"/Pages") else {
+    let Some(pages) = fetch_key_dict(data, inflated, xref, catalog, b"/Pages") else {
         return map;
     };
     let mut stack = vec![pages.to_vec()];
@@ -172,7 +181,7 @@ fn build_page_object_map(
         }
         // Walk Kids refs and assign indices to leaf pages.
         for kid in parse_ref_array_after_key(&node, b"/Kids") {
-            if let Some(body) = fetch_object(data, xref, kid) {
+            if let Some(body) = fetch_object(data, inflated, xref, kid) {
                 let is_pages = find_key(body, b"/Kids").is_some()
                     && find_key(body, b"/Count").is_some()
                     && find_key(body, b"/MediaBox").is_none();
@@ -201,13 +210,14 @@ fn body_contains_name(body: &[u8], name: &[u8]) -> bool {
 
 fn collect_field_refs(
     data: &[u8],
+    inflated: &InflatedObjects,
     xref: &[XrefEntry],
     acro: &[u8],
     notes: &mut Vec<String>,
 ) -> Vec<u32> {
     if let Some((n, _)) = find_indirect_ref(acro, b"/Fields") {
         // Single indirect array object.
-        if let Some(arr_obj) = fetch_object(data, xref, n) {
+        if let Some(arr_obj) = fetch_object(data, inflated, xref, n) {
             return parse_ref_array_bytes(arr_obj);
         }
         notes.push(format!("/Fields ref {n} not fetchable"));
@@ -218,6 +228,7 @@ fn collect_field_refs(
 
 fn walk_field(
     data: &[u8],
+    inflated: &InflatedObjects,
     xref: &[XrefEntry],
     obj_num: u32,
     parent_name: &str,
@@ -235,7 +246,7 @@ fn walk_field(
     if !visited.insert(obj_num) {
         return;
     }
-    let Some(body) = fetch_object(data, xref, obj_num) else {
+    let Some(body) = fetch_object(data, inflated, xref, obj_num) else {
         notes.push(format!("field obj {obj_num} missing"));
         return;
     };
@@ -254,7 +265,8 @@ fn walk_field(
         // Intermediate node — inherit name, walk kids.
         for k in kids {
             walk_field(
-                data, xref, k, &name, depth + 1, page_map, out, tab, visited, notes,
+                data, inflated, xref, k, &name, depth + 1, page_map, out, tab, visited,
+                notes,
             );
         }
         // Parent may also hold /V for terminal radio groups — if no kids produced leaves with this name, emit.
