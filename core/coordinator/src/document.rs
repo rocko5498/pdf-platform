@@ -808,7 +808,48 @@ impl DocumentCoordinator {
         query: &str,
         page_indices: &[u32],
     ) -> Vec<text_extract::PageSearchResult> {
-        self.text_service.find_in_cached_pages(query, page_indices)
+        // Matching runs through `search::find_all`, which applies the
+        // normalization FR-SRCH-1 requires: ligature folding, soft-hyphen
+        // elision, case and diacritic handling.
+        //
+        // This used to call `TextExtractionService::find_in_cached_pages`,
+        // which uses `PageTextModel::find_all` — literal substring matching.
+        // The product's search therefore did none of what the `search` crate
+        // exists to do: typing "cooperate" did not find "co<U+00AD>operate"
+        // on the page, and nothing caught it because `search`'s tests run over
+        // hand-written models rather than a document.
+        //
+        // The service cannot call `search` itself: `search` depends on
+        // `text-extract`, so the normalizing matcher sits above it. The
+        // coordinator sees both, which makes this the layer that can.
+        // [FR-SRCH-1, ADR-019, PRIN-6]
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let options = search::FindOptions::default();
+        let mut results = Vec::new();
+        for &page_index in page_indices {
+            let Some(model) = self.text_service.get_cached(page_index) else {
+                continue;
+            };
+            let matches: Vec<engine_api::extract::MatchLocation> =
+                search::find_all(model, query, &options)
+                    .into_iter()
+                    .map(|found| engine_api::extract::MatchLocation {
+                        line_index: found.line_index,
+                        char_offset: found.char_offset,
+                        char_len: found.char_len,
+                    })
+                    .collect();
+            if !matches.is_empty() {
+                results.push(text_extract::PageSearchResult {
+                    page_index,
+                    matches,
+                    reliable: model.reliable,
+                });
+            }
+        }
+        results
     }
 
     /// Number of pages currently held in the text cache.

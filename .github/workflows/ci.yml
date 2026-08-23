@@ -193,6 +193,11 @@ jobs:
       # parser survives in-process; this proves the real path does, where a
       # panic in Z1 reaches the coordinator only as a dead transport.
       # [SDS §10.6, SDS §14, PRIN-1, GR-8]
+      # FR-SRCH-1/2: a user typing a word must find it, in a real document,
+      # with a location the UI can draw.
+      - name: Search over a real document (M2)
+        run: cargo test -p coordinator --test search_e2e
+
       - name: Malformed documents never kill the worker (M1)
         run: cargo test -p coordinator --test malformed_open_e2e
 

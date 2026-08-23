@@ -73,24 +73,38 @@ impl PageTextModel {
 
     /// Find all occurrences of a query (case-insensitive) and return their
     /// line and character offsets.
+    ///
+    /// This is literal substring matching. It applies **none** of the
+    /// normalization FR-SRCH-1 requires — ligature folding, soft-hyphen
+    /// elision, diacritics — so product search goes through
+    /// `search::find_all` instead. This remains for callers that genuinely
+    /// want the raw text.
+    ///
+    /// Offsets are in **characters**, as the field names say. They were byte
+    /// offsets: on any line containing a multi-byte character the values were
+    /// wrong, and `start + 1` advanced by one byte, so the next slice landed
+    /// inside a codepoint and panicked — reachable from any document with
+    /// non-ASCII text and a search box. [FR-SRCH-1, FR-SRCH-2, PRIN-1]
     pub fn find_all(&self, query: &str) -> Vec<MatchLocation> {
         if query.is_empty() {
             return Vec::new();
         }
-        let query_lower = query.to_lowercase();
+        let query_lower: Vec<char> = query.to_lowercase().chars().collect();
         let mut results = Vec::new();
 
         for line in &self.lines {
-            let line_lower = line.text.to_lowercase();
-            let mut start = 0;
-            while let Some(pos) = line_lower[start..].find(&query_lower) {
-                let absolute = start + pos;
-                results.push(MatchLocation {
-                    line_index: line.index,
-                    char_offset: absolute as u32,
-                    char_len: query.len() as u32,
-                });
-                start = absolute + 1;
+            let haystack: Vec<char> = line.text.to_lowercase().chars().collect();
+            if query_lower.len() > haystack.len() {
+                continue;
+            }
+            for start in 0..=(haystack.len() - query_lower.len()) {
+                if haystack[start..start + query_lower.len()] == query_lower[..] {
+                    results.push(MatchLocation {
+                        line_index: line.index,
+                        char_offset: start as u32,
+                        char_len: query_lower.len() as u32,
+                    });
+                }
             }
         }
 
@@ -147,6 +161,63 @@ pub trait Extract: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn matching_multibyte_text_does_not_panic() {
+        // `find_all` sliced the line by byte index and advanced `start + 1`
+        // byte at a time, so the next slice landed inside a codepoint and
+        // panicked — reachable from any document with non-ASCII text and a
+        // search box. [PRIN-1, FR-SRCH-1]
+        let model = PageTextModel {
+            page_index: 0,
+            lines: vec![TextLine {
+                index: 0,
+                text: "\u{E000}\u{E001}\u{E002}".to_owned(),
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                spans: Vec::new(),
+            }],
+            reliable: false,
+            char_count: 3,
+            has_structure: false,
+        };
+        let hits = model.find_all("\u{E000}");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].char_offset, 0);
+        assert_eq!(hits[0].char_len, 1);
+    }
+
+    #[test]
+    fn offsets_are_characters_not_bytes() {
+        // The fields are named char_offset and char_len. They held byte values,
+        // so every consumer that mapped a match back onto the page — selection
+        // rectangles, highlight geometry — was wrong on any non-ASCII line.
+        let model = PageTextModel {
+            page_index: 0,
+            lines: vec![TextLine {
+                index: 0,
+                text: "\u{6587}\u{5B57}needle".to_owned(),
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                spans: Vec::new(),
+            }],
+            reliable: true,
+            char_count: 8,
+            has_structure: false,
+        };
+        let hits = model.find_all("needle");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].char_offset, 2,
+            "two CJK characters precede the match, not six bytes"
+        );
+        assert_eq!(hits[0].char_len, 6);
+    }
+
     use super::*;
 
     #[test]
