@@ -134,7 +134,11 @@ fn char_safe_slice<'a>(s: &'a str, start: usize, len: usize) -> &'a str {
 
 /// Normalize text for searching: lowercase, fold common ligatures,
 /// elide soft hyphens.
-fn normalize_for_search(text: &str) -> String {
+///
+/// Public because the cross-document index has to apply exactly this to both
+/// the text it stores and the queries it runs. Two normalizers would drift,
+/// and a document searched two ways would answer differently. [FR-SRCH-1]
+pub fn normalize_for_search(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     for ch in text.to_lowercase().chars() {
         match ch {
