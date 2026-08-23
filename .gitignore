@@ -49,6 +49,8 @@ Thumbs.db
 .serena/
 .mimocode/
 .claude/
+AGENTS.md
+CLAUDE.md
 # Local vector/index caches — may contain indexed source; never commit (GIT-5)
 ruvector.db
 .codebase-memory/
