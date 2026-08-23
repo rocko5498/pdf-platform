@@ -9,6 +9,10 @@ Run before tagging a release. Do **not** invent numbers — attach real outputs.
 ```bash
 python tools/provision_engine.py   # installs the pinned PDFium; verifies SHA-256
 cd core
+# Without these, the OCR and qpdf suites *skip themselves* when the tool is
+# absent and still report success. CI sets both; a release check run by hand
+# without them proves less than it appears to. [T-11, GR-8]
+export PDF_PLATFORM_REQUIRE_OCR=1 PDF_PLATFORM_REQUIRE_QPDF=1
 cargo test --workspace
 cargo run -q -p corpus-diff
 cargo test -p pdf-model --test interop_matrix
