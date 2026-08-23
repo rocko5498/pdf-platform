@@ -136,7 +136,13 @@ impl CrossDocumentIndex {
                 self.revision_field => record.revision,
                 self.page_field => u64::from(record.page),
                 self.reliable_field => u64::from(record.reliable),
-                self.text_field => record.text.clone(),
+                // Indexed normalized, so the ligature folding, case folding
+                // and soft-hyphen elision that `find` applies inside an open
+                // document apply here too. Storing raw text and querying it
+                // through Tantivy's default tokenizer meant `cooperate` did
+                // not find `co\u{ad}operate` across documents while it did
+                // inside one. [FR-SRCH-1, FR-SRCH-IDX-1]
+                self.text_field => crate::normalize_for_search(&record.text),
             ))
             .map_err(|e| TantivyBackendError::Backend(e.to_string()))?;
         self.writer
@@ -164,8 +170,9 @@ impl CrossDocumentIndex {
             .map_err(|e| TantivyBackendError::Backend(e.to_string()))?;
         let searcher = reader.searcher();
         let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
+        // The same normalization the indexed text went through.
         let parsed = parser
-            .parse_query(query)
+            .parse_query(&crate::normalize_for_search(query))
             .map_err(|e| TantivyBackendError::Query(e.to_string()))?;
         let top = searcher
             .search(&parsed, &TopDocs::with_limit(limit))
@@ -264,6 +271,55 @@ mod tests {
             char_count: text.chars().count() as u32,
             has_structure: false,
         }
+    }
+
+    /// The cross-document index answered differently from the same search
+    /// inside an open document: `find` normalizes (case, ligatures, soft
+    /// hyphens) and the index stored raw text queried through Tantivy's
+    /// default tokenizer. One product, one query, two answers.
+    /// [FR-SRCH-1, FR-SRCH-IDX-1, PRIN-6]
+    #[test]
+    fn the_index_finds_what_an_open_document_finds() {
+        let dir = temp_index_dir("normalization");
+        let mut index = CrossDocumentIndex::open_or_create(&dir).unwrap();
+
+        // A soft hyphen from a line break, and an fi ligature: both routine in
+        // real PDFs, both invisible to a reader typing the plain word.
+        let page_text = format!(
+            "they agreed to co{}operate on the {}nal draft",
+            '\u{ad}',  // soft hyphen, as a line break leaves behind
+            '\u{fb01}' // fi ligature
+        );
+        index
+            .upsert(&IndexRecord {
+                source: [7; 16],
+                revision: 1,
+                page: 3,
+                text: page_text.clone(),
+                reliable: true,
+            })
+            .unwrap();
+
+        for query in ["cooperate", "final", "COOPERATE"] {
+            let hits = index.search(query, 10).unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "the index missed '{query}' in {page_text:?}"
+            );
+            assert_eq!(hits[0].page, 3);
+        }
+
+        // And the in-document matcher agrees, which is the point.
+        let page = model(3, &page_text);
+        for query in ["cooperate", "final", "COOPERATE"] {
+            assert!(
+                !crate::find_all(&page, query, &crate::FindOptions::default()).is_empty(),
+                "the in-document matcher missed '{query}', so this test proves nothing"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
