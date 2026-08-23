@@ -170,6 +170,21 @@ fn thumbnail_crosses_document_bound_utility_process() {
     let thumbnail = decode_thumbnail_result(&bytes).unwrap();
     assert_eq!(thumbnail.page, 0);
     assert!(thumbnail.is_current(6, 4));
+
+    // The descriptor says a thumbnail was produced. Whether one was *drawn* is
+    // a separate claim: the pixels live in the shared region, and nothing here
+    // had ever looked at them. An untouched region is all zeros, which is
+    // indistinguishable from a rendered black square — so require the opaque
+    // white this blank fixture must produce. [FR-VIEW-3, PRIN-1, GR-8]
+    let pixels = pool
+        .inspect_shared_memory(0, |region| region[..(16 * 16 * 4) as usize].to_vec())
+        .expect("worker 0 exists");
+    assert!(
+        pixels.chunks_exact(4).all(|px| px == [255u8, 255, 255, 255]),
+        "the thumbnail region does not hold a rendered blank page; first pixels: {:?}",
+        &pixels[..16.min(pixels.len())]
+    );
+
     let _ = std::fs::remove_file(path);
 }
 
