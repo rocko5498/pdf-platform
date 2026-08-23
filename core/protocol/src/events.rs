@@ -1042,6 +1042,7 @@ mod tests {
         let event = WorkerEvent::Summary {
             correlation_id: 99,
             summary: StructuralSummary {
+                root_obj_num: 1,
                 page_count: 42,
                 has_acroform: true,
                 has_xfa: false,

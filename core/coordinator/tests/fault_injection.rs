@@ -260,6 +260,7 @@ fn fault_inject_incremental_save_preserves_untouched() {
         8,
         &original_offsets,
         original_bytes.len() as u32,
+        &pdf_write::TrailerInfo { root_obj_num: 1, ..Default::default() },
     ).expect("incremental write");
 
     assert!(result.objects_written >= 2);
@@ -474,6 +475,7 @@ fn fault_inject_incremental_save_preserves_signatures() {
         5,
         &original_offsets,
         original_bytes.len() as u32,
+        &pdf_write::TrailerInfo { root_obj_num: 1, ..Default::default() },
     ).expect("incremental write");
 
     // The signature object bytes must appear in the output at their

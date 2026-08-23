@@ -220,6 +220,7 @@ mod tests {
         offsets.insert(1, 100);
         offsets.insert(3, 250);
         let s = StructuralSummary {
+            root_obj_num: 1,
             page_count: 3,
             has_acroform: true,
             has_xfa: false,

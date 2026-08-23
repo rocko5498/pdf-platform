@@ -232,6 +232,7 @@ mod tests {
             5,   // next obj num is 5
             &offsets,
             0,   // original_len: writing to empty buffer
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         assert!(result.objects_written >= 2);
@@ -259,6 +260,7 @@ mod tests {
             5,
             &offsets,
             0,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         let text = String::from_utf8_lossy(&output);
@@ -291,6 +293,7 @@ mod tests {
             3,
             &HashMap::new(),
             0,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         assert_eq!(result.objects_written, 0);
@@ -312,6 +315,7 @@ mod tests {
             2,
             &HashMap::new(),
             0,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         // The xref_offset should equal the byte position of "xref\n" in the output.
@@ -340,6 +344,7 @@ endobj
             2,
             &HashMap::new(),
             0,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
         )
         .unwrap();
 

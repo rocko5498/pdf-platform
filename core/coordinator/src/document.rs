@@ -1629,6 +1629,7 @@ mod tests {
             2,
             &std::collections::HashMap::new(),
             0,
+            &pdf_write::TrailerInfo { root_obj_num: 1, ..Default::default() },
         ).unwrap();
 
         assert_eq!(result.objects_written, 1);
