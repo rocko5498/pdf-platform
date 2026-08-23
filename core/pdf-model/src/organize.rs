@@ -58,52 +58,59 @@ impl Command for DeletePagesCommand {
     }
 }
 
-/// Rotate one or more pages by 90-degree increments.
+/// Set a page's `/Rotate` to `rotation`, preserving every other key.
 ///
-/// Modifies the /Rotate entry of each affected page object.
-#[derive(Debug, Clone)]
-pub struct RotatePagesCommand {
-    /// (page_index, rotation_delta) pairs. Delta is +90, +180, or +270.
-    pub rotations: Vec<(u32, u32)>,
-    /// Page object numbers and their original rotation values.
-    pub page_obj_rotations: Vec<(u32, u32)>,
-    /// New rotation values after the operation.
-    pub new_rotations: Vec<(u32, u32)>,
+/// Rotation used to be applied by writing `N 0 obj << /Rotate D >> endobj`
+/// over the page object, replacing /Type, /Parent, /MediaBox, /Contents and
+/// /Resources with nothing at all: a rotated page would have lost its
+/// content. It never fired only because the caller passed page object numbers
+/// where the builder matched page indices, so the rotation applied to no page
+/// and silently did nothing. [FR-ROTATE, ADR-012, PRIN-1, GR-8]
+pub fn set_page_rotation(page_bytes: &[u8], rotation: u32) -> Result<Vec<u8>, String> {
+    let text = String::from_utf8_lossy(page_bytes).to_string();
+    let dict_end = text
+        .rfind(">>")
+        .ok_or_else(|| "page object has no dictionary end".to_string())?;
+
+    if let Some(at) = text.find("/Rotate") {
+        let after = at + "/Rotate".len();
+        let rest = &text[after..];
+        let value_start = after
+            + rest
+                .find(|c: char| !c.is_ascii_whitespace())
+                .ok_or_else(|| "/Rotate has no value".to_string())?;
+        let value_end = value_start
+            + text[value_start..]
+                .find(|c: char| !(c.is_ascii_digit() || c == '-' || c == '+'))
+                .ok_or_else(|| "/Rotate value never ends".to_string())?;
+        let mut patched = String::with_capacity(text.len() + 8);
+        patched.push_str(&text[..at]);
+        patched.push_str(&format!("/Rotate {rotation}"));
+        patched.push_str(&text[value_end..]);
+        return Ok(patched.into_bytes());
+    }
+
+    let mut patched = String::with_capacity(text.len() + 16);
+    patched.push_str(&text[..dict_end]);
+    patched.push_str(&format!("/Rotate {rotation} "));
+    patched.push_str(&text[dict_end..]);
+    Ok(patched.into_bytes())
 }
 
-impl Command for RotatePagesCommand {
-    fn name(&self) -> &str {
-        "RotatePages"
-    }
-
-    fn apply(&self, overlay: &mut CowOverlay) -> Result<(), CommandError> {
-        for &(obj_num, new_rot) in &self.new_rotations {
-            let rot_bytes = format!("{} 0 obj\n<< /Rotate {} >>\nendobj\n", obj_num, new_rot);
-            overlay.set_object(obj_num, rot_bytes.into_bytes());
-        }
-        Ok(())
-    }
-
-    fn undo(&self, overlay: &mut CowOverlay) -> Result<(), CommandError> {
-        for &(obj_num, old_rot) in &self.page_obj_rotations {
-            let rot_bytes = format!("{} 0 obj\n<< /Rotate {} >>\nendobj\n", obj_num, old_rot);
-            overlay.set_object(obj_num, rot_bytes.into_bytes());
-        }
-        Ok(())
-    }
-
-    fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        use std::io::Write;
-        for ((page, _delta), (_obj, new_rot)) in self.rotations.iter().zip(self.new_rotations.iter()) {
-            let _ = writeln!(buf, "PAGE:{page}:ROT:{new_rot}");
-        }
-        buf
-    }
-
-    fn box_clone(&self) -> Box<dyn Command> {
-        Box::new(self.clone())
-    }
+/// Read a page's current `/Rotate`, defaulting to 0.
+#[must_use]
+pub fn page_rotation(page_bytes: &[u8]) -> u32 {
+    let text = String::from_utf8_lossy(page_bytes);
+    let Some(at) = text.find("/Rotate") else {
+        return 0;
+    };
+    text[at + "/Rotate".len()..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
 }
 
 /// Helper to build a delete-pages command group.
@@ -177,50 +184,38 @@ pub fn build_delete_pages_group(
     Ok(group)
 }
 
-/// Helper to build a rotate-pages command group.
+/// Build a rotate-pages command group, patching each page in place.
 ///
-/// Given page object numbers and their current rotations, produces
-/// a CommandGroup that applies the rotation delta.
+/// `pages` is `(object number, current page bytes)` for every page to rotate.
+/// The bytes are required for two reasons: rotation must preserve the rest of
+/// the page dictionary, and undo must restore exactly what was there.
+///
+/// The previous signature took page *indices* alongside a list the caller
+/// populated with page *object numbers*, and matched one against the other — so
+/// the lookup never succeeded and rotation silently did nothing. Taking the
+/// pages themselves removes the mismatch rather than documenting it.
+/// [FR-ROTATE, ADR-012, PRIN-1]
 pub fn build_rotate_pages_group(
-    page_indices: &[u32],
-    page_obj_rotations: &[(u32, u32)], // (page_index, current_rotation)
+    pages: &[(u32, Vec<u8>)],
     degrees: u32,
 ) -> Result<CommandGroup, String> {
-    if page_indices.is_empty() {
+    if pages.is_empty() {
         return Err("no pages to rotate".into());
     }
     if !matches!(degrees, 90 | 180 | 270) {
         return Err(format!("invalid rotation: {degrees} (must be 90, 180, or 270)"));
     }
 
-    let rotations: Vec<(u32, u32)> = page_indices.iter()
-        .map(|&idx| (idx, degrees))
-        .collect();
-
-    let new_rotations: Vec<(u32, u32)> = page_indices.iter()
-        .filter_map(|&idx| {
-            page_obj_rotations.iter()
-                .find(|(page, _)| *page == idx)
-                .map(|(_, current)| (idx, (current + degrees) % 360))
-        })
-        .collect();
-
-    let page_obj_rotations_owned: Vec<(u32, u32)> = page_indices.iter()
-        .filter_map(|&idx| {
-            page_obj_rotations.iter()
-                .find(|(page, _)| *page == idx)
-                .map(|(_, current)| (idx, *current))
-        })
-        .collect();
-
-    let cmd = RotatePagesCommand {
-        rotations,
-        page_obj_rotations: page_obj_rotations_owned,
-        new_rotations,
-    };
-
-    let mut group = CommandGroup::new(format!("Rotate {} page(s) by {degrees}°", page_indices.len()));
-    group.push(Box::new(cmd));
+    let mut group = CommandGroup::new(format!("Rotate {} page(s) by {degrees}°", pages.len()));
+    for (obj_num, page_bytes) in pages {
+        let rotation = (page_rotation(page_bytes) + degrees) % 360;
+        let new_bytes = set_page_rotation(page_bytes, rotation)?;
+        group.push(Box::new(crate::command::SetObjectCommand {
+            obj_num: *obj_num,
+            new_bytes,
+            old_bytes: Some(page_bytes.clone()),
+        }));
+    }
     Ok(group)
 }
 
