@@ -564,6 +564,17 @@ fn cmd_split(path: &Path, rest: &[String]) {
     }
 }
 
+/// Page numbers are 1-based and ordered.
+fn check_page_range(first: u32, last: u32) -> Result<(), String> {
+    if first == 0 || last == 0 {
+        return Err("page numbers are 1-based; 0 is not a page".into());
+    }
+    if first > last {
+        return Err(format!("first page {first} is after last page {last}"));
+    }
+    Ok(())
+}
+
 fn cmd_extract_pages(path: &Path, rest: &[String]) {
     use pdf_model::assembly_ops::extract_pages;
     // extract-pages <file> <first> <last> -o out
@@ -571,8 +582,24 @@ fn cmd_extract_pages(path: &Path, rest: &[String]) {
         eprintln!("error: extract-pages requires <first> <last> -o <out>");
         process::exit(1);
     }
-    let first: u32 = rest[0].parse().unwrap_or(0);
-    let last: u32 = rest[1].parse().unwrap_or(0);
+    // `unwrap_or(0)` turned `extract-pages doc.pdf two four` into the range
+    // 0..0, so the complaint came from somewhere further down and named
+    // numbers the user never typed. [UX-ERR-3]
+    let parse_page = |value: &str, what: &str| -> u32 {
+        match value.trim().parse() {
+            Ok(page) => page,
+            Err(_) => {
+                eprintln!("error: {what} page must be a number, got '{value}'");
+                process::exit(1);
+            }
+        }
+    };
+    let first = parse_page(&rest[0], "first");
+    let last = parse_page(&rest[1], "last");
+    if let Err(error) = check_page_range(first, last) {
+        eprintln!("error: {error}");
+        process::exit(1);
+    }
     let (_, out) = match parse_dash_o(&rest[2..]) {
         Ok(v) => v,
         Err(e) => {
@@ -1821,11 +1848,29 @@ fn cmd_batch(pipeline_path: &Path) {
         } else if let Some(val) = line.strip_prefix("output_dir=") {
             current_output_dir = Some(PathBuf::from(val));
         } else if let Some(val) = line.strip_prefix("pages_per_file=") {
-            current_pages_per_file = val.parse().unwrap_or(2);
+            current_pages_per_file = match batch_number(val, "pages_per_file") {
+                Ok(value) => value as u32,
+                Err(error) => {
+                    eprintln!("error: {}: {error}", pipeline_path.display());
+                    process::exit(1);
+                }
+            };
         } else if let Some(val) = line.strip_prefix("first=") {
-            current_first = val.parse().unwrap_or(1);
+            current_first = match batch_number(val, "first") {
+                Ok(value) => value as u32,
+                Err(error) => {
+                    eprintln!("error: {}: {error}", pipeline_path.display());
+                    process::exit(1);
+                }
+            };
         } else if let Some(val) = line.strip_prefix("last=") {
-            current_last = val.parse().unwrap_or(1);
+            current_last = match batch_number(val, "last") {
+                Ok(value) => value as u32,
+                Err(error) => {
+                    eprintln!("error: {}: {error}", pipeline_path.display());
+                    process::exit(1);
+                }
+            };
         } else if let Some(val) = line.strip_prefix("text=") {
             current_text = Some(val.to_string());
         } else if let Some(val) = line.strip_prefix("lang=") {
@@ -1835,9 +1880,21 @@ fn cmd_batch(pipeline_path: &Path) {
         } else if let Some(val) = line.strip_prefix("profile=") {
             current_profile = Some(val.to_string());
         } else if let Some(val) = line.strip_prefix("start=") {
-            current_start = val.parse().unwrap_or(1);
+            current_start = match batch_number(val, "start") {
+                Ok(value) => value as u32,
+                Err(error) => {
+                    eprintln!("error: {}: {error}", pipeline_path.display());
+                    process::exit(1);
+                }
+            };
         } else if let Some(val) = line.strip_prefix("width=") {
-            current_width = val.parse().unwrap_or(6);
+            current_width = match batch_number(val, "width") {
+                Ok(value) => value as usize,
+                Err(error) => {
+                    eprintln!("error: {}: {error}", pipeline_path.display());
+                    process::exit(1);
+                }
+            };
         } else {
             // A key this parser does not know is a typo, and skipping it
             // quietly produces a step built from defaults — or no step at all
@@ -2158,6 +2215,18 @@ fn cmd_index(args: &[String]) {
 
 fn hex_id(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parse a numeric value from a pipeline file.
+///
+/// These used to be `val.parse().unwrap_or(default)`, so `pages_per_file=abc`
+/// silently split every 2 pages and the run reported success for a document
+/// nobody asked for. [GR-8, UX-ERR-3]
+fn batch_number(value: &str, key: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    trimmed
+        .parse::<u64>()
+        .map_err(|_| format!("{key}= must be a whole number, got '{trimmed}'"))
 }
 
 /// Turn one parsed stanza into a pipeline step.
@@ -2690,6 +2759,33 @@ mod batch_tests {
             false, 1, 6, root,
         )?;
         Ok(pipeline)
+    }
+
+    #[test]
+    fn a_numeric_field_that_is_not_a_number_is_an_error() {
+        // `val.parse().unwrap_or(2)` turned `pages_per_file=abc` into a split
+        // every 2 pages, and the run reported success. [GR-8]
+        let error = batch_number("abc", "pages_per_file").expect_err("not a number");
+        assert!(error.contains("pages_per_file="), "{error}");
+        assert!(error.contains("abc"), "the message must quote what was read: {error}");
+
+        assert_eq!(batch_number(" 12 ", "first").unwrap(), 12, "surrounding space is fine");
+        assert!(batch_number("-1", "start").is_err(), "a negative count is not a page count");
+        assert!(batch_number("", "width").is_err(), "an empty value is not a default");
+        assert!(batch_number("3.5", "last").is_err(), "a page count is a whole number");
+    }
+
+    #[test]
+    fn an_impossible_page_range_is_refused_before_the_work_starts() {
+        assert!(check_page_range(1, 5).is_ok());
+        assert!(
+            check_page_range(0, 5).unwrap_err().contains("1-based"),
+            "page 0 does not exist"
+        );
+        assert!(
+            check_page_range(9, 2).unwrap_err().contains("after"),
+            "a reversed range is a mistake, not an empty result"
+        );
     }
 
     #[test]
