@@ -169,7 +169,10 @@ jobs:
 
       - name: Test workspace
         env:
+          # Both tools are installed above, so their tests must prove the
+          # capability rather than tolerate its absence. [ADR-022, GR-8]
           PDF_PLATFORM_REQUIRE_OCR: "1"
+          PDF_PLATFORM_REQUIRE_QPDF: "1"
         run: cargo test --workspace
 
       - name: Run corpus-diff gate
