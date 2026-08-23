@@ -65,9 +65,15 @@ pub fn inject_content_ref_and_font(
     content_obj_num: u32,
     font_obj_num: u32,
     font_name: &str,
+    opacity: Option<f32>,
 ) -> Result<Vec<u8>, String> {
     if font_name.is_empty() || !font_name.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Err("font resource name must be ASCII alphanumeric".into());
+    }
+    if let Some(alpha) = opacity {
+        if !(0.0..=1.0).contains(&alpha) {
+            return Err(format!("opacity {alpha} is outside 0.0..=1.0"));
+        }
     }
 
     let mut text = String::from_utf8(page_obj_bytes.to_vec())
@@ -111,6 +117,44 @@ pub fn inject_content_ref_and_font(
             &resource_dict[resource_dict.len() - 2..]
         )
     };
+    // A stamp drawn at less than full opacity emits `/GSstamp gs`, which names
+    // an ExtGState in these resources. Writing the operator without the
+    // resource — or, as before this change, writing the number itself as the
+    // operand — produces a content stream a reader may reject. The state is an
+    // inline dictionary: it belongs to this page, so it needs no object of its
+    // own. [FR-STAMP, PRIN-1]
+    let patched_resources = match opacity {
+        None => patched_resources,
+        Some(alpha) => {
+            let name = crate::stamp::EXT_GSTATE_NAME;
+            let entry =
+                format!("/{name} << /Type /ExtGState /ca {alpha:.3} /CA {alpha:.3} >>");
+            if let Some(at) = patched_resources.find("/ExtGState") {
+                let value = at + "/ExtGState".len();
+                let start = value
+                    + patched_resources[value..]
+                        .find(|c: char| !c.is_ascii_whitespace())
+                        .ok_or_else(|| "empty /ExtGState resource".to_string())?;
+                if !patched_resources[start..].starts_with("<<") {
+                    return Err("indirect /ExtGState resources are not supported for stamping".into());
+                }
+                let end = matching_dict_end(&patched_resources, start)
+                    .ok_or_else(|| "unclosed /ExtGState dictionary".to_string())?;
+                format!(
+                    "{} {entry} {}",
+                    &patched_resources[..end - 2],
+                    &patched_resources[end - 2..]
+                )
+            } else {
+                format!(
+                    "{} /ExtGState << {entry} >> {}",
+                    &patched_resources[..patched_resources.len() - 2],
+                    &patched_resources[patched_resources.len() - 2..]
+                )
+            }
+        }
+    };
+
     text.replace_range(value_start..resource_end, &patched_resources);
 
     let content_ref = format!("{content_obj_num} 0 R");
@@ -179,9 +223,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opacity_adds_the_graphics_state_the_stamp_stream_names() {
+        let page = b"3 0 obj
+<< /Type /Page /Resources << /ProcSet [/PDF /Text] >> /Contents 4 0 R >>
+endobj
+";
+        let out = inject_content_ref_and_font(page, 20, 21, "FStamp", Some(0.35)).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        let name = crate::stamp::EXT_GSTATE_NAME;
+        assert!(text.contains(&format!("/ExtGState << /{name} << /Type /ExtGState")), "{text}");
+        assert!(text.contains("/ca 0.350"), "{text}");
+        assert!(text.contains("/CA 0.350"), "{text}");
+    }
+
+    #[test]
+    fn opacity_extends_an_existing_ext_gstate_dictionary() {
+        let page = b"3 0 obj
+<< /Type /Page /Resources << /ExtGState << /GS0 5 0 R >> >> /Contents 4 0 R >>
+endobj
+";
+        let out = inject_content_ref_and_font(page, 20, 21, "FStamp", Some(0.5)).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("/GS0 5 0 R"), "the page's own state was dropped: {text}");
+        assert!(text.contains(crate::stamp::EXT_GSTATE_NAME), "{text}");
+        assert_eq!(text.matches("/ExtGState <<").count(), 1, "duplicate dictionaries: {text}");
+    }
+
+    #[test]
+    fn no_opacity_adds_no_graphics_state() {
+        let page = b"3 0 obj
+<< /Type /Page /Resources << >> /Contents 4 0 R >>
+endobj
+";
+        let out = inject_content_ref_and_font(page, 20, 21, "FStamp", None).unwrap();
+        assert!(!String::from_utf8_lossy(&out).contains("/ExtGState"));
+    }
+
+    #[test]
+    fn an_opacity_outside_the_unit_range_is_refused() {
+        let page = b"3 0 obj
+<< /Type /Page /Resources << >> /Contents 4 0 R >>
+endobj
+";
+        let error = inject_content_ref_and_font(page, 20, 21, "FStamp", Some(1.5)).unwrap_err();
+        assert!(error.contains("outside"), "{error}");
+    }
+
+    #[test]
     fn stamp_appends_content_and_font_to_direct_resources() {
         let page = b"3 0 obj\n<< /Type /Page /Resources << /ProcSet [/PDF /Text] >> /Contents 4 0 R >>\nendobj\n";
-        let out = inject_content_ref_and_font(page, 20, 21, "FStamp").unwrap();
+        let out = inject_content_ref_and_font(page, 20, 21, "FStamp", None).unwrap();
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("/Contents [4 0 R 20 0 R]"), "got: {text}");
         assert!(text.contains("/Font << /FStamp 21 0 R >>"), "got: {text}");
@@ -191,7 +282,7 @@ mod tests {
     #[test]
     fn stamp_appends_to_contents_array() {
         let page = b"3 0 obj\n<< /Type /Page /Resources << >> /Contents [4 0 R 5 0 R] >>\nendobj\n";
-        let out = inject_content_ref_and_font(page, 20, 21, "FStamp").unwrap();
+        let out = inject_content_ref_and_font(page, 20, 21, "FStamp", None).unwrap();
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("/Contents [4 0 R 5 0 R 20 0 R]"), "got: {text}");
     }
@@ -199,7 +290,7 @@ mod tests {
     #[test]
     fn stamp_rejects_indirect_resources() {
         let page = b"3 0 obj\n<< /Type /Page /Resources 8 0 R /Contents 4 0 R >>\nendobj\n";
-        let error = inject_content_ref_and_font(page, 20, 21, "FStamp").unwrap_err();
+        let error = inject_content_ref_and_font(page, 20, 21, "FStamp", None).unwrap_err();
         assert!(error.contains("indirect /Resources"), "got: {error}");
     }
 

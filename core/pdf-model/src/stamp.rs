@@ -81,6 +81,16 @@ pub fn bates_number(start: u32, index: u32, width: usize) -> String {
     format!("{:0width$}", start + index, width = width)
 }
 
+/// Resource name for the stamp's transparency state, shared by the content
+/// stream and the page's `/Resources` so the two can never disagree.
+pub const EXT_GSTATE_NAME: &str = "GSstamp";
+
+/// Whether this stamp needs an `/ExtGState` resource at all.
+#[must_use]
+pub fn needs_ext_gstate(stamp: &Stamp) -> bool {
+    (stamp.opacity - 1.0).abs() > 0.001
+}
+
 /// Generate a PDF content stream that renders a stamp on a page. [FR-STAMP]
 ///
 /// The stream is in page coordinates (not local widget coords).
@@ -108,8 +118,15 @@ pub fn generate_stamp_stream(
     write!(&mut buf, "q\n").unwrap();
 
     // Set opacity if not fully opaque.
-    if (stamp.opacity - 1.0).abs() > 0.001 {
-        write!(&mut buf, "{:.3} gs\n", stamp.opacity).unwrap();
+    //
+    // This used to write `{opacity} gs`. The `gs` operator takes the *name* of
+    // an ExtGState in the page's resources, not a number, so a translucent
+    // stamp emitted a malformed operator that a reader may reject along with
+    // the rest of the stream. The name below is the one
+    // `page_patch::inject_content_ref_and_font` writes into `/ExtGState`.
+    // [FR-STAMP, PRIN-1, GR-8]
+    if needs_ext_gstate(stamp) {
+        write!(&mut buf, "/{EXT_GSTATE_NAME} gs\n").unwrap();
     }
 
     // Set text color.
@@ -247,7 +264,16 @@ mod tests {
         };
         let stream = generate_stamp_stream(&stamp, 612.0, 792.0);
         let s = String::from_utf8_lossy(&stream);
-        assert!(s.contains("gs"), "should set graphics state for opacity");
+        // `contains("gs")` passed for the malformed `0.500 gs` this used to
+        // emit. The operand of `gs` must be a name. [T-10]
+        assert!(
+            s.contains(&format!("/{EXT_GSTATE_NAME} gs")),
+            "opacity must reference a named ExtGState, got: {s}"
+        );
+        assert!(
+            !s.contains("0.500 gs"),
+            "the operand of `gs` must be a name, not a number: {s}"
+        );
     }
 
     #[test]

@@ -741,6 +741,7 @@ impl DocumentCoordinator {
         })
     }
 
+    /// Pages in the open document, as the worker reported them.
     pub fn page_count(&self) -> u32 {
         self.summary.page_count
     }
@@ -1196,6 +1197,7 @@ impl DocumentCoordinator {
     // utility pool, no raster crossing IPC, and calling `scale_blocks_to_page`
     // before generating the text layer.
 
+    /// Ask the worker to quit, then wait for it. [SDS §7]
     pub fn close_worker(&mut self) -> Result<(), SessionError> {
         let _ = self.session.send(b"CMD:QUIT\n");
         let _ = self.session.kill_worker();
@@ -1240,6 +1242,10 @@ fn build_stamp_group(
             // The stamp's own resource name, so the page's /Resources entry and
             // the stream's Tf operator can never disagree. They did.
             &stamp.font_name,
+            // Same reasoning for transparency: the stream emits `/GSstamp gs`
+            // only when the stamp is translucent, and the resource is written
+            // only then. [FR-STAMP]
+            pdf_model::stamp::needs_ext_gstate(stamp).then_some(stamp.opacity),
         )
         .map_err(SessionError::Protocol)?;
 
