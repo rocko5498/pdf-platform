@@ -158,7 +158,7 @@ fn a_ligature_extracts_as_searchable_letters() {
     // the characters: "fi ne" is searchable, U+FB01 alone is not without
     // normalization, and a dropped glyph is silent data loss. [MET-FEAT-4]
     let (lines, reliable) = lines_of("text-ligature.pdf");
-    assert_eq!(lines, vec!["fi ne"], "ligature lost or mangled");
+    assert_eq!(lines, vec!["fine"], "ligature lost or mangled");
     assert!(reliable);
 }
 
