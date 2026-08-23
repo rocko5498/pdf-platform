@@ -237,13 +237,7 @@ fn main() -> ExitCode {
                             );
                         }
                         Command::GetLayers { correlation_id } => {
-                            handle_get_layers(
-                                pdfium
-                                    .as_ref()
-                                    .map(|e| e as &dyn engine_api::structure::Structure),
-                                correlation_id,
-                                &mut transport,
-                            );
+                            handle_get_layers(&doc_file, correlation_id, &mut transport);
                         }
                         Command::GetAttachments { correlation_id } => {
                             handle_get_attachments(
@@ -721,31 +715,45 @@ fn handle_get_outline(
 }
 
 fn handle_get_layers(
-    structure_engine: Option<&dyn engine_api::structure::Structure>,
+    doc_file: &Option<File>,
     correlation_id: u64,
     transport: &mut Box<dyn protocol::transport::WorkerTransport>,
 ) {
-    let Some(structure) = structure_engine else {
-        send_error(transport, correlation_id, "no engine loaded");
+    // Answered from the document's own catalog rather than from the engine.
+    // `PdfiumEngine::layers` returns an empty list for every document —
+    // pdfium-render exposes no optional-content API — so the shell's Layers
+    // panel reported "none" whether or not the document had any, which is a
+    // silent wrong answer rather than an honest "cannot tell". [GR-8, FR-VIEW-4]
+    let Some(file) = doc_file.as_ref() else {
+        send_error(transport, correlation_id, "no document loaded");
         return;
     };
-    match structure.layers() {
-        Ok(layers) => {
-            let total = layers.total_count() as u32;
-            let event = WorkerEvent::LayersResult {
-                correlation_id,
-                group_count: layers.groups.len() as u32,
-                total_count: total,
-                has_layers: !layers.is_empty(),
-            };
-            let body = encode_worker_event(&event);
-            if let Err(e) = transport.send(&body) {
-                eprintln!("worker: send LAYERS_RESULT failed: {e}");
-            }
+    let map = match unsafe { memmap2::Mmap::map(file) } {
+        Ok(map) => map,
+        Err(error) => {
+            send_error(transport, correlation_id, &format!("mmap failed: {error}"));
+            return;
         }
-        Err(e) => {
-            send_error(transport, correlation_id, &e.to_string());
-        }
+    };
+
+    let groups = pdf_cos::ocg::parse_optional_content_groups(&map);
+    let data = groups
+        .iter()
+        .map(|group| format!("{}	{}", group.name, group.visible))
+        .collect::<Vec<_>>()
+        .join("
+");
+
+    let event = WorkerEvent::LayersResult {
+        correlation_id,
+        group_count: groups.len() as u32,
+        total_count: groups.len() as u32,
+        has_layers: !groups.is_empty(),
+        data,
+    };
+    let body = encode_worker_event(&event);
+    if let Err(e) = transport.send(&body) {
+        eprintln!("worker: send LAYERS_RESULT failed: {e}");
     }
 }
 
