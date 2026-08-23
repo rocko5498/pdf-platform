@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Rust edition 2021, MSRV 1.80 (per workspace Cargo.toml)
-- No `unsafe` without `// SAFETY:` comment (per CLAUDE.md / ADR-027)
+- No `unsafe` without `// SAFETY:` comment (per ADR-027)
 - Every change cites spec IDs (SDS §14 M0, FR-DIAG-2, US-DEV-6, ADR-006, ADR-025, ADR-010)
 - No clap / arg-parsing library at M0 — use `std::env::args()` (full CLI at M6)
 - No JSON output at M0 — human-readable only (JSON at M6 with FR-CLI parity)
@@ -466,8 +466,7 @@ LeniencyEvent type records tolerated parse deviations.
 One unit test with embedded minimal-PDF byte literal.
 
 Cites: SDS §14 M0, FR-DIAG-2, ADR-006, ADR-025
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+"
 ```
 
 ---
@@ -527,8 +526,7 @@ DocumentStructure so protocol can add serialization later without
 touching the parse layer.
 
 Cites: ADR-025, FR-DIAG-2
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+"
 ```
 
 ---
@@ -615,8 +613,7 @@ No actor/channel — CLI is in-process; this is a diagnostic probe, not
 a document lifecycle open.
 
 Cites: ADR-010, ADR-025, FR-DIAG-2, SDS §14 M0
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+"
 ```
 
 ---
@@ -731,8 +728,7 @@ AcroForm/XFA/JS/sig presence, and leniency events. Exit codes: 0 ok,
 1 bad arg/not-found, 2 fatal scan error.
 
 Cites: SDS §14 M0, FR-DIAG-2, US-DEV-6, ADR-025, FR-CLI
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+"
 ```
 
 ---

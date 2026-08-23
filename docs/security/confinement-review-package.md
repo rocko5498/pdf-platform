@@ -1,7 +1,7 @@
 # Confinement Review Package (Human-Gated)
 
 **Status:** DRAFT for security review — **not** production-enforced  
-**Cites:** ADR-008, ADR-016, SDS §12.2, IG AI-6 / AGENTS §7  
+**Cites:** ADR-008, ADR-016, SDS §12.2, IG AI-6  
 **Rule:** An agent may draft; a human owner must review before **enforcement** lands.  
 **Never** weaken a filter, downgrade “indeterminate,” or claim full sandboxing while mode is Advisory.
 

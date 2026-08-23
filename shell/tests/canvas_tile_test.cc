@@ -1,5 +1,5 @@
 // M0 exit criterion: a tile rendered through the real bridge, IPC and shared
-// memory — on every OS CI builds. [AGENTS §11, ADR-003, ADR-004, ADR-007,
+// memory — on every OS CI builds. [SDS §14 M0, ADR-003, ADR-004, ADR-007,
 // ADR-022 T-5, ADR-029, SDS §6.4]
 //
 // The Rust-side `render_tile_real_pdf_via_pdfium` cannot discharge this: it

@@ -1,7 +1,7 @@
 # Security report: 16 RUSTSEC advisories against the pinned Wasmtime
 
 **Date:** 2026-08-02
-**Reporter:** agent (drafted; human-gated per IG AI-6, AGENTS §7, CR-Z)
+**Reporter:** agent (drafted; human-gated per IG AI-6, CR-Z)
 **Status:** Report only. No dependency version was changed.
 **Cites:** ADR-014, ADR-015, ADR-028 §2/§4, ADR-033, ADR-029 §3, GR-1, GR-8, FR-PLUG-4, DEP-3, M11
 
@@ -94,7 +94,7 @@ check in `.github/workflows/ci.yml`, and no record of `cargo audit` ever being r
 ## What an agent must not do here
 
 Bumping Wasmtime from 28 to a fixed series crosses **fifteen** major versions, in a
-security-critical path. IG AI-6 and AGENTS §7 make sandbox and plugin-runtime code
+security-critical path. IG AI-6 make sandbox and plugin-runtime code
 human-gated: an agent may draft, never weaken a verification or relax a sandbox
 constraint, and CR-Z requires two reviewers. Attempting the upgrade blind would also
 breach ADR-028 §4, which requires dependency updates to land as reviewed proposals

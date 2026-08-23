@@ -27,7 +27,6 @@ const CANONICAL_DOCS: &[&str] = &[
     "docs/product-requirements-document.md",
     "docs/ui-ux-design-system.md",
     "IMPLEMENTATION_GUIDE.md",
-    "AGENTS.md",
 ];
 
 /// Prefixes that denote a citable identifier.
