@@ -58,6 +58,15 @@ jobs:
       - name: G-1 citation traceability
         run: cargo run -q --manifest-path tools/check-citations/Cargo.toml
 
+      # Four shipped defects had the same shape: `windows(N)` compared against
+      # a byte literal of a different length, which is never equal, so the
+      # search silently never matched. `endobj` (corrupted every stamp),
+      # `/Flate` and `/None` (every PDF stream treated as an unknown filter),
+      # and a redaction assertion that could not fail. Mechanical pattern,
+      # mechanical check. [T-11, PRIN-1, GR-8]
+      - name: Window/needle length mismatches
+        run: python tools/check_window_lengths.py
+
       - name: Licence allowlist (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

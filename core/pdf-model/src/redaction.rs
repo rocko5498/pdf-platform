@@ -1068,7 +1068,16 @@ mod tests {
         // Step 4: Scrub metadata.
         let original_pdf = b"%PDF-1.4\n1 0 obj\n<< /Author (Secret Agent) /Type /Catalog >>\nendobj\n";
         let scrubbed = scrub_metadata(original_pdf);
-        assert!(!scrubbed.windows(11).any(|w| w == b"Secret Agent"), "metadata scrubbed");
+        // `windows(11)` against the twelve-byte "Secret Agent" compares
+        // slices of different lengths, which are never equal: the assertion
+        // held whether or not anything was scrubbed. Same shape as the
+        // `windows(7)`/`endobj` and `windows(7)`//Flate defects. [T-10]
+        const SECRET: &[u8] = b"Secret Agent";
+        assert!(
+            !scrubbed.windows(SECRET.len()).any(|w| w == SECRET),
+            "the author name is still in the scrubbed bytes: {:?}",
+            String::from_utf8_lossy(&scrubbed)
+        );
 
         // Step 5: Remove annotations.
         let mut store = AnnotationStore::new();
