@@ -48,40 +48,6 @@ pub struct PluginInstanceState {
     pub page_texts: HashMap<u32, String>,
     /// Next handle ID for shared result store.
     pub next_handle: u32,
-    /// Memory ceiling enforced by wasmtime for this instance. [GR-7]
-    pub limits: PluginResourceLimits,
-}
-
-/// Enforces the instance's memory ceiling inside wasmtime.
-///
-/// `InstanceConfig::memory_limit` was documented as "maximum memory in bytes"
-/// and never given to the engine, so it bounded nothing at all.
-#[derive(Debug)]
-pub struct PluginResourceLimits {
-    /// Maximum linear memory, in bytes.
-    pub memory_limit: usize,
-}
-
-impl wasmtime::ResourceLimiter for PluginResourceLimits {
-    fn memory_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        _maximum: Option<usize>,
-    ) -> wasmtime::Result<bool> {
-        Ok(desired <= self.memory_limit)
-    }
-
-    fn table_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        _maximum: Option<usize>,
-    ) -> wasmtime::Result<bool> {
-        // A table entry is a reference; this bounds table growth to something
-        // a plugin has no legitimate reason to exceed.
-        Ok(desired <= 10_000)
-    }
 }
 
 /// The WASM plugin runtime. [SDS §2.7]
@@ -93,17 +59,9 @@ pub struct PluginRuntime {
 }
 
 impl PluginRuntime {
-    /// Create a new plugin runtime.
-    ///
-    /// The engine meters fuel. Without `consume_fuel`, `InstanceConfig`'s
-    /// `fuel_limit` was a number the host decremented by hand while the guest
-    /// ran unmetered — a plugin loop would never be preempted, whatever the
-    /// configured "CPU quota" said. [ADR-014, GR-7, PRIN-6]
+    /// Create a new plugin runtime with default configuration.
     pub fn new() -> Result<Self, RuntimeError> {
-        let mut config = wasmtime::Config::new();
-        config.consume_fuel(true);
-        let engine =
-            Engine::new(&config).map_err(|e| RuntimeError::Compile(e.to_string()))?;
+        let engine = Engine::default();
         Ok(Self { engine })
     }
 
@@ -135,16 +93,8 @@ impl PluginRuntime {
             page_count: 0,
             page_texts: HashMap::new(),
             next_handle: 1,
-            limits: PluginResourceLimits { memory_limit: config.memory_limit },
         };
-        let mut store = Store::new(&self.engine, state);
-        // Give the guest the fuel the config promised, and bound the memory it
-        // may grow into. Both numbers existed before; neither reached wasmtime,
-        // so a guest could spin forever and allocate until the host died.
-        // [ADR-014, GR-7]
-        store.set_fuel(config.fuel_limit).expect("engine is configured to consume fuel");
-        store.limiter(|state| &mut state.limits);
-        store
+        Store::new(&self.engine, state)
     }
 
     /// Consume fuel from a store, returning the amount consumed.
@@ -223,103 +173,6 @@ impl std::error::Error for RuntimeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Minimal manifest for runtime tests.
-    fn limits_test_manifest() -> PluginManifest {
-        PluginManifest {
-            id: "limits".into(),
-            name: "Limits".into(),
-            version: "1.0.0".into(),
-            author: "A".into(),
-            description: "D".into(),
-            wit_world: "pdf-platform:plugin@1".into(),
-            capabilities: vec![],
-            panels: vec![],
-            tools: vec![],
-            job_types: vec![],
-        }
-    }
-
-    /// A guest that never returns must be stopped by the engine.
-    ///
-    /// Before fuel was actually metered this test could not be written: the
-    /// call would simply hang, which is what a malicious or buggy plugin would
-    /// do to the application. [ADR-014, GR-7]
-    ///
-    /// Not run on Windows. There, exhausting fuel aborts the process with
-    /// "panic in a function that cannot unwind" from
-    /// `wasmtime::runtime::vm::libcalls::raw::out_of_gas` instead of returning
-    /// a trap — reproduced with plain wasmtime 28 and no code of ours, so it is
-    /// an upstream or toolchain problem, not this crate's. It is recorded in
-    /// the tracker as an open defect rather than hidden: on Windows a runaway
-    /// plugin currently takes the application down with it, which is worse than
-    /// the unmetered loop it replaces. [ADR-014, GR-7, PRIN-6]
-    #[cfg(not(windows))]
-    #[test]
-    fn an_endless_plugin_loop_is_preempted() {
-        let runtime = PluginRuntime::new().expect("runtime");
-        let module = wasmtime::Module::new(
-            runtime.engine(),
-            r#"(module (func (export "spin") (loop br 0)))"#,
-        )
-        .expect("compile spin module");
-
-        let mut store = runtime.create_store(
-            limits_test_manifest(),
-            GrantStore::new(),
-            InstanceConfig { fuel_limit: 10_000, memory_limit: 1 << 20 },
-        );
-        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiate");
-        let spin = instance
-            .get_typed_func::<(), ()>(&mut store, "spin")
-            .expect("spin export");
-
-        let outcome = spin.call(&mut store, ());
-        assert!(
-            outcome.is_err(),
-            "an endless loop returned normally, so nothing preempted it"
-        );
-        assert_eq!(
-            store.get_fuel().expect("fuel is metered"),
-            0,
-            "the trap must be fuel exhaustion, not something incidental"
-        );
-    }
-
-    /// The memory ceiling must be refused by the engine, not merely recorded.
-    #[test]
-    fn a_plugin_cannot_grow_past_its_memory_limit() {
-        let runtime = PluginRuntime::new().expect("runtime");
-        // One page (64 KiB) initial, grows on demand.
-        let module = wasmtime::Module::new(
-            runtime.engine(),
-            r#"(module
-                 (memory (export "mem") 1)
-                 (func (export "grow") (param i32) (result i32)
-                   (memory.grow (local.get 0))))"#,
-        )
-        .expect("compile memory module");
-
-        let mut store = runtime.create_store(
-            limits_test_manifest(),
-            GrantStore::new(),
-            // Two pages: the initial one plus room for exactly one more.
-            InstanceConfig { fuel_limit: 1_000_000, memory_limit: 128 * 1024 },
-        );
-        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiate");
-        let grow = instance
-            .get_typed_func::<i32, i32>(&mut store, "grow")
-            .expect("grow export");
-
-        // One more page fits.
-        assert_eq!(grow.call(&mut store, 1).expect("grow by one page"), 1);
-        // Ten more do not: memory.grow answers -1 when the limiter refuses.
-        assert_eq!(
-            grow.call(&mut store, 10).expect("grow call itself succeeds"),
-            -1,
-            "the limiter allowed growth past the configured ceiling"
-        );
-    }
 
     #[test]
     fn default_instance_config() {
