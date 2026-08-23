@@ -291,11 +291,49 @@ pub(crate) fn find_indirect_ref(data: &[u8], key: &[u8]) -> Option<(u32, u16)> {
 pub(crate) fn fetch_key_dict<'a>(
     data: &'a [u8],
     xref: &[XrefEntry],
-    parent: &[u8],
+    parent: &'a [u8],
     key: &[u8],
 ) -> Option<&'a [u8]> {
-    let (n, _) = find_indirect_ref(parent, key)?;
-    fetch_object(data, xref, n)
+    if let Some((n, _)) = find_indirect_ref(parent, key) {
+        return fetch_object(data, xref, n);
+    }
+    // The value may be a direct dictionary. PDF 32000-1 allows it wherever a
+    // dictionary is expected — `/AcroForm << /Fields [...] >>` written inline
+    // is a conforming document — and resolving only indirect references meant
+    // such a file reported "AcroForm present but not fetchable", imported zero
+    // fields, and left the caller to invent some. [FR-FORM-1, PRIN-1]
+    inline_dict_after_key(parent, key)
+}
+
+/// The `<< ... >>` slice that follows `key`, if the value is a direct dictionary.
+pub(crate) fn inline_dict_after_key<'a>(parent: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let pos = find_key(parent, key)?;
+    let mut i = pos + key.len();
+    skip_ws(parent, &mut i);
+    if parent.get(i) != Some(&b'<') || parent.get(i + 1) != Some(&b'<') {
+        return None;
+    }
+    let start = i;
+    let mut depth = 0usize;
+    while i + 1 < parent.len() {
+        if parent[i] == b'<' && parent[i + 1] == b'<' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if parent[i] == b'>' && parent[i + 1] == b'>' {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Some(&parent[start..i]);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    // Unbalanced: refuse rather than hand back a slice that runs to the end of
+    // the object. [GR-8]
+    None
 }
 
 /// Parse `/Key <integer>` and return the integer value.
