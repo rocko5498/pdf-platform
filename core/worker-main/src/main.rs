@@ -834,34 +834,21 @@ fn handle_get_object(
         }
     };
 
-    let idx = obj_num as usize;
-    if idx >= entries.len() || !entries[idx].in_use {
+    // One fetch for both kinds of object. `fetch_object_bytes` slices the file
+    // for an ordinary object and decompresses the containing object stream for
+    // a PDF 1.5+ compressed one, which is where a modern producer keeps most of
+    // the document. The private copy of this logic here could only do the
+    // former, and it terminated objects with a `windows(7)` scan for the
+    // six-byte `endobj` — the match never fired, so every object ran to the
+    // 4096-byte fallback or to end of file. [SDS §3.1, PRIN-1, GR-8]
+    let Some(data) = pdf_cos::scan::fetch_object_bytes(&map, &entries, obj_num) else {
         send_error(
             transport,
             correlation_id,
             &format!("object {obj_num} not found"),
         );
         return;
-    }
-
-    let offset = entries[idx].offset as usize;
-    // Find endobj after the offset to determine object length.
-    let obj_bytes = &map[offset..];
-    // `windows(7)` compared seven-byte slices against the six-byte needle
-    // `endobj`, so the match never fired and every object was returned from its
-    // offset to the 4096-byte fallback — or to end of file for a small
-    // document. Callers that parse the first dictionary they see survived it;
-    // the stamp path did not, because it patched the *last* `>>` in what it was
-    // given and hit the file's trailer, then wrote the whole tail back as the
-    // page object. [SDS §3.1, PRIN-1, GR-8]
-    const END_OBJ: &[u8] = b"endobj";
-    let end = obj_bytes
-        .windows(END_OBJ.len())
-        .position(|w| w == END_OBJ)
-        .map(|p| offset + p + END_OBJ.len())
-        .unwrap_or(offset + obj_bytes.len().min(4096));
-
-    let data = map[offset..end].to_vec();
+    };
 
     let event = WorkerEvent::ObjectData {
         correlation_id,

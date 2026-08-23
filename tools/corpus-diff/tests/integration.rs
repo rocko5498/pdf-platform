@@ -24,16 +24,22 @@ fn known_good_fixture_passes() {
     }
 }
 
+/// This asserted `ours=err`: our scan failed where qpdf recovered. SDS §10.4
+/// puts qpdf-style reconstruction in our COS layer and `parse_xref_chain` now
+/// falls back to it, so the document opens and agrees with qpdf on the page
+/// count. Keeping the old assertion would assert the defect. [SDS §10.4, AI-7]
 #[test]
-fn malformed_fixture_fails() {
+fn a_malformed_xref_is_reconstructed_and_agrees_with_qpdf() {
     if !qpdf_available() {
         eprintln!("skip: qpdf not on PATH");
         return;
     }
     match compare_fixture(&test_fixtures_dir().join("malformed-xref.pdf")) {
-        FixtureResult::Fail { reason, .. } => {
-            assert!(reason.contains("ours=err"), "unexpected reason: {reason}");
+        FixtureResult::Pass { page_count, .. } => {
+            assert!(page_count > 0, "a reconstructed document must have pages");
         }
-        FixtureResult::Pass { .. } => panic!("expected Fail for malformed-xref.pdf"),
+        FixtureResult::Fail { reason, .. } => {
+            panic!("a damaged xref must be reconstructed, not refused: {reason}")
+        }
     }
 }

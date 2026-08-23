@@ -123,22 +123,17 @@ fn a_truncated_xref_table_surfaces_as_leniency() {
     }
 }
 
-/// SDS §10.4 and ADR-006 put qpdf-style xref reconstruction in this layer, and
-/// `pdf_cos::xref::reconstruct_xref` implements it — documented as "when the
-/// xref table is damaged or missing, scan the file for all object definitions
-/// and build an xref from them", with its own unit test.
+/// SDS §10.4 and ADR-006 put qpdf-style xref reconstruction in this layer.
+/// `pdf_cos::xref::reconstruct_xref` implemented it from M0 and **nothing
+/// called it**: a document with an unusable `startxref` failed to open with
+/// "malformed xref table" instead of being repaired, and the
+/// `xref-reconstructed` event could not fire in production.
 ///
-/// **Its only caller is that unit test.** Nothing on the scan path invokes it,
-/// so a document with an unusable `startxref` fails to open with "malformed
-/// xref table" instead of being repaired, and the `xref-reconstructed` leniency
-/// event can never fire in production.
-///
-/// Ignored rather than deleted or inverted: AI-7 forbids a test that asserts
-/// the current behaviour is correct, and this records what SDS §10.4 requires
-/// so that wiring reconstruction in has a waiting assertion.
-/// [SDS §10.4, ADR-006, FR-VIEW-2, GR-8, AI-7]
+/// This test was written then, ignored, and left as a waiting assertion —
+/// which is what it was for. `parse_xref_chain` now falls back to
+/// reconstruction when the newest section cannot be read, so it runs.
+/// [SDS §10.4, ADR-006, FR-VIEW-2, GR-8]
 #[test]
-#[ignore = "reconstruct_xref has no production caller; SDS §10.4 recovery is not wired into the scan path"]
 fn a_bogus_startxref_forces_recorded_reconstruction() {
     // "180" -> "999" points past the end of the file. Same byte length.
     let bytes: Vec<u8> = String::from_utf8_lossy(VALID)

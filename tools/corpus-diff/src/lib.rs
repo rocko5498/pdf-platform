@@ -115,7 +115,13 @@ mod tests {
     }
 
     #[test]
-    fn compare_fixture_fails_on_our_scan_error() {
+    fn a_malformed_xref_is_repaired_rather_than_refused() {
+        // This used to assert `ours=err` for `malformed-xref.pdf`: our scan
+        // failed where qpdf recovered. SDS §10.4 puts qpdf-style
+        // reconstruction in our COS layer, and `parse_xref_chain` now falls
+        // back to it, so the document opens and the page count agrees with
+        // qpdf's. Asserting the old outcome would be asserting the defect.
+        // [SDS §10.4, FR-VIEW-2, AI-7]
         if !qpdf_available() {
             eprintln!("skip: qpdf not on PATH");
             return;
@@ -125,8 +131,36 @@ mod tests {
             .join("fixtures")
             .join("malformed-xref.pdf");
         match compare_fixture(&malformed) {
-            FixtureResult::Fail { reason, .. } => assert!(reason.contains("ours=err")),
-            FixtureResult::Pass { .. } => panic!("expected Fail for malformed-xref.pdf"),
+            FixtureResult::Pass { page_count, .. } => {
+                assert!(page_count > 0, "a repaired document must have pages")
+            }
+            FixtureResult::Fail { reason, .. } => {
+                panic!("a damaged xref must be reconstructed, not refused: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_pdf_still_fails() {
+        // The Fail path must keep a case that reaches it, or the comparison
+        // reports Pass for everything and proves nothing. [T-11]
+        if !qpdf_available() {
+            eprintln!("skip: qpdf not on PATH");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "pdf-platform-corpus-not-a-pdf-{}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"this is not a PDF at all, not even close
+").unwrap();
+
+        let outcome = compare_fixture(&path);
+        let _ = std::fs::remove_file(&path);
+
+        match outcome {
+            FixtureResult::Fail { .. } => {}
+            FixtureResult::Pass { .. } => panic!("a text file must not compare as a PDF"),
         }
     }
 }

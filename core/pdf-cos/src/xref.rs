@@ -284,6 +284,54 @@ pub fn parse_xref_stream(
 /// Reconstruct the xref table by scanning the entire file for `N G obj` patterns.
 /// [SDS §10.4, FR-VIEW-2]
 ///
+/// An object stream's decompressed contents and its object index.
+pub struct DecodedObjectStream {
+    /// The decompressed bytes.
+    pub bytes: Vec<u8>,
+    /// `(object numbers with their relative offsets, /First)`.
+    pub index: (Vec<(u32, usize)>, usize),
+}
+
+/// Decode a `/Type /ObjStm` object: decompress it and read its header pairs.
+///
+/// A modern PDF keeps most of its objects inside these, so a reader that
+/// cannot open one cannot see the document's catalog, pages or fields.
+/// [FR-VIEW-2, SDS §3.1]
+pub fn decode_object_stream(stream_obj_body: &[u8]) -> Result<DecodedObjectStream, String> {
+    let count = find_stream_int(stream_obj_body, b"/N").ok_or("object stream missing /N")?;
+    let first = find_stream_int(stream_obj_body, b"/First").ok_or("object stream missing /First")?;
+    let content = find_stream_content(stream_obj_body).ok_or("object stream has no content")?;
+
+    let mut leniency = Vec::new();
+    let bytes = decompress_stream(stream_obj_body, content, &mut leniency)?;
+
+    let header_end = usize::try_from(first).map_err(|_| "/First is out of range")?;
+    let header = bytes.get(..header_end).ok_or("object stream shorter than /First")?;
+    let numbers: Vec<usize> = String::from_utf8_lossy(header)
+        .split_whitespace()
+        .filter_map(|token| token.parse().ok())
+        .collect();
+
+    let wanted = usize::try_from(count).map_err(|_| "/N is out of range")?;
+    let mut index = Vec::with_capacity(wanted);
+    for pair in numbers.chunks(2).take(wanted) {
+        if pair.len() == 2 {
+            index.push((pair[0] as u32, pair[1]));
+        }
+    }
+    if index.len() != wanted {
+        return Err(format!(
+            "object stream declares {wanted} objects but its header lists {}",
+            index.len()
+        ));
+    }
+
+    Ok(DecodedObjectStream {
+        bytes,
+        index: (index, header_end),
+    })
+}
+
 /// This is the qpdf-style recovery: when the xref table is damaged or missing,
 /// scan the file for all object definitions and build an xref from them.
 pub fn reconstruct_xref(data: &[u8], leniency: &mut Vec<LeniencyEvent>) -> XrefTable {
@@ -456,7 +504,19 @@ fn decompress_stream(
     leniency: &mut Vec<LeniencyEvent>,
 ) -> Result<Vec<u8>, String> {
     // Check the /Filter entry.
-    if dict.windows(7).any(|w| w == b"/Flate") || dict.windows(12).any(|w| w == b"/Filter /Flate") {
+    //
+    // These comparisons used to be `windows(7).any(|w| w == b"/Flate")` and
+    // `windows(6).any(|w| w == b"/None")` — seven- and six-byte windows against
+    // six- and five-byte needles, which can never be equal. Every stream
+    // therefore fell through to "unknown filter; using raw data" and was handed
+    // to the caller still compressed. Same shape as the `windows(7)`/`endobj`
+    // defect in the worker: a length written by hand next to a literal whose
+    // length nobody re-checked. [PRIN-1, GR-8]
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|window| window == needle)
+    }
+
+    if contains(dict, b"/FlateDecode") || contains(dict, b"/Fl ") {
         // FlateDecode (zlib/deflate).
         flate2_decompress(content).map_err(|e| {
             leniency.push(LeniencyEvent::new(
@@ -465,7 +525,7 @@ fn decompress_stream(
             ));
             format!("FlateDecode failed: {e}")
         })
-    } else if dict.windows(6).any(|w| w == b"/None") || dict.windows(11).any(|w| w == b"/Filter /None") {
+    } else if contains(dict, b"/None") {
         // No compression.
         Ok(content.to_vec())
     } else {
@@ -478,13 +538,29 @@ fn decompress_stream(
     }
 }
 
-/// Decompress a deflate stream.
+/// Decompress a `/FlateDecode` stream.
+///
+/// PDF's FlateDecode is a **zlib** stream (RFC 1950), not a bare deflate one
+/// (RFC 1951): two header bytes and a trailing checksum. This used a
+/// `DeflateDecoder`, so every well-formed xref stream failed to decompress —
+/// the mirror image of the missing zlib header that made OCR recognise nothing.
+/// It never showed because nothing called this in production.
+///
+/// The raw-deflate fallback stays for the writers that omit the header, and it
+/// is recorded when it fires rather than silently accepted. [SDS §3, GR-8]
 fn flate2_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let mut decoder = flate2::read::DeflateDecoder::new(data);
+
+    let mut zlib = flate2::read::ZlibDecoder::new(data);
     let mut output = Vec::new();
-    decoder.read_to_end(&mut output)
-        .map_err(|e| format!("deflate decompression failed: {e}"))?;
+    match zlib.read_to_end(&mut output) {
+        Ok(_) => return Ok(output),
+        Err(_) => output.clear(),
+    }
+
+    let mut raw = flate2::read::DeflateDecoder::new(data);
+    raw.read_to_end(&mut output)
+        .map_err(|e| format!("FlateDecode failed as zlib and as raw deflate: {e}"))?;
     Ok(output)
 }
 
