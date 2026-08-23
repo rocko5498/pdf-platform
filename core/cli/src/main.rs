@@ -2524,20 +2524,69 @@ fn execute_cli_pipeline(
 mod stamp_tests {
     use super::*;
 
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/corpus-diff/fixtures")
+            .join(name)
+    }
+
     #[test]
     fn run_stamp_writes_incremental_stamp_objects() {
+        // No skip: the worker is built alongside this crate and the fixture is
+        // in the repository. A test that quietly returns when its subject is
+        // missing is a test that can never fail. [ADR-022, PRIN-6]
         let worker = find_worker();
-        let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/corpus-diff/fixtures/valid-1page.pdf");
-        if !worker.exists() || !input.exists() {
-            eprintln!("skipping: build worker-main and provide corpus fixture");
-            return;
-        }
+        let input = fixture("valid-1page.pdf");
+        assert!(worker.exists(), "worker binary missing at {}", worker.display());
+        assert!(input.exists(), "fixture missing at {}", input.display());
+
         let output = std::env::temp_dir().join("pdf-platform-cli-stamp-test.pdf");
         run_stamp(&input, &output, Some("CONFIDENTIAL"), None, 6, 10.0).unwrap();
         let bytes = std::fs::read(&output).unwrap();
         assert!(bytes.windows(b"CONFIDENTIAL".len()).any(|w| w == b"CONFIDENTIAL"));
         assert!(bytes.len() > std::fs::metadata(&input).unwrap().len() as usize);
         std::fs::remove_file(output).ok();
+    }
+
+    #[test]
+    fn a_stamp_is_visible_on_the_rendered_page() {
+        // The test above proves the bytes are in the file. It cannot tell a
+        // stamp that renders from one that is present, well-formed and
+        // invisible — a content stream attached to nothing, drawn outside the
+        // MediaBox, or painted in white on white would all satisfy it.
+        //
+        // The M6 tracker row records stamping as "not yet corpus- or
+        // reader-tested" for exactly this reason. This renders both documents
+        // and requires the page to have changed. [FR-STAMP, FR-CMP-1, PRIN-1]
+        use coordinator::document::DocumentCoordinator;
+        use coordinator::visual_compare::{compare_pages, DEFAULT_CHANNEL_TOLERANCE};
+
+        let worker = find_worker();
+        let input = fixture("valid-1page.pdf");
+        assert!(worker.exists(), "worker binary missing at {}", worker.display());
+
+        let output = std::env::temp_dir().join("pdf-platform-cli-stamp-visible.pdf");
+        run_stamp(&input, &output, Some("CONFIDENTIAL"), None, 6, 24.0).unwrap();
+
+        let mut before = DocumentCoordinator::open(&worker, &input).expect("open input");
+        let mut after = DocumentCoordinator::open(&worker, &output).expect("open stamped");
+        let rendered_before = before.render_page(0, 0.5).expect("render input");
+        let rendered_after = after.render_page(0, 0.5).expect("render stamped");
+        let _ = before.close();
+        let _ = after.close();
+        std::fs::remove_file(&output).ok();
+
+        let diff = compare_pages(&rendered_before, &rendered_after, DEFAULT_CHANNEL_TOLERANCE)
+            .expect("compare renders");
+        assert!(
+            !diff.is_identical(),
+            "the stamped page renders identically to the unstamped one: the stamp \
+             is in the file but not on the page"
+        );
+        assert!(
+            diff.max_channel_delta > 64,
+            "the difference is too faint to be drawn text: max channel delta {}",
+            diff.max_channel_delta
+        );
     }
 }

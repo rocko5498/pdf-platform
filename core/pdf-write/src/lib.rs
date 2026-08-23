@@ -71,15 +71,26 @@ impl IncrementalWriter {
         // Sort by object number for deterministic output.
         object_buffers.sort_by_key(|(n, _)| *n);
 
+        // An object whose bytes do not end in a newline runs straight into the
+        // next one — `endobj4 0 obj` — which a conforming lexer is not obliged
+        // to split. The bytes used to carry a trailing newline by accident,
+        // because `get_object` over-read past `endobj`; once that was fixed the
+        // separator had to become deliberate. [SDS §3.4, PRIN-1]
+        fn needs_separator(bytes: &[u8]) -> bool {
+            !bytes.ends_with(b"\n")
+        }
         for (obj_num, bytes) in &object_buffers {
             dirty_offsets.insert(*obj_num, current_pos);
-            current_pos += bytes.len() as u32;
+            current_pos += bytes.len() as u32 + u32::from(needs_separator(bytes));
             objects_written += 1;
         }
 
         // Second pass: write objects to the actual writer.
-        for (obj_num, bytes) in &object_buffers {
+        for (_obj_num, bytes) in &object_buffers {
             writer.write_all(bytes)?;
+            if needs_separator(bytes) {
+                writer.write_all(b"\n")?;
+            }
         }
 
         // Build xref section.
