@@ -81,6 +81,11 @@ pub enum WorkerEvent {
         total_count: u32,
         /// Whether layers are present.
         has_layers: bool,
+        /// One `name<TAB>visible` line per group, in document order.
+        ///
+        /// The counts alone cannot populate a panel, and a panel that lists
+        /// "3 layers" without saying which is not a layers panel. [FR-VIEW-4]
+        data: String,
     },
     /// Embedded file attachments result. [FR-EMB, M1]
     AttachmentsResult {
@@ -267,11 +272,12 @@ has_structure={has_structure}\nfull_text={}\n",
             )
             .into_bytes()
         }
-        WorkerEvent::LayersResult { correlation_id, group_count, total_count, has_layers } => {
+        WorkerEvent::LayersResult { correlation_id, group_count, total_count, has_layers, data } => {
             format!(
                 "EVT:LAYERS_RESULT:{correlation_id}\n\
                  group_count={group_count}\ntotal_count={total_count}\n\
-                 has_layers={has_layers}\n"
+                 has_layers={has_layers}\ndata={}\n",
+                data.replace('\n', "\\n")
             )
             .into_bytes()
         }
@@ -666,12 +672,15 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
             let mut group_count = None;
             let mut total_count = None;
             let mut has_layers = None;
+            let mut data = None;
             for line in lines {
                 let Some((k, v)) = line.split_once('=') else { continue; };
                 match k {
                     "group_count" => group_count = Some(v.parse().map_err(|_| EventDecodeError::BadField("group_count"))?),
                     "total_count" => total_count = Some(v.parse().map_err(|_| EventDecodeError::BadField("total_count"))?),
                     "has_layers" => has_layers = Some(v == "true"),
+                    "data" => data = Some(v.replace("\n", "
+")),
                     _ => {}
                 }
             }
@@ -680,6 +689,7 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
                 group_count: group_count.ok_or(EventDecodeError::BadField("group_count"))?,
                 total_count: total_count.ok_or(EventDecodeError::BadField("total_count"))?,
                 has_layers: has_layers.ok_or(EventDecodeError::BadField("has_layers"))?,
+                data: data.unwrap_or_default(),
             })
         }
         "ATTACHMENTS_RESULT" => {

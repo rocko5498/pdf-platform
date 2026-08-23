@@ -394,11 +394,14 @@ impl WorkerSession {
                 group_count,
                 total_count,
                 has_layers,
+                data,
             }) if cid == correlation_id => Ok(StructureQueryResult {
                 kind: "layers".into(),
                 count: group_count,
                 total: total_count,
-                data: String::new(),
+                // One `name<TAB>visible` line per group; `String::new()` here
+                // used to drop the names on the floor. [FR-VIEW-4]
+                data,
                 flag: has_layers,
             }),
             Ok(WorkerEvent::RenderError {
