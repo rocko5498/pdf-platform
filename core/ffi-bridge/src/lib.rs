@@ -85,8 +85,13 @@ struct FormUndoEntry {
 /// A single undoable annotation operation. [FR-ANNOT-4, M4]
 #[derive(Debug, Clone)]
 enum AnnotUndoEntry {
-    /// Annotation was created -- undo removes it.
-    Created { id: u64, page_index: u32 },
+    /// Annotation was created — undo removes it, redo puts it back.
+    ///
+    /// Carries the annotation itself, not just its id. Holding only an id made
+    /// redo impossible: `redo_impl` had to return "redo not available for
+    /// create" — as an `Ok`, so the shell reported success and nothing
+    /// happened, while `can_redo()` kept saying yes. [FR-ANNOT-4, GR-8]
+    Created { annotation: pdf_model::annotation::Annotation, page_index: u32 },
     /// Annotation was deleted -- undo re-adds it.
     Deleted { annotation: pdf_model::annotation::Annotation, page_index: u32 },
 }
@@ -579,9 +584,12 @@ fn add_annotation_impl(
         ann.ensure_appearance();
         debug_assert!(ann.has_appearance());
         let _ = generate_appearance(&ann); // ensure generators stay warm
-        session.annotations.page_mut(page_index).add(ann);
-        // Track for undo. [FR-ANNOT-4, M4]
-        session.annot_undo_stack.push(AnnotUndoEntry::Created { id, page_index });
+        session.annotations.page_mut(page_index).add(ann.clone());
+        // Track for undo *with the data*, so redo can restore it.
+        // [FR-ANNOT-4, M4]
+        session
+            .annot_undo_stack
+            .push(AnnotUndoEntry::Created { annotation: ann, page_index });
         session.annot_redo_stack.clear();
         Ok(id)
     })
@@ -608,9 +616,9 @@ fn undo_impl() -> Result<String, String> {
         // Try annotation undo first.
         if let Some(entry) = session.annot_undo_stack.pop() {
             let msg = match &entry {
-                AnnotUndoEntry::Created { id, page_index } => {
-                    session.annotations.page_mut(*page_index).remove(*id);
-                    format!("undid create annotation {id}")
+                AnnotUndoEntry::Created { annotation, page_index } => {
+                    session.annotations.page_mut(*page_index).remove(annotation.id);
+                    format!("undid create annotation {}", annotation.id)
                 }
                 AnnotUndoEntry::Deleted { annotation, .. } => {
                     let page = annotation.page_index;
@@ -632,9 +640,17 @@ fn redo_impl() -> Result<String, String> {
         // Try annotation redo first.
         if let Some(entry) = session.annot_redo_stack.pop() {
             let msg = match &entry {
-                AnnotUndoEntry::Created { id, .. } => {
-                    // Can't redo a created annotation without the data -- undo delete instead.
-                    format!("redo not available for create {id}")
+                AnnotUndoEntry::Created { annotation, page_index } => {
+                    // Redo of a creation re-creates it. This used to return
+                    // Ok("redo not available for create N"): a success the shell
+                    // showed as a status message while the annotation stayed
+                    // gone, with the entry pushed back onto the undo stack so
+                    // the two stacks disagreed about reality. [FR-ANNOT-4, GR-8]
+                    session
+                        .annotations
+                        .page_mut(*page_index)
+                        .add(annotation.clone());
+                    format!("redid create annotation {}", annotation.id)
                 }
                 AnnotUndoEntry::Deleted { annotation, .. } => {
                     let page = annotation.page_index;
@@ -1297,5 +1313,128 @@ mod ffi {
         fn validate_form_impl() -> Result<String>;
         /// Flatten all form fields into page content. [FR-FORM-4, M5]
         fn flatten_form_impl() -> Result<String>;
+    }
+}
+
+#[cfg(test)]
+mod bridge_lifecycle_tests {
+    //! The bridge is the single boundary between the Qt shell and everything
+    //! this product does (ADR-004, FFI-1), and it had **no tests at all**. The
+    //! shell's QTests cover input translation and one tile render; every other
+    //! user action — annotate, undo, export, save — crossed untested code.
+    //!
+    //! These drive the real `*_impl` functions the way the shell does, and
+    //! assert outcomes rather than absence of error: an annotation must reach
+    //! the saved PDF's page `/Annots`, not merely be accepted by the call.
+    //!
+    //! One test, run serially on purpose: the bridge owns a process-wide
+    //! session, so splitting these into separate `#[test]` functions would let
+    //! cargo run them concurrently against the same global state.
+
+    use super::*;
+
+    fn fixture() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/corpus-diff/fixtures/valid-1page.pdf")
+    }
+
+    /// Put the worker where the bridge looks for it: beside the running
+    /// executable.
+    ///
+    /// That rule is right for the shipped app, where the worker sits next to
+    /// the binary. For a lib test the running executable is in `target/*/deps`,
+    /// and cargo only places the worker there on some platforms — Windows
+    /// found it, Linux and macOS did not. Staging a copy keeps the product's
+    /// resolution untouched. [SDS §3.1]
+    fn stage_worker_beside_test_executable() -> std::path::PathBuf {
+        let name = if cfg!(windows) { "worker.exe" } else { "worker" };
+        let exe = std::env::current_exe().expect("current exe");
+        let test_dir = exe.parent().expect("exe dir").to_path_buf();
+        let staged = test_dir.join(name);
+        if staged.is_file() {
+            return staged;
+        }
+        // The build output directory is the parent of `deps`.
+        let build_dir = if test_dir.ends_with("deps") {
+            test_dir.parent().expect("deps parent").to_path_buf()
+        } else {
+            test_dir.clone()
+        };
+        let built = build_dir.join(name);
+        assert!(
+            built.is_file(),
+            "worker binary not built at {}; run `cargo build -p worker-main`",
+            built.display()
+        );
+        std::fs::copy(&built, &staged).expect("stage worker beside the test executable");
+        staged
+    }
+
+    #[test]
+    fn annotate_save_and_reopen_through_the_bridge() {
+        let fixture = fixture();
+        assert!(fixture.is_file(), "fixture missing: {}", fixture.display());
+        // No skip: a test that returns quietly when its subject is missing
+        // cannot fail, which is the defect pattern this suite exists to catch.
+        let _worker = stage_worker_beside_test_executable();
+
+        let opened = open_document_impl(&fixture.to_string_lossy(), "")
+            .expect("open through the bridge");
+        assert_eq!(opened.page_count, 1);
+
+        // Nothing yet.
+        assert_eq!(annotation_count_impl().expect("count"), 0);
+
+        let id = add_annotation_impl(0, "highlight", 72.0, 700.0, 120.0, 16.0, "on the record")
+            .expect("add annotation");
+        assert!(id > 0, "annotation id must be usable as a handle");
+        assert_eq!(annotation_count_impl().expect("count"), 1);
+
+        // XFDF must carry the annotation out. [FR-ANNOT-5]
+        let xfdf = export_xfdf_impl().expect("export xfdf");
+        assert!(xfdf.contains("on the record"), "xfdf lost the contents: {xfdf}");
+        // XFDF names the element after the annotation type: `<Highlight ...>`.
+        assert!(
+            xfdf.contains("<Highlight "),
+            "xfdf lost the annotation type: {xfdf}"
+        );
+
+        // Undo must remove it, redo must bring it back. [FR-ANNOT-4]
+        undo_impl().expect("undo");
+        assert_eq!(annotation_count_impl().expect("count after undo"), 0);
+        redo_impl().expect("redo");
+        assert_eq!(annotation_count_impl().expect("count after redo"), 1);
+
+        let out = std::env::temp_dir().join("pdf-platform-bridge-annot.pdf");
+        let _ = std::fs::remove_file(&out);
+        save_document_impl(&out.to_string_lossy()).expect("save");
+        close_document_impl();
+
+        // The claim under test: the annotation is *in the file*, referenced by
+        // the page. A saved file that merely grew proves nothing — the stamp
+        // path passed that bar for months while drawing nothing.
+        let saved = std::fs::read(&out).expect("read saved file");
+        let text = String::from_utf8_lossy(&saved);
+        assert!(
+            text.contains("/Annots"),
+            "the saved page has no /Annots array, so no reader will show the annotation"
+        );
+        assert!(
+            text.contains("/Subtype /Highlight") || text.contains("/Subtype/Highlight"),
+            "no highlight annotation dictionary in the saved file"
+        );
+        assert!(
+            text.contains("on the record"),
+            "the annotation's contents did not survive the save"
+        );
+
+        // And it must still be a document: reopening exercises the parser over
+        // our own output, which is where the object over-read used to bite.
+        let reopened = open_document_impl(&out.to_string_lossy(), "").expect("reopen saved file");
+        assert_eq!(reopened.page_count, 1, "the saved file lost its page");
+        close_document_impl();
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(out.with_extension("xfdf"));
     }
 }
