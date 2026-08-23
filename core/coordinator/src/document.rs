@@ -480,16 +480,21 @@ impl DocumentCoordinator {
         let pages_bytes = self.session.get_object(pages_obj_num)?;
         let pages_text = String::from_utf8_lossy(&pages_bytes);
 
-        // Extract the Kids array content between /Kids [ and ].
-        let kids_bytes = self.extract_kids_array(&pages_text)
-            .ok_or_else(|| SessionError::Protocol("could not parse /Kids array".into()))?;
-
+        // The whole Pages object, not the contents between the brackets.
+        //
+        // This used to pass `extract_kids_array`'s output — the text *inside*
+        // `/Kids [ ... ]` — while `build_delete_pages_group` looks for the
+        // literal "/Kids [" in what it receives. It never found it, so every
+        // delete failed with "could not parse Kids array". The model's own test
+        // passed a whole page-tree object, so nothing caught the mismatch.
+        // [FR-ORG-1, PRIN-1]
         let group = build_delete_pages_group(
             page_indices,
             pages_obj_num,
-            &kids_bytes,
+            &pages_bytes,
             self.summary.page_count,
-        ).map_err(|e| SessionError::Protocol(e))?;
+        )
+        .map_err(SessionError::Protocol)?;
 
         self.apply_command_group(group)
     }
@@ -506,21 +511,21 @@ impl DocumentCoordinator {
         // Parse kid references to get page object numbers.
         let kid_refs = self.parse_kid_references(&pages_text);
 
-        // Read current rotation for each page.
-        let page_obj_rotations: Vec<(u32, u32)> = page_indices.iter()
-            .filter_map(|&page_idx| {
-                kid_refs.get(page_idx as usize).map(|&obj_num| {
-                    let rotation = self.read_page_rotation(obj_num);
-                    (obj_num, rotation)
-                })
-            })
-            .collect();
+        // Fetch each page as it stands. Rotation patches the existing
+        // dictionary, so the bytes are the input — passing object numbers and
+        // rotations separately is what let the caller and the builder disagree
+        // about which was which. [FR-ROTATE]
+        let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
+        for &page_idx in page_indices {
+            let obj_num = *kid_refs.get(page_idx as usize).ok_or_else(|| {
+                SessionError::Protocol(format!("page {page_idx} is not in the page tree"))
+            })?;
+            let bytes = self.session.get_object(obj_num)?;
+            pages.push((obj_num, bytes));
+        }
 
-        let group = build_rotate_pages_group(
-            page_indices,
-            &page_obj_rotations,
-            degrees,
-        ).map_err(|e| SessionError::Protocol(e))?;
+        let group = build_rotate_pages_group(&pages, degrees)
+            .map_err(SessionError::Protocol)?;
 
         self.apply_command_group(group)
     }
