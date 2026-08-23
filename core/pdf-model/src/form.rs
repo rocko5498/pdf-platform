@@ -82,14 +82,14 @@ pub enum ValidationRule {
     MaxLength(u32),
     /// Minimum text length.
     MinLength(u32),
-    /// Regex pattern.
-    Pattern(String),
-    /// Custom validation message.
-    Custom {
-        /// Short description of the rule.
-        description: String,
-    },
 }
+
+// `Pattern(String)` and `Custom { description }` used to sit here. Nothing
+// constructed either one, and `validate` matched both with an empty body — so
+// a field carrying a pattern rule validated clean no matter what was typed
+// into it. A rule that cannot fail is worse than no rule: it reports a
+// verification that never happened. They come back with an implementation, or
+// not at all. [PRIN-6, GR-8, FR-FORM-5]
 
 /// JavaScript calculation for a field (simplified representation). [FR-JS-1]
 #[derive(Debug, Clone)]
@@ -244,19 +244,6 @@ impl FormField {
                             ));
                         }
                     }
-                }
-                ValidationRule::Pattern(ref _pat) => {
-                    if let FieldValue::Text(ref s) = self.value {
-                        if !s.is_empty() {
-                            // Simple pattern check (not full regex — that would need a regex crate).
-                            // Just check if the pattern string appears as a substring for now.
-                            // A proper implementation would use regex matching.
-                        }
-                    }
-                }
-                ValidationRule::Custom { description: _ } => {
-                    // Custom validation — would need a callback system.
-                    // For M5, custom rules are recorded but not auto-evaluated.
                 }
             }
         }
