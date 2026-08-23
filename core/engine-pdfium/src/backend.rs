@@ -423,10 +423,20 @@ impl engine_api::structure::Structure for PdfiumEngine {
         for (i, page) in pages.iter().enumerate() {
             let width = page.width().value;
             let height = page.height().value;
-            // PDFium reports rotation via the page's /Rotate entry.
-            // pdfium-render doesn't expose rotation directly, so we default to 0.
-            // TODO: extract rotation from page dictionary when pdfium-render adds support.
-            let rotation = 0u32;
+            // This was hard-coded to 0 with a comment saying pdfium-render did
+            // not expose rotation. It does: `PdfPage::rotation()`. Every page
+            // of every document therefore reported "not rotated", including
+            // pages the product had just rotated itself. [FR-ORG-2, PRIN-6]
+            let rotation = match page.rotation() {
+                Ok(pdfium_render::prelude::PdfPageRenderRotation::None) => 0,
+                Ok(pdfium_render::prelude::PdfPageRenderRotation::Degrees90) => 90,
+                Ok(pdfium_render::prelude::PdfPageRenderRotation::Degrees180) => 180,
+                Ok(pdfium_render::prelude::PdfPageRenderRotation::Degrees270) => 270,
+                // A page whose rotation cannot be read is reported upright
+                // rather than failing the whole structure query; the width and
+                // height above already account for it.
+                Err(_) => 0,
+            };
             metas.push(engine_api::structure::PageMeta {
                 index: i as u32,
                 width,
