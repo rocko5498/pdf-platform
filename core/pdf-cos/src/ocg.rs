@@ -8,7 +8,7 @@
 //! already parses the catalog, so it is read here rather than left unanswered.
 
 use crate::scan::{
-    fetch_object, find_indirect_ref, find_key, find_startxref, find_trailer, parse_xref_table,
+    fetch_object, find_indirect_ref, find_key, find_startxref, find_trailer, parse_xref_chain,
 };
 
 /// One optional content group as the document declares it.
@@ -36,8 +36,10 @@ pub fn parse_optional_content_groups(data: &[u8]) -> Vec<OptionalContentGroup> {
     let Some(xref_offset) = find_startxref(data) else {
         return Vec::new();
     };
-    let mut visited = Vec::new();
-    let Ok(xref) = parse_xref_table(data, xref_offset, &mut visited) else {
+    // The whole /Prev chain: a document whose last update added a signature
+    // keeps its optional content in an earlier section.
+    let mut leniency = Vec::new();
+    let Ok(xref) = parse_xref_chain(data, xref_offset, &mut leniency) else {
         return Vec::new();
     };
     let Some(trailer) = find_trailer(data, xref_offset) else {
