@@ -23,6 +23,8 @@
 
 #include "registry.h"
 #include <QLineEdit>
+#include <QMenu>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
@@ -235,6 +237,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 void MainWindow::setupChrome() {
     canvas_ = new CanvasWidget(this);
     setCentralWidget(canvas_);
+    buildMenuBar();
     connect(canvas_, &CanvasWidget::pageStepRequested, this, [this](int d) {
         if (d <= -100000)
             goToPage(0);
@@ -782,8 +785,8 @@ void MainWindow::goToPage(int page) {
     announceDocumentStatus();
 }
 
-void MainWindow::zoomBy(int steps) {
-    scale_ *= (steps > 0) ? 1.15f : (1.f / 1.15f);
+void MainWindow::applyScale(float scale) {
+    scale_ = scale;
     if (scale_ < 0.25f) scale_ = 0.25f;
     if (scale_ > 8.f) scale_ = 8.f;
     clampScroll();
@@ -793,6 +796,112 @@ void MainWindow::zoomBy(int steps) {
         canvas_->setProperty("zoomLevel", int(scale_ * 100));
         QAccessibleEvent ev(canvas_, QAccessible::ValueChanged);
         QAccessible::updateAccessibility(&ev);
+    }
+}
+
+void MainWindow::zoomBy(int steps) {
+    applyScale(scale_ * ((steps > 0) ? 1.15f : (1.f / 1.15f)));
+}
+
+void MainWindow::zoomToFitPage() {
+    // `view.zoom_fit` has been in the registry — and in the View menu's
+    // declared taxonomy — since M1, and nothing implemented it: Ctrl+0 was a
+    // key the stability contract promised and the application ignored, which is
+    // the dead binding ADR-032 forbids. [ADR-032, FR-VIEW-1, GR-8]
+    if (!canvas_ || page_height_ <= 0.f) return;
+    const float viewport = float(canvas_->height());
+    if (viewport <= 0.f) return;
+    applyScale(viewport / page_height_);
+    scroll_y_ = float(current_page_) * (page_height_ * scale_ + 16.f);
+    clampScroll();
+    renderVisibleTiles();
+}
+
+void MainWindow::openDocumentViaDialog() {
+    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Open PDF"), {},
+                                                      QStringLiteral("PDF (*.pdf)"));
+    if (!path.isEmpty()) openDocument(path);
+}
+
+QList<QString> MainWindow::handledActions() { return actionTable().keys(); }
+
+const QHash<QString, MainWindow::ActionHandler>& MainWindow::actionTable() {
+    // A table rather than an `if` chain so `handledActions()` and the dispatch
+    // cannot disagree: the menu test asserts every declared item is a key here,
+    // and these same keys are what runs. [ADR-032, T-8]
+    static const QHash<QString, ActionHandler> handlers = {
+        {QStringLiteral("document.open"), &MainWindow::openDocumentViaDialog},
+        {QStringLiteral("document.close"), &MainWindow::closeCurrentDocument},
+        {QStringLiteral("app.quit"), &MainWindow::quitApplication},
+        {QStringLiteral("view.zoom_in"), &MainWindow::zoomIn},
+        {QStringLiteral("view.zoom_out"), &MainWindow::zoomOut},
+        {QStringLiteral("view.zoom_fit"), &MainWindow::zoomToFitPage},
+        {QStringLiteral("nav.next_page"), &MainWindow::goToNextPage},
+        {QStringLiteral("nav.prev_page"), &MainWindow::goToPreviousPage},
+        {QStringLiteral("nav.first_page"), &MainWindow::goToFirstPage},
+        {QStringLiteral("nav.last_page"), &MainWindow::goToLastPage},
+    };
+    return handlers;
+}
+
+void MainWindow::triggerAction(const QString& action) {
+    const auto handler = actionTable().constFind(action);
+    if (handler == actionTable().constEnd()) {
+        // A menu the registry declares and nothing implements would otherwise
+        // be a silently inert item. [GR-8]
+        qWarning() << "no handler for action" << action;
+        return;
+    }
+    (this->*(*handler))();
+}
+
+void MainWindow::closeCurrentDocument() {
+    clearDocumentUi();
+    setWindowTitle(QStringLiteral("PDF Platform — no document"));
+}
+
+void MainWindow::quitApplication() { close(); }
+
+void MainWindow::zoomIn() { zoomBy(+1); }
+
+void MainWindow::zoomOut() { zoomBy(-1); }
+
+void MainWindow::goToNextPage() { goToPage(int(current_page_) + 1); }
+
+void MainWindow::goToPreviousPage() { goToPage(int(current_page_) - 1); }
+
+void MainWindow::goToFirstPage() { goToPage(0); }
+
+void MainWindow::goToLastPage() {
+    if (page_count_ == 0) return;
+    goToPage(int(page_count_) - 1);
+}
+
+void MainWindow::buildMenuBar() {
+    // Built from the declared taxonomy, including the shortcut text, so the
+    // menu and the key that triggers it are the same contract. [ADR-032, DS-MENU-1]
+    const auto& registry = chrome::shortcuts();
+    QMenuBar* bar = menuBar();
+    bar->setAccessibleName(QStringLiteral("Main menu"));
+    for (const chrome::Menu& menu : registry.menus()) {
+        QMenu* qmenu = bar->addMenu(menu.title);
+        qmenu->setObjectName(menu.id);
+        qmenu->setAccessibleName(QString(menu.title).remove(QLatin1Char('&')));
+        for (const chrome::MenuItem& item : menu.items) {
+            if (item.separator) {
+                qmenu->addSeparator();
+                continue;
+            }
+            QAction* action = qmenu->addAction(item.title);
+            action->setObjectName(item.action);
+            action->setData(item.action);
+            action->setShortcut(registry.key(item.action));
+            // QAction is not a widget and has no accessible name of its own:
+            // Qt derives it from the action's text, mnemonic stripped. The
+            // menu itself is a widget, so that one is named above.
+            const QString id = item.action;
+            connect(action, &QAction::triggered, this, [this, id]() { triggerAction(id); });
+        }
     }
 }
 
@@ -1061,9 +1170,7 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
     // [ADR-032, DS-CONV-4, PRIN-4]
     const auto& keys = chrome::shortcuts();
     if (keys.matches(QStringLiteral("document.open"), event)) {
-        QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Open PDF"), {},
-                                                    QStringLiteral("PDF (*.pdf)"));
-        if (!path.isEmpty()) openDocument(path);
+        triggerAction(QStringLiteral("document.open"));
         event->accept();
         return;
     }

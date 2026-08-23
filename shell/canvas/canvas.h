@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <QHash>
 #include <QImage>
 #include <QKeyEvent>
 #include <QMainWindow>
@@ -93,8 +94,17 @@ public:
     CanvasWidget* canvasWidget() const { return canvas_; }
 
 public slots:
+    /// Perform the action `id` names, whatever invoked it.
+    ///
+    /// The menu bar and the key handler both come through here, so a menu item
+    /// and its shortcut cannot drift apart — which is the point of the registry
+    /// being the contract. [ADR-032, DS-MENU-1, PRIN-4]
+    void triggerAction(const QString& action);
+
     void goToPage(int page);
     void zoomBy(int steps);
+    /// Scale the page so its height fits the viewport. [FR-VIEW-1, DS-ZOOM-1]
+    void zoomToFitPage();
     void findNext();
     void findPrevious();
     void performSearch(const QString& query);
@@ -109,8 +119,30 @@ public slots:
 protected:
     void keyPressEvent(QKeyEvent* event) override;
 
+public:
+    /// Action ids `triggerAction` implements.
+    ///
+    /// The menu test asserts every declared menu item appears here: a menu
+    /// entry nothing implements is the dead binding ADR-032 exists to prevent.
+    static QList<QString> handledActions();
+
 private:
+    /// What one declared action does.
+    using ActionHandler = void (MainWindow::*)();
+    static const QHash<QString, ActionHandler>& actionTable();
+
     void setupChrome();
+    void buildMenuBar();
+    void openDocumentViaDialog();
+    void closeCurrentDocument();
+    void quitApplication();
+    void zoomIn();
+    void zoomOut();
+    void goToNextPage();
+    void goToPreviousPage();
+    void goToFirstPage();
+    void goToLastPage();
+    void applyScale(float scale);
     bool openDocumentWithPassword(const QString& path, const QString& password, bool* needs_password = nullptr);
     bool renderCurrentPage();
     bool renderVisibleTiles();

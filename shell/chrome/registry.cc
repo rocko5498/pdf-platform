@@ -119,6 +119,48 @@ ShortcutRegistry ShortcutRegistry::load(const QString& path) {
     if (registry.bindings_.isEmpty()) {
         fail(path, QStringLiteral("[shortcuts] is empty"));
     }
+
+    // The menu taxonomy. Every item names an action that must already be
+    // declared above: a menu entry bound to nothing is the dead binding
+    // ADR-032 exists to prevent, and `tools/check-ui-registry` rejects it in
+    // the file. Reading it here is what turns the table into a menu bar.
+    if (root.contains("menus")) {
+        for (const auto& entry : toml::find<toml::array>(root, "menus")) {
+            Menu menu;
+            menu.id = QString::fromStdString(toml::find_or<std::string>(entry, "id", ""));
+            menu.title = QString::fromStdString(toml::find_or<std::string>(entry, "title", ""));
+            if (menu.id.isEmpty() || menu.title.isEmpty()) {
+                fail(path, QStringLiteral("a menu needs both 'id' and 'title'"));
+            }
+            if (!entry.contains("items")) {
+                fail(path, QStringLiteral("menu '%1' has no items").arg(menu.id));
+            }
+            for (const auto& item_value : toml::find<toml::array>(entry, "items")) {
+                MenuItem item;
+                if (toml::find_or<bool>(item_value, "separator", false)) {
+                    item.separator = true;
+                    menu.items.append(item);
+                    continue;
+                }
+                item.action =
+                    QString::fromStdString(toml::find_or<std::string>(item_value, "action", ""));
+                item.title =
+                    QString::fromStdString(toml::find_or<std::string>(item_value, "title", ""));
+                if (item.action.isEmpty() || item.title.isEmpty()) {
+                    fail(path, QStringLiteral("menu '%1' has an item without an action or a title")
+                                   .arg(menu.id));
+                }
+                if (!registry.bindings_.contains(item.action)) {
+                    fail(path, QStringLiteral(
+                                   "menu '%1' names action '%2', which [shortcuts] does not declare")
+                                   .arg(menu.id, item.action));
+                }
+                menu.items.append(item);
+            }
+            registry.menus_.append(menu);
+        }
+    }
+
     return registry;
 }
 

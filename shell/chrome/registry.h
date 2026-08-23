@@ -27,6 +27,23 @@ struct Binding {
     QList<QKeySequence> alternates;
 };
 
+/// One entry in a declared menu: an action, or a separator.
+struct MenuItem {
+    /// Action id this item invokes. Empty for a separator.
+    QString action;
+    /// Title as the taxonomy declares it, mnemonic included.
+    QString title;
+    /// True when this item is a rule between groups.
+    bool separator = false;
+};
+
+/// One declared top-level menu. [DS-MENU-1, ADR-032]
+struct Menu {
+    QString id;
+    QString title;
+    QList<MenuItem> items;
+};
+
 /// Parsed `ui-registry.toml`.
 class ShortcutRegistry {
 public:
@@ -54,6 +71,14 @@ public:
     /// Action ids the registry declares.
     QList<QString> actions() const { return bindings_.keys(); }
 
+    /// The declared menu taxonomy, in file order.
+    ///
+    /// `[[menus]]` has been in the contract file since M1 and nothing read it:
+    /// the taxonomy DS-MENU-* and PRIN-4 call a stability contract existed only
+    /// as a table nobody parsed, and the application had no menu bar at all.
+    /// [ADR-032, DS-MENU-1, PRIN-4]
+    const QList<Menu>& menus() const { return menus_; }
+
     /// Throws unless every id in `required` is declared. Called at startup so a
     /// binding the shell dispatches but the registry omits is a loud failure,
     /// not a silently dead key.
@@ -61,6 +86,7 @@ public:
 
 private:
     QHash<QString, Binding> bindings_;
+    QList<Menu> menus_;
     QString profile_version_;
     int schema_version_ = 0;
 };

@@ -72,3 +72,19 @@ set_tests_properties(shell.registry_binding PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
 )
+
+# ADR-032: the declared menu taxonomy must be what the application builds.
+# `[[menus]]` was read by nothing until this test's subject existed. [ADR-032, DS-MENU-1, T-8]
+add_executable(shell-menu-bar-test
+    menu_bar_test.cc
+)
+target_link_libraries(shell-menu-bar-test PRIVATE
+    shell-canvas
+    Qt6::Test
+    Qt6::Widgets
+)
+add_test(NAME shell.menu_bar COMMAND shell-menu-bar-test)
+set_tests_properties(shell.menu_bar PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;PDF_PLATFORM_UI_REGISTRY=${CMAKE_SOURCE_DIR}/chrome/ui-registry.toml"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
+)
