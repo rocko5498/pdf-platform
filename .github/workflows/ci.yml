@@ -119,7 +119,21 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP "qpdf.zip"
           $dest = Join-Path $env:RUNNER_TEMP "qpdf"
           $url = "https://github.com/qpdf/qpdf/releases/download/v$version/qpdf-$version-msvc64.zip"
-          Invoke-WebRequest -Uri $url -OutFile $zip
+          # Retry the download. A transient "Unable to read data from the
+          # transport connection" here fails the whole Rust job, which reads as
+          # a code failure and is not one. Three attempts, then give up loudly.
+          $attempt = 0
+          while ($true) {
+            $attempt++
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $zip
+              break
+            } catch {
+              if ($attempt -ge 3) { throw }
+              Write-Host "qpdf download attempt $attempt failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds (5 * $attempt)
+            }
+          }
           Expand-Archive -Path $zip -DestinationPath $dest -Force
           $qpdfExe = Get-ChildItem -Path $dest -Recurse -Filter qpdf.exe | Select-Object -First 1
           if (-not $qpdfExe) { throw "qpdf.exe not found after extract from $url" }
