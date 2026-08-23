@@ -5,7 +5,7 @@
 //! plus honesty notes — never a false success (PRIN-6).
 
 use crate::scan::{
-    fetch_key_dict, fetch_object, find_indirect_ref, find_key, find_startxref, find_trailer,
+    fetch_key_dict, fetch_object, find_indirect_ref, find_key, find_startxref,
     InflatedObjects,
     parse_uint, skip_ws, XrefEntry,
 };
