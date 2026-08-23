@@ -23,3 +23,9 @@ diagnostics     = { path = "../diagnostics" }
 # MIT OR Apache-2.0. Exit seam: broker::UtilityGrantRegistry::issue_at.
 getrandom       = "0.4"
 base64          = "0.22"
+
+[dev-dependencies]
+# Test-only: builds PDF 1.5+ fixtures (object streams, xref streams) so what is
+# being parsed is visible in the test rather than checked in as a blob. Already
+# in the lockfile via pdf-cos; MIT OR Apache-2.0. [ADR-028, §6]
+flate2 = "1"
