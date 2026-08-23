@@ -34,7 +34,7 @@ is silent or ambiguous, **stop and ask** — do not guess.
 
 Run this at the start of every work session, in order:
 
-1. **Load context** — read `AGENTS.md` (this file) and `CLAUDE.md` if present.
+1. **Load context** — read `AGENTS.md` (this file). It is the whole contract; there is no tool-specific companion.
 2. **Check current milestone** — read `docs/system-design-specification.md §14`
    to know which milestone (M0–M12) is active.
 3. **Check open work** — read `.agent-state/handoff.md` if it exists (§6 below).
@@ -202,5 +202,5 @@ third_party/   Vendored engines (PDFium etc.)
 
 ---
 
-*This file is tool-agnostic and applies equally to Claude Code, Cursor, Copilot,
-Aider, or any other AI coding agent. Keep it up to date as the project evolves.*
+*This file is tool-agnostic: it applies equally to any AI coding agent and to
+human contributors.*

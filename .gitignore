@@ -25,7 +25,7 @@ CMakeFiles/
 # only third_party/pdfium/provenance.toml is committed. [ADR-028 §3]
 /third_party/pdfium/prebuilt/
 
-# Node (Claude Code / tooling)
+# Node (tooling)
 node_modules/
 
 # Python (tools/ gate scripts leave bytecode caches)
@@ -41,9 +41,14 @@ Thumbs.db
 
 # Agent session state (ephemeral, not committed)
 .agent-state/
-.claude/settings.local.json
 .swarm/
-.serena/cache/
+# Agent tooling scratch. These are one contributor's local tool state, not
+# project artifacts: nothing in the repository reads them, and .serena's
+# memories carried a stale status claim ("M0-M7 complete", "232 passing") that
+# was wrong and published. Keep the tools; keep their state out of the repo.
+.serena/
+.mimocode/
+.claude/
 # Local vector/index caches — may contain indexed source; never commit (GIT-5)
 ruvector.db
 .codebase-memory/

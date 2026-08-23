@@ -156,7 +156,7 @@ fn render_tile_real_pdf_via_pdfium() {
     // so it passed on a machine with no engine at all — which is precisely what
     // M0's exit criterion needs proven. PDFium is provisioned before the build
     // now (ADR-038), so an unavailable engine is a real defect, not the
-    // environment. [AGENTS §11, ADR-022 T-5, PRIN-6, GR-8]
+    // environment. [SDS §14 M0, ADR-022 T-5, PRIN-6, GR-8]
     let pdf = fixture_pdf();
     assert!(
         pdf.is_file(),

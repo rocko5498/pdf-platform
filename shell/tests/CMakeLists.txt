@@ -16,7 +16,7 @@ set_tests_properties(shell.canvas_input PROPERTIES
 )
 
 # M0 exit criterion: tile through real bridge + IPC + shmem, on every OS.
-# [AGENTS §11, ADR-022 T-5, ADR-029]
+# [SDS §14 M0, ADR-022 T-5, ADR-029]
 #
 # Needs two runtime inputs the input test does not: the worker binary, which
 # the bridge spawns from its own executable's directory, and a provisioned
