@@ -5,21 +5,21 @@
 name: ci
 
 on:
-  # ADR-029 §1 calls for a "PR pipeline (fast, path-aware)". It was not path
-  # aware at all: a pull request touching only markdown ran a three-OS Rust
-  # build and full test suite, which cannot be affected by it. Nothing in CI
-  # reads docs/ — check-citations is not wired in, and the a11y and p95 scripts
-  # read shell/ and tools/bench/*.toml — so skipping these paths cannot hide a
-  # real failure. A PR touching both docs and code still runs, because
-  # paths-ignore only skips when *every* changed file matches. [ADR-029 §1]
+  # ADR-029 §1 calls for a "PR pipeline (fast, path-aware)". A pull request
+  # touching only markdown should not run a three-OS Rust build.
+  #
+  # `docs/**` is deliberately NOT ignored any more. CI now runs
+  # `tools/check-citations`, which reads the canonical documents: deleting or
+  # renaming an identifier there breaks code that cites it, so a docs-only
+  # change can now fail a gate and must be allowed to run one. The reasoning
+  # that justified skipping docs — "nothing in CI reads docs/" — stopped being
+  # true the moment the G-1 gate was wired in. [ADR-029 §1, G-1]
   # The two paths-ignore lists are duplicated on purpose. YAML anchors are not
   # dependably supported by the Actions parser, and a workflow that fails to
   # parse is worse than four repeated lines. Keep them in sync.
   push:
     branches: [main]
     paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
       - 'LICENSE'
       - '.agent-state/**'
   # No base-branch filter. Restricting this to `branches: [main]` meant a PR
@@ -28,8 +28,6 @@ on:
   # which gates the PR pipeline, not one destination. [ADR-029]
   pull_request:
     paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
       - 'LICENSE'
       - '.agent-state/**'
 
@@ -51,6 +49,15 @@ jobs:
       # NEW CI DEPENDENCY (AI-4): published by cargo-deny's own maintainers, and
       # cargo-deny is the tool ADR-028 §1 names. Pinned to a major tag, matching
       # how the other actions in this workflow are pinned.
+      # G-1 requires every change to cite the requirement or decision it
+      # implements, and AI-2 puts an uncitable change out of scope.
+      # `tools/check-citations` has existed since 2026-07-27 and was never run
+      # by CI, so it could not fail: two invented identifiers (FR-ASSM-1,
+      # FR-ASSM-2) reached main through a PR that CI passed. A gate nothing
+      # runs is not a gate. [G-1, AI-2, ADR-024]
+      - name: G-1 citation traceability
+        run: cargo run -q --manifest-path tools/check-citations/Cargo.toml
+
       - name: Licence allowlist (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
