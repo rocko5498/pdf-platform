@@ -6,7 +6,7 @@
 
 use crate::scan::{
     fetch_key_dict, fetch_object, find_indirect_ref, find_key, find_startxref, find_trailer,
-    parse_int_after_key, parse_uint, parse_xref_table, skip_ws, XrefEntry,
+    parse_uint, skip_ws, XrefEntry,
 };
 
 /// Find a PDF name key with name-boundary so `/T` does not match `/Type`. [FR-FORM-1]
@@ -84,7 +84,7 @@ pub fn extract_acroform_fields(data: &[u8]) -> Result<AcroFormScan, String> {
     let mut notes = Vec::new();
     let xref_offset = find_startxref(data).ok_or_else(|| "no startxref".to_string())?;
     let mut leniency = Vec::new();
-    let xref = parse_xref_table(data, xref_offset, &mut leniency)
+    let xref = crate::scan::parse_xref_chain(data, xref_offset, &mut leniency)
         .map_err(|e| format!("xref: {e}"))?;
     for e in &leniency {
         notes.push(format!("leniency:{}:{}", e.kind, e.detail));

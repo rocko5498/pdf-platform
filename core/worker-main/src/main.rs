@@ -821,10 +821,15 @@ fn handle_get_object(
     };
 
     // Parse the xref table to get object offsets.
-    let entries = match parse_xref_table(&map, xref_offset) {
-        Some(e) => e,
-        None => {
-            send_error(transport, correlation_id, "failed to parse xref");
+    // The whole /Prev chain. This used to be a private copy of the parser
+    // that read only the newest section, so an object left untouched by an
+    // incremental update — the shape of every third-party signed, commented
+    // or filled PDF — could not be fetched. [FR-VIEW-2, SDS §3.1]
+    let mut leniency = Vec::new();
+    let entries = match pdf_cos::scan::parse_xref_chain(&map, xref_offset, &mut leniency) {
+        Ok(entries) => entries,
+        Err(error) => {
+            send_error(transport, correlation_id, &format!("failed to parse xref: {error:?}"));
             return;
         }
     };
@@ -892,77 +897,8 @@ fn find_startxref(data: &[u8]) -> Option<usize> {
     std::str::from_utf8(&tail[start..i]).ok()?.parse().ok()
 }
 
-#[derive(Clone, Default)]
-struct XrefEntry {
-    offset: u64,
-    in_use: bool,
-}
 
-fn parse_xref_table(data: &[u8], offset: usize) -> Option<Vec<XrefEntry>> {
-    let d = data.get(offset..)?;
-    if !d.starts_with(b"xref") {
-        return None;
-    }
-    let mut pos = 4;
-    skip_ws(d, &mut pos);
-    let mut entries: Vec<XrefEntry> = Vec::new();
-    loop {
-        if d.get(pos..).map_or(false, |s| s.starts_with(b"trailer")) {
-            break;
-        }
-        let first = parse_uint(d, &mut pos)?;
-        skip_ws(d, &mut pos);
-        let count = parse_uint(d, &mut pos)?;
-        skip_ws(d, &mut pos);
-        // skip eol
-        if d.get(pos) == Some(&b'\r') {
-            pos += 1;
-        }
-        if d.get(pos) == Some(&b'\n') {
-            pos += 1;
-        }
 
-        let needed = first + count;
-        if entries.len() < needed {
-            entries.resize(needed, XrefEntry::default());
-        }
-        for obj in first..first + count {
-            if pos + 20 > d.len() {
-                break;
-            }
-            let entry_bytes = &d[pos..pos + 20];
-            let offset_bytes = &entry_bytes[0..10];
-            let in_use = entry_bytes.get(17) == Some(&b'n');
-            let byte_offset = std::str::from_utf8(offset_bytes)
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            entries[obj] = XrefEntry {
-                offset: byte_offset,
-                in_use,
-            };
-            pos += 20;
-        }
-    }
-    Some(entries)
-}
-
-fn parse_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
-    let start = *pos;
-    while *pos < data.len() && data[*pos].is_ascii_digit() {
-        *pos += 1;
-    }
-    if *pos == start {
-        return None;
-    }
-    std::str::from_utf8(&data[start..*pos]).ok()?.parse().ok()
-}
-
-fn skip_ws(data: &[u8], pos: &mut usize) {
-    while *pos < data.len() && matches!(data[*pos], b' ' | b'\t' | b'\r' | b'\n') {
-        *pos += 1;
-    }
-}
 
 /// Evaluate forms JS subset expression in Z1 (isolated path). [ADR-017, FR-JS-*, M5]
 fn handle_forms_calc(
