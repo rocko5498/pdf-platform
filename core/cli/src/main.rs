@@ -840,16 +840,21 @@ fn cmd_validate_signatures(path: &Path) {
     println!("Found {} signature(s) in {}", signatures.len(), path.display());
     println!();
 
-    // `extract_xref_offsets` is not implemented and returns an empty map, so
-    // every post-signing change check inside `validate_signature` trivially
-    // passes and the verdict falls through to Valid. A ByteRange hash proves
-    // only that the *signed* bytes are intact; an illegal post-signing edit is
-    // an appended incremental update that leaves that hash matching. Reporting
-    // Valid here would be a false valid, which FR-SIG-1 forbids and
-    // MET-FEAT-6 makes absolute — so results are downgraded to Indeterminate
-    // until real xref extraction lands. [FR-SIG-1, PRIN-6, MET-FEAT-6]
-    let xref = extract_xref_offsets(&file_bytes);
-    let change_evidence_available = !xref.is_empty();
+    // Post-signing change detection needs two xref tables: the one the signer
+    // saw, and the one the file has now. Until 2026-08-22 `extract_xref_offsets`
+    // returned an empty map and both arguments were the same empty vector, so
+    // every change check trivially passed; the verdict was downgraded to
+    // Indeterminate rather than reported as Valid, because a ByteRange hash
+    // proves only that the *signed* bytes are intact and an illegal edit is an
+    // appended revision that leaves that hash matching.
+    //
+    // Both tables are real now. What is still **not** implemented is
+    // cryptography: no CMS signature is verified and no digest is computed, so
+    // a Valid here means "no prohibited structural change was detected", never
+    // "this signature is cryptographically sound". `require_change_evidence`
+    // keeps the verdict Indeterminate whenever either table is unavailable.
+    // [FR-SIG-1, MET-FEAT-6, PRIN-6, GR-8]
+    let current_xref = extract_xref_offsets(&file_bytes);
 
     let mut all_valid = true;
     for (i, sig) in signatures.iter().enumerate() {
@@ -865,9 +870,14 @@ fn cmd_validate_signatures(path: &Path) {
         }
         println!();
 
-        // Validate.
+        // Validate against the revision this signature actually covers, not
+        // against the current file twice — comparing a table with itself can
+        // only ever report "nothing changed". [FR-SIG-1]
+        let signed_xref = xref_offsets_at_signing(&file_bytes, &sig.byte_range);
+        let change_evidence_available = !current_xref.is_empty() && signed_xref.is_some();
+        let signed_xref = signed_xref.unwrap_or_default();
         let report = sign::require_change_evidence(
-            validate_signature(&file_bytes, sig, &xref, &xref),
+            validate_signature(&file_bytes, sig, &signed_xref, &current_xref),
             change_evidence_available,
         );
 
@@ -1723,10 +1733,131 @@ fn cmd_compare(path1: &Path, path2: &Path) {
 }
 
 /// Extract xref offsets from the PDF. [FR-SIG-2]
-fn extract_xref_offsets(_bytes: &[u8]) -> Vec<(u32, u64)> {
-    // Simplified: return empty for now. A proper implementation would
-    // parse the xref table/stream to get object→offset mappings.
-    Vec::new()
+fn extract_xref_offsets(bytes: &[u8]) -> Vec<(u32, u64)> {
+    xref_offsets_of_revision(bytes).unwrap_or_default()
+}
+
+/// Object -> byte offset for the revision that `bytes` ends at.
+///
+/// Follows the xref chain from the file's last `startxref` through every
+/// `/Prev`, merging oldest first so a later revision's entry wins — which is
+/// what "the effective object" means in an incrementally updated file.
+///
+/// Returns `None` when the chain cannot be parsed. That matters: the caller
+/// reports Indeterminate without this evidence, and a *guess* at object offsets
+/// would turn a signature check into a false Valid. Nothing here reconstructs
+/// offsets by scanning for `N G obj` headers, even though `pdf_cos::xref` can:
+/// a damaged xref is exactly the case where an attacker-controlled file should
+/// not be given the benefit of the doubt. [FR-SIG-1, MET-FEAT-6, PRIN-6, GR-8]
+fn xref_offsets_of_revision(bytes: &[u8]) -> Option<Vec<(u32, u64)>> {
+    use pdf_cos::xref::{parse_classic_xref, parse_xref_stream, XrefTable};
+
+    let mut sections: Vec<XrefTable> = Vec::new();
+    let mut next_offset = pdf_cos::scan::find_startxref(bytes);
+    let mut seen: Vec<usize> = Vec::new();
+
+    while let Some(offset) = next_offset {
+        // A /Prev loop is malformed and, followed blindly, does not terminate.
+        if seen.contains(&offset) || sections.len() > MAX_XREF_SECTIONS {
+            break;
+        }
+        seen.push(offset);
+
+        let mut leniency = Vec::new();
+        let table = match parse_classic_xref(bytes, offset, &mut leniency) {
+            Ok(table) => table,
+            Err(_) => {
+                // Not a classic table: PDF 1.5+ may put the xref in a stream
+                // object that begins at this same offset.
+                let body = object_body_at(bytes, offset)?;
+                parse_xref_stream(bytes, body, &mut leniency).ok()?
+            }
+        };
+        next_offset = previous_xref_offset(bytes, offset);
+        sections.push(table);
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    // Oldest first, so newer revisions overwrite.
+    let mut effective = XrefTable::new();
+    for table in sections.iter().rev() {
+        effective.merge(table);
+    }
+
+    let offsets: Vec<(u32, u64)> = effective
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(obj_num, entry)| *obj_num > 0 && entry.in_use && entry.entry_type == 1)
+        .map(|(obj_num, entry)| (obj_num as u32, entry.offset))
+        .collect();
+
+    if offsets.is_empty() {
+        None
+    } else {
+        Some(offsets)
+    }
+}
+
+/// Depth limit for the `/Prev` chain: untrusted input, bounded work. [GR-7]
+const MAX_XREF_SECTIONS: usize = 64;
+
+/// The `N G obj ... endobj` body starting at `offset`, if one is there.
+fn object_body_at(bytes: &[u8], offset: usize) -> Option<&[u8]> {
+    let rest = bytes.get(offset..)?;
+    let start = find_bytes(rest, b"obj")? + 3;
+    let end = find_bytes(&rest[start..], b"endobj")? + start;
+    rest.get(start..end)
+}
+
+/// `/Prev` recorded by the trailer belonging to the section at `offset`.
+fn previous_xref_offset(bytes: &[u8], offset: usize) -> Option<usize> {
+    // Both a classic trailer and an xref stream dictionary carry /Prev; the
+    // window is bounded so a huge file does not turn this into a full scan.
+    const WINDOW: usize = 4096;
+    let end = (offset + WINDOW).min(bytes.len());
+    let region = bytes.get(offset..end)?;
+    let at = find_bytes(region, b"/Prev")? + 5;
+    let digits: String = region[at..]
+        .iter()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take_while(|b| b.is_ascii_digit())
+        .map(|&b| b as char)
+        .collect();
+    let previous: usize = digits.parse().ok()?;
+    // `/Prev 0` is not a back-pointer, it is a pointer at the file header.
+    if previous == 0 || previous >= bytes.len() {
+        None
+    } else {
+        Some(previous)
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Object -> offset as the signer saw it.
+///
+/// The signature covers the file up to the end of its last ByteRange span;
+/// everything after that is a later incremental update. Parsing the xref chain
+/// of that prefix gives the revision that was signed, which is the only thing a
+/// post-signing change can be measured against. [FR-SIG-1, SDS §3.3]
+fn xref_offsets_at_signing(bytes: &[u8], byte_range: &[u64]) -> Option<Vec<(u32, u64)>> {
+    let (start, length) = match byte_range {
+        [.., start, length] => (*start, *length),
+        _ => return None,
+    };
+    let signed_end = usize::try_from(start.checked_add(length)?).ok()?;
+    if signed_end == 0 || signed_end > bytes.len() {
+        return None;
+    }
+    xref_offsets_of_revision(&bytes[..signed_end])
 }
 ///
 /// Pipeline file format: one step per section, type=merge/split/etc.
@@ -2539,5 +2670,110 @@ mod stamp_tests {
         assert!(bytes.windows(b"CONFIDENTIAL".len()).any(|w| w == b"CONFIDENTIAL"));
         assert!(bytes.len() > std::fs::metadata(&input).unwrap().len() as usize);
         std::fs::remove_file(output).ok();
+    }
+}
+
+/// Post-signing change detection: the xref evidence it rests on. [FR-SIG-1]
+#[cfg(test)]
+mod signature_xref_tests {
+    use super::*;
+
+    /// A one-object PDF with a classic xref, plus the offsets it declares.
+    fn minimal_pdf() -> (Vec<u8>, u64) {
+        let header = b"%PDF-1.7\n";
+        let obj = b"1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let obj_offset = header.len() as u64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(obj);
+        let xref_at = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{obj_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n");
+        bytes.extend_from_slice(format!("{xref_at}\n%%EOF\n").as_bytes());
+        (bytes, obj_offset)
+    }
+
+    /// Append an incremental revision that redefines object 1.
+    fn append_revision(base: &[u8]) -> (Vec<u8>, u64) {
+        let previous_startxref = pdf_cos::scan::find_startxref(base).expect("base startxref");
+        let mut bytes = base.to_vec();
+        let new_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Changed true >>\nendobj\n");
+        let xref_at = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{new_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R /Prev {previous_startxref} >>\nstartxref\n")
+                .as_bytes(),
+        );
+        bytes.extend_from_slice(format!("{xref_at}\n%%EOF\n").as_bytes());
+        (bytes, new_offset)
+    }
+
+    #[test]
+    fn xref_offsets_come_from_the_classic_table() {
+        let (bytes, obj_offset) = minimal_pdf();
+        let offsets = xref_offsets_of_revision(&bytes).expect("chain parses");
+        assert_eq!(offsets, vec![(1, obj_offset)]);
+    }
+
+    #[test]
+    fn a_later_revision_overrides_the_offset_it_supersedes() {
+        // The whole point of following /Prev: the effective object is the one
+        // the newest section names, not the first one found in the file.
+        let (base, first_offset) = minimal_pdf();
+        let (updated, second_offset) = append_revision(&base);
+        assert_ne!(first_offset, second_offset);
+
+        let offsets = xref_offsets_of_revision(&updated).expect("chain parses");
+        assert_eq!(offsets, vec![(1, second_offset)], "newest revision must win");
+    }
+
+    #[test]
+    fn the_signed_revision_is_read_from_the_prefix_the_signature_covers() {
+        // A signature covering only the original bytes must be compared against
+        // the original xref. Reading the whole file for both sides can only
+        // ever conclude "nothing changed". [FR-SIG-1]
+        let (base, first_offset) = minimal_pdf();
+        let (updated, second_offset) = append_revision(&base);
+
+        // ByteRange covering exactly the original revision.
+        let byte_range = vec![0u64, 0, 0, base.len() as u64];
+        let signed = xref_offsets_at_signing(&updated, &byte_range).expect("prefix parses");
+        let current = xref_offsets_of_revision(&updated).expect("chain parses");
+
+        assert_eq!(signed, vec![(1, first_offset)]);
+        assert_eq!(current, vec![(1, second_offset)]);
+        assert_ne!(signed, current, "an appended revision must be visible as a change");
+    }
+
+    #[test]
+    fn a_prev_loop_terminates() {
+        // Malformed input, not a hypothetical: a /Prev pointing at its own
+        // section would spin forever if the chain were followed blindly.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.7\n1 0 obj\n<< >>\nendobj\n");
+        let xref_at = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n");
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Prev {xref_at} >>\nstartxref\n{xref_at}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let offsets = xref_offsets_of_revision(&bytes);
+        assert!(offsets.is_some(), "a self-referential /Prev must still yield the section");
+    }
+
+    #[test]
+    fn an_unparseable_xref_yields_no_evidence_rather_than_a_guess() {
+        // pdf_cos can reconstruct offsets by scanning for object headers. That
+        // is the right call for opening a damaged file and the wrong one for
+        // deciding whether a signed document was altered, so this path must
+        // return nothing and let the caller report Indeterminate.
+        let bytes = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+        assert!(xref_offsets_of_revision(bytes).is_none(), "no startxref, no evidence");
+
+        let damaged = b"%PDF-1.7\n1 0 obj\n<< >>\nendobj\nstartxref\n999999\n%%EOF\n";
+        assert!(xref_offsets_of_revision(damaged).is_none(), "bad offset, no evidence");
     }
 }

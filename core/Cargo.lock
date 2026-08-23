@@ -306,6 +306,7 @@ dependencies = [
  "diagnostics",
  "jobs",
  "ocr-bridge",
+ "pdf-cos",
  "pdf-model",
  "pdf-platform-plugin-sdk",
  "plugin-host",
