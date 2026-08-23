@@ -8,7 +8,7 @@
 //! already parses the catalog, so it is read here rather than left unanswered.
 
 use crate::scan::{
-    fetch_object, find_indirect_ref, find_key, find_startxref, find_trailer, parse_xref_chain,
+    fetch_object_bytes, find_indirect_ref, find_key, find_startxref, find_trailer, parse_xref_chain,
 };
 
 /// One optional content group as the document declares it.
@@ -48,18 +48,18 @@ pub fn parse_optional_content_groups(data: &[u8]) -> Vec<OptionalContentGroup> {
     let Some((root_num, _)) = find_indirect_ref(trailer, b"/Root") else {
         return Vec::new();
     };
-    let Some(catalog) = fetch_object(data, &xref, root_num) else {
+    let Some(catalog) = fetch_object_bytes(data, &xref, root_num) else {
         return Vec::new();
     };
 
     // /OCProperties may be inline in the catalog or an indirect object.
-    let properties: Vec<u8> = match find_indirect_ref(catalog, b"/OCProperties") {
-        Some((num, _)) => match fetch_object(data, &xref, num) {
-            Some(object) => object.to_vec(),
+    let properties: Vec<u8> = match find_indirect_ref(&catalog, b"/OCProperties") {
+        Some((num, _)) => match fetch_object_bytes(data, &xref, num) {
+            Some(object) => object,
             None => return Vec::new(),
         },
-        None => match find_key(catalog, b"/OCProperties") {
-            Some(_) => catalog.to_vec(),
+        None => match find_key(&catalog, b"/OCProperties") {
+            Some(_) => catalog.clone(),
             None => return Vec::new(),
         },
     };
@@ -78,10 +78,10 @@ pub fn parse_optional_content_groups(data: &[u8]) -> Vec<OptionalContentGroup> {
 
     ocgs.into_iter()
         .filter_map(|obj_num| {
-            let object = fetch_object(data, &xref, obj_num)?;
+            let object = fetch_object_bytes(data, &xref, obj_num)?;
             Some(OptionalContentGroup {
                 obj_num,
-                name: pdf_string_after_key(object, b"/Name")
+                name: pdf_string_after_key(&object, b"/Name")
                     .unwrap_or_else(|| format!("Layer {obj_num}")),
                 visible: if base_on {
                     !off.contains(&obj_num)

@@ -83,9 +83,37 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
     let xref_offset = find_startxref(data).ok_or(ScanError::NoStartxref)?;
     // The whole chain, not just the newest section: see `parse_xref_chain`.
     let xref = parse_xref_chain(data, xref_offset, &mut leniency)?;
-    let trailer = find_trailer(data, xref_offset).ok_or(ScanError::NoTrailer)?;
+    // A `startxref` pointing nowhere has no trailer at that offset, and the
+    // whole point of reconstruction is to open the file anyway: fall back to
+    // the last trailer in the file, then to the catalog itself.
+    // [SDS §10.4, FR-VIEW-2]
+    let trailer = match find_trailer(data, xref_offset) {
+        Some(trailer) => trailer.to_vec(),
+        None => match last_trailer(data) {
+            Some(trailer) => {
+                leniency.push(LeniencyEvent::new(
+                    "trailer-recovered",
+                    "no trailer at startxref; used the last trailer in the file",
+                ));
+                trailer
+            }
+            None => return Err(ScanError::NoTrailer),
+        },
+    };
 
-    let root_ref = find_indirect_ref(trailer, b"/Root").ok_or(ScanError::NoRoot)?;
+    let root_ref = match find_indirect_ref(&trailer, b"/Root") {
+        Some(root) => root,
+        None => match find_catalog_object(data, &xref) {
+            Some(num) => {
+                leniency.push(LeniencyEvent::new(
+                    "root-recovered",
+                    "trailer names no /Root; used the object typed /Catalog",
+                ));
+                (num, 0)
+            }
+            None => return Err(ScanError::NoRoot),
+        },
+    };
     let catalog = fetch_object(data, &xref, root_ref.0).unwrap_or(b"");
 
     let has_acroform = find_key(catalog, b"/AcroForm").is_some();
@@ -129,13 +157,17 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
 
 // --- private helpers ---
 
-/// One cross-reference entry: where an object starts, and whether it is live.
+/// One cross-reference entry: where an object lives, and whether it is live.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XrefEntry {
-    /// Byte offset of the object in the file.
+    /// Byte offset of the object in the file. Zero for a compressed object,
+    /// which is not at any file offset at all.
     pub offset: u64,
     /// Whether the entry is in use (`n`) rather than free (`f`).
     pub in_use: bool,
+    /// For a PDF 1.5+ compressed object: `(object stream number, index within
+    /// it)`. Most objects in a modern PDF are stored this way.
+    pub compressed: Option<(u32, u32)>,
 }
 
 /// Scan last 1024 bytes for `startxref\n<N>`, return N as a file offset.
@@ -173,6 +205,139 @@ pub fn find_startxref(data: &[u8]) -> Option<usize> {
 }
 
 /// Parse a classic (non-compressed) xref table at `offset`.
+/// Parse one cross-reference section, classic table or PDF 1.5+ stream.
+///
+/// A cross-reference *stream* is an ordinary object with `/Type /XRef` whose
+/// compressed contents hold the same table. `parse_xref_table` rejected it with
+/// "not supported at M0", so every COS read on a modern PDF — page objects for
+/// stamping, AcroForm fields, optional content — failed on documents most
+/// producers have written since 2003. [FR-VIEW-2, SDS §3.1]
+fn parse_section(
+    data: &[u8],
+    offset: usize,
+    leniency: &mut Vec<LeniencyEvent>,
+) -> Result<Vec<XrefEntry>, ScanError> {
+    if data.get(offset..).is_some_and(|d| d.starts_with(b"xref")) {
+        return parse_xref_table(data, offset, leniency);
+    }
+
+    let body = object_body_at(data, offset).ok_or(ScanError::MalformedXref)?;
+    let table = crate::xref::parse_xref_stream(data, body, leniency).map_err(|message| {
+        leniency.push(LeniencyEvent::new("xref-stream-unreadable", &message));
+        ScanError::MalformedXref
+    })?;
+
+    Ok(table
+        .entries
+        .iter()
+        .map(|entry| match entry.entry_type {
+            2 => XrefEntry {
+                offset: 0,
+                in_use: true,
+                compressed: Some((entry.obj_stream_num, entry.obj_stream_index)),
+            },
+            _ => XrefEntry {
+                offset: entry.offset,
+                in_use: entry.in_use,
+                compressed: None,
+            },
+        })
+        .collect())
+}
+
+/// The dictionary carrying a section's `/Prev`: the trailer for a classic
+/// table, the stream's own dictionary for an xref stream.
+fn section_dictionary(data: &[u8], offset: usize) -> Option<Vec<u8>> {
+    if data.get(offset..).is_some_and(|d| d.starts_with(b"xref")) {
+        return find_trailer(data, offset).map(<[u8]>::to_vec);
+    }
+    object_body_at(data, offset).map(<[u8]>::to_vec)
+}
+
+/// The bytes of the object beginning at `offset`, up to and including `endobj`.
+fn object_body_at(data: &[u8], offset: usize) -> Option<&[u8]> {
+    let rest = data.get(offset..)?;
+    const END: &[u8] = b"endobj";
+    let end = rest
+        .windows(END.len())
+        .position(|window| window == END)
+        .map(|at| at + END.len())
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// The last `trailer` dictionary in the file, wherever it is.
+fn last_trailer(data: &[u8]) -> Option<Vec<u8>> {
+    const TRAILER: &[u8] = b"trailer";
+    let at = data
+        .windows(TRAILER.len())
+        .rposition(|window| window == TRAILER)?;
+    let rest = &data[at..];
+    let start = rest.windows(2).position(|w| w == b"<<")?;
+    let end = rest[start..].windows(2).rposition(|w| w == b">>")? + start + 2;
+    Some(rest[start..end].to_vec())
+}
+
+/// The number of the object typed `/Catalog`, for a file whose trailer is gone.
+fn find_catalog_object(data: &[u8], xref: &[XrefEntry]) -> Option<u32> {
+    (1..xref.len() as u32).find(|num| {
+        fetch_object(data, xref, *num)
+            .map(|object| {
+                find_key(object, b"/Type /Catalog").is_some()
+                    || (find_key(object, b"/Catalog").is_some()
+                        && find_key(object, b"/Pages").is_some())
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Fetch a whole object — `N G obj … endobj` — following an object stream when
+/// it lives in one.
+///
+/// `fetch_object` returns only the *body*, which is what this crate's own
+/// parsing wants. Callers that rewrite an object (the stamp patcher, rotation,
+/// the OCR text layer) need the header too, because what they hand back is
+/// written to the file verbatim. A compressed object has no header in the
+/// stream, so one is synthesised: to everything downstream it then looks like
+/// any other object. [FR-VIEW-2, SDS §3.1]
+pub fn fetch_object_bytes(data: &[u8], xref: &[XrefEntry], num: u32) -> Option<Vec<u8>> {
+    let entry = xref.get(num as usize)?;
+
+    let Some((container, index)) = entry.compressed else {
+        if !entry.in_use {
+            return None;
+        }
+        return object_body_at(data, usize::try_from(entry.offset).ok()?).map(<[u8]>::to_vec);
+    };
+
+    let container_entry = xref.get(container as usize)?;
+    if container_entry.compressed.is_some() {
+        // An object stream inside an object stream is not a thing.
+        return None;
+    }
+    let container_body =
+        object_body_at(data, usize::try_from(container_entry.offset).ok()?)?;
+
+    let decoded = crate::xref::decode_object_stream(container_body).ok()?;
+    let (offsets, first) = &decoded.index;
+    let (_, relative) = offsets.get(index as usize).copied()?;
+    let start = first.checked_add(relative)?;
+    let end = offsets
+        .get(index as usize + 1)
+        .and_then(|(_, next)| first.checked_add(*next))
+        .unwrap_or(decoded.bytes.len())
+        .min(decoded.bytes.len());
+    let body = decoded.bytes.get(start..end)?;
+
+    let mut object = format!("{num} 0 obj
+").into_bytes();
+    object.extend_from_slice(body.strip_suffix(b" ").unwrap_or(body));
+    object.extend_from_slice(b"
+endobj
+");
+    Some(object)
+}
+
 /// Read the whole cross-reference chain, newest section first. [FR-VIEW-2]
 ///
 /// `parse_xref_table` reads **one** section. An incrementally updated PDF
@@ -214,13 +379,32 @@ pub fn parse_xref_chain(data: &[u8], start: usize, leniency: &mut Vec<LeniencyEv
         }
         visited.push(current);
 
-        let section = match parse_xref_table(data, current, leniency) {
+        let section = match parse_section(data, current, leniency) {
             Ok(section) => section,
             Err(error) => {
                 // The newest section failing is fatal; an older one failing
                 // leaves us with what we already merged, which is strictly
                 // better than nothing and is recorded.
                 if visited.len() == 1 {
+                    // SDS §10.4 puts qpdf-style reconstruction here: when the
+                    // newest section cannot be read, scan the file for object
+                    // definitions instead of refusing to open the document.
+                    // `reconstruct_xref` has existed since M0 with no caller,
+                    // so a damaged startxref failed with "malformed xref table"
+                    // and the `xref-reconstructed` event could never fire.
+                    // [SDS §10.4, ADR-006, FR-VIEW-2]
+                    let rebuilt = crate::xref::reconstruct_xref(data, leniency);
+                    if rebuilt.entries.len() > 1 {
+                        return Ok(rebuilt
+                            .entries
+                            .iter()
+                            .map(|entry| XrefEntry {
+                                offset: entry.offset,
+                                in_use: entry.in_use,
+                                compressed: None,
+                            })
+                            .collect());
+                    }
                     return Err(error);
                 }
                 leniency.push(LeniencyEvent::new(
@@ -242,8 +426,8 @@ pub fn parse_xref_chain(data: &[u8], start: usize, leniency: &mut Vec<LeniencyEv
             }
         }
 
-        offset = match find_trailer(data, current)
-            .and_then(|trailer| parse_int_after_key(trailer, b"/Prev"))
+        offset = match section_dictionary(data, current)
+            .and_then(|dict| parse_int_after_key(&dict, b"/Prev"))
             .and_then(|prev| usize::try_from(prev).ok())
         {
             None => None,
@@ -319,6 +503,7 @@ pub(crate) fn parse_xref_table(
             entries[obj] = XrefEntry {
                 offset: byte_offset,
                 in_use,
+                compressed: None,
             };
             pos += 20;
         }
