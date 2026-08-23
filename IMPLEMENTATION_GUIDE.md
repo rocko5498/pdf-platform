@@ -118,6 +118,14 @@ Governed by `ADR-022`. A change is incomplete without the tests its stratum requ
 - **T-7 Determinism.** Coordinator-level changes exploit recorded-inbox replay for deterministic regression (`SDS §7.5`).
 - **T-8 UI & a11y.** User-visible changes pass the Design QA checklist (`DS §13`), including the **absolute-gated** items: accessibility (`AQA-1..11`), no-color-alone (`AQA-3`), destructive-pattern (`IQA-5`), overlay contrast (`IQA-6`). Accessibility regressions are release-blocking (`NFR-A11Y-3`).
 
+**Rule T-10. Assert the outcome, not the activity.** A test asserts a property of the artefact the requirement names — the saved document, the rendered pixels, the extracted text — never that a function was called, that a result was `Ok`, or that a struct holds the value just written to it. Check it by deleting the implementation's body down to a plausible return value: if the test still passes, it is asserting activity (`ADR-039 EV-1`).
+
+**Rule T-11. Every gate is observed failing once.** Before a test, CI job, assertion or threshold is trusted, it is made to fail against a deliberately broken input or implementation, and that observation is recorded in the PR that adds it. A gate that has never failed is indistinguishable from one that cannot (`ADR-039 EV-2`).
+
+**Rule T-12. Every layer seam carries an end-to-end test.** Where two components exchange a value whose meaning could be read two ways — index, offset, object number, scale, unit, coordinate origin — one test drives the real path across the seam and asserts the outcome on the far side. Unit tests either side of a seam test each side's belief about it, not the seam (`ADR-039 EV-3`). The seams here: shell ↔ FFI bridge, bridge ↔ coordinator, coordinator ↔ worker, worker ↔ engine, engine ↔ external tool.
+
+**Rule T-13. A status claim cites evidence or says "not measured".** Trackers, release gates, ADR status lines and PR descriptions state the command run and what it printed, or mark the claim **not measured** — which is a passing state. "Implemented" is not a status; an unmeasured budget asserted silently is a `PRIN-6` violation (`ADR-039 EV-4`, `AI-8`, `B-3`).
+
 **Rule T-9.** Absolute metrics (`MET-GOV-2`: redaction completeness, signature validation, data-loss, CLI/GUI parity, standards conformance, a11y) are never traded off; a failing absolute metric blocks merge/release.
 
 ---
@@ -154,7 +162,7 @@ A PR MUST confirm:
 - [ ] **PR-3.** Rust↔Qt and FFI rules honored (§4, §5) if the boundary is touched.
 - [ ] **PR-4.** New dependencies pass the dependency policy (§6); SBOM/license updated.
 - [ ] **PR-5.** `unsafe` (if any) meets §7, with `// SAFETY:` notes and second reviewer.
-- [ ] **PR-6.** Tests for the applicable strata present and green (§8); absolute metrics not regressed (`T-9`).
+- [ ] **PR-6.** Tests for the applicable strata present and green (§8); each new gate observed failing once, with the observation stated (`T-11`); absolute metrics not regressed (`T-9`).
 - [ ] **PR-7.** Benchmarks attached for hot-path changes; no budget regression (§9).
 - [ ] **PR-8.** UI changes pass Design QA (`DS §13`), themes/densities/DPI/a11y verified; tokens not literals (`GR-10`).
 - [ ] **PR-9.** No default network/telemetry introduced (`GR-9`); no secrets/content committed (`GIT-5`).
