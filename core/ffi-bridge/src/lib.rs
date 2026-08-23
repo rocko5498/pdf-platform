@@ -1338,30 +1338,45 @@ mod bridge_lifecycle_tests {
             .join("../../tools/corpus-diff/fixtures/valid-1page.pdf")
     }
 
-    fn worker_is_built() -> bool {
-        // The bridge spawns `worker` from the current executable's directory.
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
-            .map(|dir| {
-                let dir = if dir.ends_with("deps") {
-                    dir.parent().map(std::path::Path::to_path_buf).unwrap_or(dir)
-                } else {
-                    dir
-                };
-                dir.join(if cfg!(windows) { "worker.exe" } else { "worker" }).is_file()
-            })
-            .unwrap_or(false)
+    /// Put the worker where the bridge looks for it: beside the running
+    /// executable.
+    ///
+    /// That rule is right for the shipped app, where the worker sits next to
+    /// the binary. For a lib test the running executable is in `target/*/deps`,
+    /// and cargo only places the worker there on some platforms — Windows
+    /// found it, Linux and macOS did not. Staging a copy keeps the product's
+    /// resolution untouched. [SDS §3.1]
+    fn stage_worker_beside_test_executable() -> std::path::PathBuf {
+        let name = if cfg!(windows) { "worker.exe" } else { "worker" };
+        let exe = std::env::current_exe().expect("current exe");
+        let test_dir = exe.parent().expect("exe dir").to_path_buf();
+        let staged = test_dir.join(name);
+        if staged.is_file() {
+            return staged;
+        }
+        // The build output directory is the parent of `deps`.
+        let build_dir = if test_dir.ends_with("deps") {
+            test_dir.parent().expect("deps parent").to_path_buf()
+        } else {
+            test_dir.clone()
+        };
+        let built = build_dir.join(name);
+        assert!(
+            built.is_file(),
+            "worker binary not built at {}; run `cargo build -p worker-main`",
+            built.display()
+        );
+        std::fs::copy(&built, &staged).expect("stage worker beside the test executable");
+        staged
     }
 
     #[test]
     fn annotate_save_and_reopen_through_the_bridge() {
         let fixture = fixture();
         assert!(fixture.is_file(), "fixture missing: {}", fixture.display());
-        // No skip. A test that returns quietly when its subject is missing
+        // No skip: a test that returns quietly when its subject is missing
         // cannot fail, which is the defect pattern this suite exists to catch.
-        // CI builds the workspace, so the worker is always present.
-        assert!(worker_is_built(), "worker binary is not beside the test executable; run `cargo build -p worker-main`");
+        let _worker = stage_worker_beside_test_executable();
 
         let opened = open_document_impl(&fixture.to_string_lossy(), "")
             .expect("open through the bridge");
