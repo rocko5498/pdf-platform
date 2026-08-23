@@ -23,6 +23,8 @@ pub struct FdfAnnotation {
     /// Page index (0-based).
     pub page: u32,
     /// Rect [x y width height].
+    /// Annotation rectangle as XFDF writes it: `[x1, y1, x2, y2]`, the two
+    /// opposite corners in PDF user space — **not** `x, y, width, height`.
     pub rect: [f32; 4],
     /// Contents (text).
     pub contents: String,
@@ -81,23 +83,14 @@ pub fn export_xfdf(store: &AnnotationStore, form: Option<&AcroForm>) -> String {
     xml
 }
 
-/// Export annotations to FDF format (simplified). [FR-REV-4]
-///
-/// Returns the FDF content as a string (simplified text format for M4).
-pub fn export_fdf(store: &AnnotationStore) -> String {
-    let mut fdf = String::new();
-    fdf.push_str("%FDF-1.2\n");
-    fdf.push_str("1 0 obj\n<< /FDF << /Fields [\n");
-
-    for ann in store.all_annotations() {
-        fdf.push_str(&annotation_to_fdf(ann));
-    }
-
-    fdf.push_str("] >> >>\nendobj\n");
-    fdf.push_str("trailer\n<< /Root 1 0 R >>\n");
-    fdf.push_str("startxref\n0\n%%EOF\n");
-    fdf
-}
+// `export_fdf` used to sit here. Nothing called it, and what it produced was
+// not a loadable FDF file: annotations went into `/Fields` (which holds form
+// field values, not annotations), `/Rect` was written as x/y/width/height, and
+// the trailer pointed `startxref` at offset 0 with no cross-reference table at
+// all. FR-REV-4 asks for *an* interoperable format and XFDF is the one this
+// product implements and tests. A second format returns with a reader, a
+// writer and a round-trip against a file this codebase did not write.
+// [FR-REV-4, PRIN-6, GR-8]
 
 /// Convert an annotation to XFDF XML fragment.
 fn annotation_to_xfdf(ann: &Annotation) -> String {
@@ -114,9 +107,18 @@ fn annotation_to_xfdf(ann: &Annotation) -> String {
         ann.properties.color.b,
     ));
 
+    // XFDF's `rect` is the annotation's /Rect: two opposite corners in PDF
+    // user space. This used to emit `x, y, width, height`, which our own
+    // importer read back the same way — so the round-trip test passed while
+    // every file we handed to another tool described a different rectangle:
+    // a 100x12 highlight at (10, 20) was read by Acrobat as the region from
+    // (10, 20) to (100, 12). [FR-REV-4, PRIN-7]
     xml.push_str(&format!(
         " rect=\"{:.1},{:.1},{:.1},{:.1}\"",
-        rect.x, rect.y, rect.width, rect.height
+        rect.x,
+        rect.y,
+        rect.x + rect.width,
+        rect.y + rect.height
     ));
 
     if !ann.properties.contents.is_empty() {
@@ -168,17 +170,6 @@ fn field_to_xfdf(name: &str, value: &FieldValue) -> String {
     format!("      <field name=\"{}\" value=\"{}\"/>\n", xml_escape(name), val_str)
 }
 
-/// Convert an annotation to FDF field entry.
-fn annotation_to_fdf(ann: &Annotation) -> String {
-    format!(
-        "<< /Type /Annot /Subtype /{} /Page {} /Rect [{:.1} {:.1} {:.1} {:.1}] /Contents ({}) /T ({}) >>\n",
-        ann.pdf_type_str(),
-        ann.page_index,
-        ann.rect.x, ann.rect.y, ann.rect.width, ann.rect.height,
-        fdf_escape(&ann.properties.contents),
-        fdf_escape(&ann.properties.author),
-    )
-}
 
 /// Parse XFDF content and return annotations + form fields.
 pub fn parse_xfdf(content: &str) -> (Vec<FdfAnnotation>, HashMap<String, String>) {
@@ -187,44 +178,74 @@ pub fn parse_xfdf(content: &str) -> (Vec<FdfAnnotation>, HashMap<String, String>
 
     let mut in_annots = false;
     let mut in_fields = false;
-    let _current_ann: Option<FdfAnnotation> = None;
 
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with("<annots") {
+    // Walk elements, not lines. This used to iterate `content.lines()` and
+    // require `<annots>` to start a line of its own, so an XFDF file written
+    // without line breaks — which the format permits and minifiers produce —
+    // imported zero annotations and reported success. [FR-REV-4, GR-8]
+    for element in xfdf_elements(content) {
+        let element = element.trim();
+        if element.starts_with("<annots") {
             in_annots = true;
             continue;
         }
-        if trimmed == "</annots>" {
+        if element.starts_with("</annots") {
             in_annots = false;
             continue;
         }
-        if trimmed.starts_with("<f>") || trimmed.starts_with("<f ") {
+        if element.starts_with("<f>") || element.starts_with("<f ") {
             in_fields = true;
             continue;
         }
-        if trimmed == "</f>" {
+        if element.starts_with("</f") {
             in_fields = false;
             continue;
         }
 
         if in_annots {
-            // Parse annotation element.
-            if let Some(ann) = parse_xfdf_annot_line(trimmed) {
+            if let Some(ann) = parse_xfdf_annot_line(element) {
                 annotations.push(ann);
             }
         }
-
         if in_fields {
-            // Parse field element.
-            if let Some((name, value)) = parse_xfdf_field_line(trimmed) {
+            if let Some((name, value)) = parse_xfdf_field_line(element) {
                 fields.insert(name, value);
             }
         }
     }
 
     (annotations, fields)
+}
+
+/// Split XFDF into `<...>` elements, ignoring text between them.
+///
+/// Angle brackets inside attribute values are quoted, so quotes are tracked.
+fn xfdf_elements(content: &str) -> Vec<&str> {
+    let bytes = content.as_bytes();
+    let mut elements = Vec::new();
+    let mut index = 0;
+    while let Some(open) = bytes[index..].iter().position(|b| *b == b'<') {
+        let open = index + open;
+        let mut quote: Option<u8> = None;
+        let mut cursor = open + 1;
+        while cursor < bytes.len() {
+            let byte = bytes[cursor];
+            match quote {
+                Some(q) if byte == q => quote = None,
+                Some(_) => {}
+                None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+                None if byte == b'>' => break,
+                None => {}
+            }
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            break;
+        }
+        elements.push(&content[open..=cursor]);
+        index = cursor + 1;
+    }
+    elements
 }
 
 /// Parse a single XFDF annotation line.
@@ -331,12 +352,6 @@ fn xml_unescape(s: &str) -> String {
         .replace("&quot;", "\"")
 }
 
-/// Escape for FDF literal strings.
-fn fdf_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('(', "\\(")
-        .replace(')', "\\)")
-}
 
 
 /// Import XFDF annotations into an `AnnotationStore`. [FR-REV-4, FR-ANNOT interop]
@@ -365,7 +380,14 @@ pub fn import_xfdf_to_store(content: &str, store: &mut AnnotationStore) -> usize
             "Redact" => AnnotationType::Redaction,
             _ => AnnotationType::StickyNote,
         };
-        let rect = crate::annotation::Rect::new(fa.rect[0], fa.rect[1], fa.rect[2], fa.rect[3]);
+        // `fa.rect` holds the two corners; `Rect` holds origin plus extent,
+        // and XFDF does not promise which corner comes first.
+        let rect = crate::annotation::Rect::new(
+            fa.rect[0].min(fa.rect[2]),
+            fa.rect[1].min(fa.rect[3]),
+            (fa.rect[2] - fa.rect[0]).abs(),
+            (fa.rect[3] - fa.rect[1]).abs(),
+        );
         let mut ann = Annotation::new(id, fa.page, annot_type, rect)
             .with_author(fa.author)
             .with_contents(fa.contents);
@@ -502,7 +524,7 @@ mod tests {
         let xfdf = r#"<?xml version="1.0" encoding="UTF-8"?>
 <xfdf xmlns="http://ns.adobe.com/xfdf/" xml:space="preserve">
   <annots>
-    <Highlight page="0" color="1.000,1.000,0.000" rect="10.0,20.0,100.0,12.0" contents="Test note" title="Alice"/>
+    <Highlight page="0" color="1.000,1.000,0.000" rect="10.0,20.0,110.0,32.0" contents="Test note" title="Alice"/>
   </annots>
   <f>
     <field name="name" value="John"/>
@@ -515,23 +537,10 @@ mod tests {
         assert_eq!(annots[0].page, 0);
         assert_eq!(annots[0].contents, "Test note");
         assert_eq!(annots[0].author, "Alice");
-        assert_eq!(annots[0].rect, [10.0, 20.0, 100.0, 12.0]);
+        assert_eq!(annots[0].rect, [10.0, 20.0, 110.0, 32.0]);
 
         assert_eq!(fields.len(), 1);
         assert_eq!(fields.get("name").unwrap(), "John");
-    }
-
-    #[test]
-    fn fdf_export_basic() {
-        let mut store = AnnotationStore::new();
-        let id = store.next_id();
-        let ann = Annotation::new(id, 0, AnnotationType::StickyNote, Rect::new(50.0, 50.0, 20.0, 20.0));
-        store.page_mut(0).add(ann);
-
-        let fdf = export_fdf(&store);
-        assert!(fdf.contains("%FDF-1.2"));
-        assert!(fdf.contains("%%EOF"));
-        assert!(fdf.contains("/Type /Annot"));
     }
 
     #[test]
@@ -546,13 +555,6 @@ mod tests {
         assert_eq!(unescaped, original);
     }
 
-    #[test]
-    fn fdf_escape_roundtrip() {
-        let original = "test (parens) and \\backslash";
-        let escaped = fdf_escape(original);
-        assert!(escaped.contains("\\("));
-        assert!(escaped.contains("\\\\"));
-    }
     #[test]
     fn xfdf_interop_export_import_matrix() {
         // [FR-REV-4] annotations authored here re-import with types intact
