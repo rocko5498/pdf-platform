@@ -101,7 +101,8 @@ pub fn build_annotation_pdf_objects(
         .expect("ensure_appearance always sets appearance")
         .clone();
 
-    let ap_bytes = serialize_appearance_stream_object(ap_obj_num, &annotation.rect, &content);
+    let ap_bytes =
+        serialize_appearance_stream_object(ap_obj_num, &annotation.rect, &content, ContentSpace::Page);
     let annot_bytes = serialize_annotation_dict_object(annotation, annot_obj_num, ap_obj_num);
 
     AnnotationPdfObjects {
@@ -112,22 +113,70 @@ pub fn build_annotation_pdf_objects(
     }
 }
 
+/// Which space an appearance generator drew in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentSpace {
+    /// Content is already relative to the bottom-left of the rect, as the
+    /// widget generators write it.
+    Local,
+    /// Content uses page coordinates and must be translated into the form's
+    /// own space, as every annotation generator writes it.
+    Page,
+}
+
 /// Serialize an appearance XObject stream. [FR-ANNOT-2]
-fn serialize_appearance_stream_object(obj_num: u32, rect: &Rect, content: &[u8]) -> Vec<u8> {
+///
+/// A form XObject's content is **clipped to its `/BBox`**. The annotation
+/// generators draw at `rect.x, rect.y` — page space — while the BBox is
+/// `[0 0 width height]`, so every annotation that was not at the page origin
+/// drew entirely outside its own box and rendered as nothing in any conforming
+/// reader. Nothing here noticed, because this product's canvas draws
+/// annotations itself in Qt and never rasterizes these streams. The fix is one
+/// `cm` that moves page coordinates into the form's space; the alternative,
+/// rewriting the arithmetic in eight generators, is the same change with more
+/// places to get it wrong. [FR-ANNOT-1, FR-ANNOT-2, PRIN-1, GR-8]
+fn serialize_appearance_stream_object(
+    obj_num: u32,
+    rect: &Rect,
+    content: &[u8],
+    space: ContentSpace,
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    if space == ContentSpace::Page {
+        let _ = write!(stream, "q 1 0 0 1 {:.3} {:.3} cm\n", -rect.x, -rect.y);
+    }
+    stream.extend_from_slice(content);
+    if !stream.ends_with(b"\n") {
+        stream.push(b'\n');
+    }
+    if space == ContentSpace::Page {
+        stream.extend_from_slice(b"Q\n");
+    }
+
+    // Text operators need the font they name. The stream says `/F1 .. Tf`, and
+    // a form XObject that declares no resources leaves it undefined: readers
+    // may fall back to the page's resources, which need not contain /F1, or
+    // draw nothing. The dictionary is written inline — a font dictionary is
+    // allowed to be a direct object, and one shared Helvetica needs no object
+    // of its own. [FR-ANNOT-2]
+    let resources = if stream.windows(2).any(|w| w == b"Tf") {
+        " /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 \
+/BaseFont /Helvetica /Encoding /WinAnsiEncoding >> >> >>"
+    } else {
+        ""
+    };
+
     let mut out = Vec::new();
     let _ = writeln!(out, "{obj_num} 0 obj");
     let _ = writeln!(
         out,
-        "<< /Type /XObject /Subtype /Form /BBox [0 0 {} {}] /Length {} >>",
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 {} {}]{resources} /Length {} >>",
         rect.width,
         rect.height,
-        content.len()
+        stream.len()
     );
     let _ = writeln!(out, "stream");
-    out.extend_from_slice(content);
-    if !content.ends_with(b"\n") {
-        out.push(b'\n');
-    }
+    out.extend_from_slice(&stream);
     let _ = writeln!(out, "endstream");
     let _ = writeln!(out, "endobj");
     out
@@ -549,7 +598,9 @@ pub fn build_widget_pdf_objects(
         .expect("ensure_widget_appearance always sets appearance")
         .clone();
     let rect = Rect::new(field.rect.x, field.rect.y, field.rect.width, field.rect.height);
-    let ap_bytes = serialize_appearance_stream_object(ap_obj_num, &rect, &content);
+    // Widget generators already draw relative to the widget's own corner.
+    let ap_bytes =
+        serialize_appearance_stream_object(ap_obj_num, &rect, &content, ContentSpace::Local);
     let widget_bytes = serialize_widget_dict_object(field, widget_obj_num, ap_obj_num);
     field.widget_obj_num = Some(widget_obj_num);
     WidgetPdfObjects {
