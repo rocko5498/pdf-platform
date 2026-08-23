@@ -865,12 +865,33 @@ fn save_document_impl(out_path: &str) -> Result<String, String> {
                 let mut widget_nums = Vec::new();
                 for name in names {
                     if let Some(field) = session.form.field_mut(&name) {
-                        let objs =
-                            build_widget_pdf_objects(field, next_obj, next_obj + 1);
+                        // Reuse the document's own widget object number when the
+                        // field came from the file.
+                        //
+                        // Allocating a fresh one appended a *second* widget with
+                        // the same /T: the page ended up with `/Annots [6 0 R
+                        // 5 0 R]`, the original still carrying `/V ()`, and
+                        // `/AcroForm /Fields` still pointing at that original.
+                        // So the typed value was in the file and the form still
+                        // read empty — and a reader could legitimately show
+                        // either widget. [FR-FORM-1, FR-FORM-4, PRIN-1, GR-8]
+                        let existing_widget = field.widget_obj_num;
+                        let widget_num = existing_widget.unwrap_or_else(|| {
+                            let n = next_obj;
+                            next_obj += 1;
+                            n
+                        });
+                        let ap_num = next_obj;
+                        next_obj += 1;
+
+                        let objs = build_widget_pdf_objects(field, widget_num, ap_num);
                         overlay.set_object(objs.widget_obj_num, objs.widget_bytes);
                         overlay.set_object(objs.ap_obj_num, objs.ap_bytes);
-                        widget_nums.push(objs.widget_obj_num);
-                        next_obj += 2;
+                        // An existing widget is already in the page's /Annots;
+                        // adding it again would duplicate the reference.
+                        if existing_widget.is_none() {
+                            widget_nums.push(objs.widget_obj_num);
+                        }
                         form_widget_count += 1;
                     }
                 }
@@ -1059,6 +1080,19 @@ fn reload_form_from_document_impl() -> Result<String, String> {
 fn set_form_field_impl(name: &str, value: &str) -> Result<String, String> {
     with_session_mut(|session| {
         if session.form.field_count() == 0 {
+            // The demo model exists so a document *without* a form can still
+            // exercise the fill path. Seeding it for a document that HAS an
+            // AcroForm we failed to import would put invented fields in front
+            // of a user editing a real form, and any value typed into them
+            // would be written back into that document. Refuse and say why.
+            // [FR-FORM-1, GR-8, PRIN-6]
+            if session.summary.has_acroform {
+                return Err(format!(
+                    "this document has an AcroForm whose fields could not be imported, so \
+                     there is no field '{name}' to set; filling a demo field here would \
+                     write invented data into a real form"
+                ));
+            }
             seed_demo_form(&mut session.form, session.page_height);
         }
         let Some(field) = session.form.field(name) else {
@@ -1333,6 +1367,21 @@ mod bridge_lifecycle_tests {
 
     use super::*;
 
+    /// Serializes these tests against the bridge's process-wide session.
+    ///
+    /// The bridge deliberately holds one document at a time in a global, which
+    /// is right for a single-window shell driven from the Qt main thread. Cargo
+    /// runs tests in threads of one process, so two of them would drive the
+    /// same session at once — they did, and the second failed on state the
+    /// first had closed.
+    static SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn exclusive_session() -> std::sync::MutexGuard<'static, ()> {
+        SESSION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn fixture() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tools/corpus-diff/fixtures/valid-1page.pdf")
@@ -1370,8 +1419,99 @@ mod bridge_lifecycle_tests {
         staged
     }
 
+    /// A one-page document carrying a real AcroForm text field.
+    ///
+    /// `valid-1page.pdf` has no form, and the bridge falls back to a seeded
+    /// demo model when a document has none — which would make a form test pass
+    /// without a form ever being read from or written to a file.
+    fn acroform_pdf() -> Vec<u8> {
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R] >> >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+               /Resources << /Font << /Helv 4 0 R >> >> /Annots [5 0 R] >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (claimant) /V () \
+               /Rect [72 700 372 724] /DA (/Helv 12 Tf 0 g) /P 3 0 R >>"
+                .to_vec(),
+        ];
+
+        let mut bytes: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_at = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in &offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn a_filled_form_field_reaches_the_saved_file() {
+        let _session = exclusive_session();
+        // M5 records AcroForm fill as complete. What was never checked is
+        // whether a value typed into a field survives a save: the field model
+        // lives in the session, and the session is discarded when the document
+        // closes. [FR-FORM-1, FR-FORM-4, PRIN-6]
+        let _worker = stage_worker_beside_test_executable();
+
+        let source = std::env::temp_dir().join("pdf-platform-bridge-form.pdf");
+        std::fs::write(&source, acroform_pdf()).expect("write form fixture");
+
+        open_document_impl(&source.to_string_lossy(), "").expect("open form document");
+
+        let listed = list_form_fields_impl().expect("list fields");
+        assert!(
+            listed.contains("claimant"),
+            "the document's own field was not imported: {listed}"
+        );
+
+        set_form_field_impl("claimant", "Ada Lovelace").expect("set field");
+
+        let out = std::env::temp_dir().join("pdf-platform-bridge-form-out.pdf");
+        let _ = std::fs::remove_file(&out);
+        save_document_impl(&out.to_string_lossy()).expect("save");
+        close_document_impl();
+
+        let saved = std::fs::read(&out).expect("read saved");
+        let text = String::from_utf8_lossy(&saved);
+        assert!(
+            text.contains("Ada Lovelace"),
+            "the filled value is not in the saved file, so no reader will show it"
+        );
+
+        // And the document must still open, with the value visible to us again.
+        open_document_impl(&out.to_string_lossy(), "").expect("reopen saved form");
+        let relisted = list_form_fields_impl().expect("list after reopen");
+        assert!(
+            relisted.contains("Ada Lovelace"),
+            "the value did not survive a save/reopen round trip: {relisted}"
+        );
+        close_document_impl();
+
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(out.with_extension("xfdf"));
+    }
+
     #[test]
     fn annotate_save_and_reopen_through_the_bridge() {
+        let _session = exclusive_session();
         let fixture = fixture();
         assert!(fixture.is_file(), "fixture missing: {}", fixture.display());
         // No skip: a test that returns quietly when its subject is missing

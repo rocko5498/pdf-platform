@@ -1,5 +1,5 @@
 //! Assembly moves the *right* pages, not just the right number of them.
-//! [FR-ASSM-1, FR-ASSM-2, MET-FEAT-*]
+//! [FR-MERGE-1, FR-SPLIT-1, FR-EXTRACT-1]
 //!
 //! `assembly_ops`' own tests assert page counts: merging pages 2–4 of a 5-page
 //! document twice must yield 6 pages. It does — and it would also pass if the
