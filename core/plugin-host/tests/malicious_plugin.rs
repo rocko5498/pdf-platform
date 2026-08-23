@@ -12,9 +12,33 @@ use plugin_host::{
     manifest::Capability,
 };
 
-/// Create a minimal valid WASM module that does nothing.
-fn minimal_wasm() -> Vec<u8> {
+/// A module with no entry point: valid WebAssembly, not a valid plugin.
+fn module_without_entry_point() -> Vec<u8> {
     wat::parse_str("(module)").unwrap()
+}
+
+/// A guest that exports the entry point and the actions these tests invoke,
+/// and imports nothing — so what it can reach is decided entirely by grants.
+fn test_guest() -> Vec<u8> {
+    wat::parse_str(
+        r#"(module
+             (func (export "run"))
+             (func (export "action"))
+             (func (export "malicious_action")))"#,
+    )
+    .unwrap()
+}
+
+/// A guest that imports a host function for a capability it may not hold.
+fn annotating_guest() -> Vec<u8> {
+    wat::parse_str(
+        r#"(module
+             (import "env" "host_submit_annotation" (func $submit (param i32 i32) (result i64)))
+             (memory (export "memory") 1)
+             (func (export "run")
+               (i64.store (i32.const 0) (call $submit (i32.const 0) (i32.const 0)))))"#,
+    )
+    .unwrap()
 }
 
 /// Create a manifest for a plugin that only declares ReadText.
@@ -62,7 +86,7 @@ fn undeclared_capability_grant_rejected() {
     grants.grant("com.malicious.read-only", Capability::ReadText);
     grants.grant("com.malicious.read-only", Capability::Annotate); // undeclared!
 
-    let result = manager.enable(manifest, grants);
+    let result = manager.enable(manifest, grants, test_guest());
     assert!(
         result.is_err(),
         "Should reject undeclared capability grant"
@@ -93,7 +117,7 @@ fn capability_not_granted_deny() {
     grants.grant("com.malicious.read-only", Capability::ReadText);
     // Annotate is NOT granted
 
-    manager.enable(manifest, grants).unwrap();
+    manager.enable(manifest, grants, test_guest()).unwrap();
 
     // ReadText should be granted
     assert!(manager.has_capability("com.malicious.read-only", &Capability::ReadText));
@@ -162,7 +186,7 @@ fn plugin_crash_contained_by_circuit_breaker() {
     let manifest = annotate_manifest();
     let grants = GrantStore::new();
 
-    manager.enable(manifest, grants).unwrap();
+    manager.enable(manifest, grants, test_guest()).unwrap();
     manager.load("com.malicious.annotate").unwrap();
 
     // Simulate 3 crashes
@@ -192,7 +216,7 @@ fn unload_stops_plugin() {
     let manifest = annotate_manifest();
     let grants = GrantStore::new();
 
-    manager.enable(manifest, grants).unwrap();
+    manager.enable(manifest, grants, test_guest()).unwrap();
     manager.load("com.malicious.annotate").unwrap();
     manager.unload("com.malicious.annotate").unwrap();
 
@@ -217,7 +241,7 @@ fn remove_completely_removes() {
     let manifest = annotate_manifest();
     let grants = GrantStore::new();
 
-    manager.enable(manifest, grants).unwrap();
+    manager.enable(manifest, grants, test_guest()).unwrap();
     assert!(manager.state("com.malicious.annotate").is_some());
 
     manager.remove("com.malicious.annotate");
@@ -236,7 +260,7 @@ fn grant_revocation_deny() {
     let mut grants = GrantStore::new();
     grants.grant("com.malicious.annotate", Capability::Annotate);
 
-    manager.enable(manifest, grants).unwrap();
+    manager.enable(manifest, grants, test_guest()).unwrap();
     assert!(manager.has_capability("com.malicious.annotate", &Capability::Annotate));
 
     // Remove and re-enable without grant
@@ -244,7 +268,7 @@ fn grant_revocation_deny() {
 
     let manifest2 = annotate_manifest();
     let grants2 = GrantStore::new(); // no grants
-    manager.enable(manifest2, grants2).unwrap();
+    manager.enable(manifest2, grants2, test_guest()).unwrap();
 
     assert!(!manager.has_capability("com.malicious.annotate", &Capability::Annotate));
 }
@@ -259,7 +283,7 @@ fn circuit_breaker_resets_after_success() {
     let manifest = annotate_manifest();
     let grants = GrantStore::new();
 
-    manager.enable(manifest, grants).unwrap();
+    manager.enable(manifest, grants, test_guest()).unwrap();
     manager.load("com.malicious.annotate").unwrap();
 
     // Record 2 failures (below threshold of 3)
@@ -302,4 +326,64 @@ fn malformed_manifest_rejected() {
         "capabilities": []
     }"#;
     assert!(manager.discover(invalid_version.as_bytes()).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: A plugin cannot reach a host function it was not granted
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ungranted_host_function_is_absent_from_the_instance() {
+    // ADR-014 §2: undeclared capabilities are unlinkable, not merely denied.
+    // Until the host actually loaded plugin modules there was nothing to link,
+    // and every host function was wired into every instance regardless.
+    let mut manager = PluginManager::new().unwrap();
+    let mut manifest = annotate_manifest();
+    manifest.id = "com.malicious.unlinkable".into();
+
+    // Declared in the manifest, never granted by the user.
+    manager
+        .enable(manifest, GrantStore::new(), annotating_guest())
+        .unwrap();
+
+    let result = manager.load("com.malicious.unlinkable");
+
+    match &result {
+        Err(plugin_host::PluginError::Runtime(plugin_host::RuntimeError::Instantiate(
+            detail,
+        ))) => assert!(
+            detail.contains("host_submit_annotation"),
+            "the failure must name the absent import: {detail}"
+        ),
+        other => panic!("expected an unknown-import failure, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: A module that is not a plugin is rejected, not silently accepted
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_module_without_an_entry_point_is_rejected() {
+    let mut manager = PluginManager::new().unwrap();
+    let manifest = annotate_manifest();
+
+    manager
+        .enable(manifest, GrantStore::new(), module_without_entry_point())
+        .unwrap();
+
+    let result = manager.load("com.malicious.annotate");
+
+    assert!(
+        matches!(
+            &result,
+            Err(plugin_host::PluginError::MissingExport { export, .. }) if export == "run"
+        ),
+        "expected a missing-`run` error, got {result:?}"
+    );
+    assert_ne!(
+        manager.state("com.malicious.annotate"),
+        Some(&plugin_host::PluginState::Running),
+        "a module with no entry point must never be reported as Running"
+    );
 }

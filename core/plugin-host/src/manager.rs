@@ -41,8 +41,23 @@ pub(crate) struct LoadedPlugin {
     pub(crate) failure_count: u32,
     /// When the circuit breaker last tripped.
     pub(crate) circuit_breaker_tripped_at: Option<Instant>,
+    /// The plugin's own WebAssembly, from the package that carried the manifest.
+    pub(crate) wasm: Vec<u8>,
+    /// Whether the guest's shutdown hook ran during graceful unload. [SDS §11.5]
+    pub(crate) shutdown_hook_called: bool,
     pub(crate) module: Option<wasmtime::Module>,
     pub(crate) store: Option<wasmtime::Store<crate::runtime::PluginInstanceState>>,
+    pub(crate) instance: Option<wasmtime::Instance>,
+}
+
+impl LoadedPlugin {
+    /// Count a fault against the circuit breaker. [SDS §11.5]
+    fn note_failure(&mut self) {
+        self.failure_count += 1;
+        if self.failure_count >= CIRCUIT_BREAKER_THRESHOLD {
+            self.circuit_breaker_tripped_at = Some(Instant::now());
+        }
+    }
 }
 
 /// The plugin manager. [SDS §2.2.7]
@@ -82,15 +97,27 @@ impl PluginManager {
         parse_manifest(manifest_bytes).map_err(PluginError::InvalidManifest)
     }
 
-    /// Enable a plugin with the given capability grants.
+    /// Enable a plugin with the given capability grants and its module bytes.
     ///
-    /// The plugin is not loaded yet (lazy loading on first use).
+    /// `module_wasm` is the plugin's own WebAssembly, taken from the package
+    /// that carried the manifest (`SDS §11.1`). The manager does not read it
+    /// from disk: no canonical document specifies a plugin directory layout, so
+    /// the caller that opened the package supplies the bytes rather than this
+    /// crate inventing a location for them (`AI-1`).
+    ///
+    /// The plugin is not instantiated yet — that happens on first use
+    /// (`SDS §11.2`).
     pub fn enable(
         &mut self,
         manifest: PluginManifest,
         grants: GrantStore,
+        module_wasm: Vec<u8>,
     ) -> Result<(), PluginError> {
         let id = manifest.id.clone();
+
+        if module_wasm.is_empty() {
+            return Err(PluginError::EmptyModule(id));
+        }
 
         // Validate that granted capabilities are declared in the manifest.
         for grant in grants.grants_for(&id) {
@@ -109,18 +136,31 @@ impl PluginManager {
             ui: PluginUI::default(),
             failure_count: 0,
             circuit_breaker_tripped_at: None,
+            wasm: module_wasm,
+            shutdown_hook_called: false,
             module: None,
             store: None,
+            instance: None,
         };
 
         self.plugins.insert(id, plugin);
         Ok(())
     }
 
-    /// Load (instantiate) a plugin's WASM module.
+    /// Load a plugin: compile its module, instantiate it, and call its entry
+    /// point. [SDS §11.2, FR-PLUG-1, ADR-014]
     ///
-    /// In a real implementation, this would compile and instantiate the
-    /// WASM bytes. For now, it transitions the state to Running.
+    /// This used to compile a one-instruction stub and instantiate *that*, so
+    /// enabling a plugin exercised the wasmtime pipeline and never ran a line
+    /// of the plugin's code. The module now comes from the plugin, and the
+    /// entry point the WIT world names — `run`, no parameters, no result — is
+    /// called before this returns, so a plugin that fails to start fails here
+    /// rather than appearing to run.
+    ///
+    /// The module is core WebAssembly linked against the host functions in
+    /// `host_calls`. Instantiating a *component* against the WIT world is not
+    /// implemented; a component fails here with a wasmtime error rather than
+    /// silently doing nothing.
     pub fn load(&mut self, plugin_id: &str) -> Result<(), PluginError> {
         let plugin = self
             .plugins
@@ -144,18 +184,15 @@ impl PluginManager {
             }
         }
 
-        // Compile a minimal WASM stub and instantiate. [ADR-014, M11]
-        // Real plugins provide their own WASM via the manifest; for now we
-        // compile a stub to prove the wasmtime pipeline works end-to-end.
-        let stub_wat = r#"(module (func (export "_start") (nop)))"#;
-        let stub_wasm = wasmtime::Module::new(
-            self.runtime.engine(),
-            stub_wat,
-        ).map_err(|e| {
-            plugin.failure_count += 1;
-            plugin.circuit_breaker_tripped_at = Some(Instant::now());
-            PluginError::Runtime(RuntimeError::Compile(e.to_string()))
-        })?;
+        let module = match wasmtime::Module::new(self.runtime.engine(), &plugin.wasm) {
+            Ok(module) => module,
+            Err(error) => {
+                plugin.note_failure();
+                return Err(PluginError::Runtime(RuntimeError::Compile(
+                    error.to_string(),
+                )));
+            }
+        };
 
         let mut store = self.runtime.create_store(
             plugin.manifest.clone(),
@@ -163,29 +200,69 @@ impl PluginManager {
             crate::runtime::InstanceConfig::default(),
         );
 
+        // Only granted host functions exist in this instance. [ADR-014 §2]
+        let granted: Vec<Capability> = plugin
+            .grants
+            .grants_for(plugin_id)
+            .into_iter()
+            .filter(|grant| grant.granted)
+            .map(|grant| grant.capability.clone())
+            .collect();
+
         let mut linker = wasmtime::Linker::new(self.runtime.engine());
-        crate::host_calls::link_host_functions(&mut linker)
+        crate::host_calls::link_host_functions(&mut linker, &granted)
             .map_err(|e| PluginError::Runtime(RuntimeError::HostCall(e.to_string())))?;
 
-        let _instance = linker.instantiate(&mut store, &stub_wasm)
-            .map_err(|e| {
-                plugin.failure_count += 1;
-                plugin.circuit_breaker_tripped_at = Some(Instant::now());
-                PluginError::Runtime(RuntimeError::Instantiate(e.to_string()))
-            })?;
+        let instance = match linker.instantiate(&mut store, &module) {
+            Ok(instance) => instance,
+            Err(error) => {
+                plugin.note_failure();
+                return Err(PluginError::Runtime(RuntimeError::Instantiate(
+                    error.to_string(),
+                )));
+            }
+        };
 
-        plugin.module = Some(stub_wasm);
+        // The host calls the plugin's entry point. [SDS §11.2 step 3]
+        let run = match instance.get_typed_func::<(), ()>(&mut store, "run") {
+            Ok(run) => run,
+            Err(_) => {
+                plugin.note_failure();
+                return Err(PluginError::MissingExport {
+                    plugin_id: plugin_id.into(),
+                    export: "run".into(),
+                });
+            }
+        };
+        if let Err(error) = run.call(&mut store, ()) {
+            plugin.note_failure();
+            return Err(PluginError::GuestTrap {
+                plugin_id: plugin_id.into(),
+                detail: error.to_string(),
+            });
+        }
+
+        store.data_mut().initialized = true;
+        plugin.module = Some(module);
+        plugin.instance = Some(instance);
         plugin.store = Some(store);
         plugin.state = PluginState::Running;
         Ok(())
     }
 
-    /// Invoke a plugin-registered tool action.
+    /// Invoke a plugin-registered tool action by calling the guest export of
+    /// that name. [SDS §11.4, FR-PLUG-3]
+    ///
+    /// `args_json` is **not** forwarded: the WIT world defines `run: func()`
+    /// and no argument-passing ABI for actions, so there is nowhere to put it.
+    /// The response says `"args_passed":false` rather than echoing the
+    /// arguments back and implying the plugin saw them (`GR-8`). This method
+    /// used to return exactly that echo without calling the guest at all.
     pub fn invoke_action(
         &mut self,
         plugin_id: &str,
         action_id: &str,
-        args_json: &str,
+        _args_json: &str,
     ) -> Result<String, PluginError> {
         let plugin = self
             .plugins
@@ -204,23 +281,47 @@ impl PluginManager {
             });
         }
 
-        // Invoke the plugin's exported function via wasmtime. [M11]
-        let store = plugin.store.as_mut()
-            .ok_or_else(|| PluginError::NotRunning(plugin_id.into()))?;
+        let Some(instance) = plugin.instance else {
+            return Err(PluginError::NotRunning(plugin_id.into()));
+        };
 
-        if self.runtime.consume_fuel(store, 1000).is_none() {
-            plugin.failure_count += 1;
-            return Err(PluginError::CircuitBreakerOpen {
-                plugin_id: plugin_id.into(),
-                cooldown_remaining: CIRCUIT_BREAKER_COOLDOWN,
-            });
+        let outcome = {
+            let store = plugin
+                .store
+                .as_mut()
+                .ok_or_else(|| PluginError::NotRunning(plugin_id.into()))?;
+
+            if self.runtime.consume_fuel(store, 1000).is_none() {
+                Err(PluginError::Runtime(RuntimeError::Preempted))
+            } else {
+                match instance.get_typed_func::<(), ()>(&mut *store, action_id) {
+                    Err(_) => Err(PluginError::MissingExport {
+                        plugin_id: plugin_id.into(),
+                        export: action_id.into(),
+                    }),
+                    Ok(action) => action.call(&mut *store, ()).map_err(|error| {
+                        PluginError::GuestTrap {
+                            plugin_id: plugin_id.into(),
+                            detail: error.to_string(),
+                        }
+                    }),
+                }
+            }
+        };
+
+        match outcome {
+            Ok(()) => {
+                plugin.failure_count = 0;
+                plugin.circuit_breaker_tripped_at = None;
+                Ok(format!(
+                    r#"{{"status":"ok","plugin":"{plugin_id}","action":"{action_id}","args_passed":false}}"#
+                ))
+            }
+            Err(error) => {
+                plugin.note_failure();
+                Err(error)
+            }
         }
-
-        // Real plugins would export a function that we call here.
-        Ok(format!(
-            r#"{{"status":"ok","plugin":"{}","action":"{}","args":{}}}"#,
-            plugin_id, action_id, args_json
-        ))
     }
 
     /// Unload a plugin, transitioning it to Disabled.
@@ -230,7 +331,19 @@ impl PluginManager {
             .get_mut(plugin_id)
             .ok_or_else(|| PluginError::NotFound(plugin_id.into()))?;
 
-        // TODO: call the plugin's shutdown export before disabling.
+        // Graceful termination calls the guest's shutdown hook first, if it has
+        // one; a plugin that traps on the way out is still unloaded. [SDS §11.5]
+        let mut called = false;
+        if let (Some(instance), Some(store)) = (plugin.instance, plugin.store.as_mut()) {
+            if let Ok(shutdown) = instance.get_typed_func::<(), ()>(&mut *store, "shutdown") {
+                called = shutdown.call(&mut *store, ()).is_ok();
+            }
+            store.data_mut().shut_down = true;
+        }
+        plugin.shutdown_hook_called = called;
+
+        plugin.instance = None;
+        plugin.store = None;
         plugin.state = PluginState::Disabled;
         plugin.ui = PluginUI::default();
         Ok(())
@@ -316,6 +429,22 @@ pub enum PluginError {
         /// Time remaining before cooldown expires.
         cooldown_remaining: Duration,
     },
+    /// The plugin was enabled with no module bytes.
+    EmptyModule(String),
+    /// The plugin's module does not export something the host must call.
+    MissingExport {
+        /// Plugin ID.
+        plugin_id: String,
+        /// The export that was looked up.
+        export: String,
+    },
+    /// Guest code trapped.
+    GuestTrap {
+        /// Plugin ID.
+        plugin_id: String,
+        /// The trap, as wasmtime reported it.
+        detail: String,
+    },
     /// Runtime error.
     Runtime(RuntimeError),
 }
@@ -340,6 +469,16 @@ impl std::fmt::Display for PluginError {
                 f,
                 "circuit breaker open for {plugin_id}, cooldown {cooldown_remaining:.0?}"
             ),
+            Self::EmptyModule(id) => write!(
+                f,
+                "plugin {id} was enabled with no module bytes; the package must supply the plugin's WebAssembly"
+            ),
+            Self::MissingExport { plugin_id, export } => {
+                write!(f, "plugin {plugin_id} does not export '{export}'")
+            }
+            Self::GuestTrap { plugin_id, detail } => {
+                write!(f, "plugin {plugin_id} trapped: {detail}")
+            }
             Self::Runtime(e) => write!(f, "runtime error: {e}"),
         }
     }
@@ -382,6 +521,55 @@ mod tests {
         }
     }
 
+    /// A guest that leaves evidence in its own memory of having run.
+    ///
+    /// `run` writes a marker at offset 0 and whatever `host_get_page_count`
+    /// returned at offset 4; `count` writes 7 at offset 8. A host that
+    /// instantiates a stub, or never calls the guest, leaves all three zero —
+    /// which is what every one of these assertions is for. [T-10]
+    const RECORDING_GUEST: &str = r#"
+        (module
+          (import "env" "host_get_page_count" (func $page_count (result i32)))
+          (memory (export "memory") 1)
+          (func (export "run")
+            (i32.store (i32.const 0) (i32.const 0x00c0ffee))
+            (i32.store (i32.const 4) (call $page_count)))
+          (func (export "count")
+            (i32.store (i32.const 8) (i32.const 7)))
+          (func (export "shutdown")
+            (i32.store (i32.const 12) (i32.const 9))))
+    "#;
+
+    /// A guest whose entry point traps.
+    const TRAPPING_GUEST: &str = r#"(module (func (export "run") (unreachable)))"#;
+
+    /// A well-formed module that is not a plugin: no `run`.
+    const GUEST_WITHOUT_RUN: &str = r#"(module (func (export "other") (nop)))"#;
+
+    fn guest(wat: &str) -> Vec<u8> {
+        wat.as_bytes().to_vec()
+    }
+
+    /// Grants that let `RECORDING_GUEST` link its one import.
+    fn read_text_granted() -> GrantStore {
+        let mut grants = GrantStore::new();
+        grants.grant("com.example.test", Capability::ReadText);
+        grants
+    }
+
+    /// Read four bytes of the loaded guest's linear memory.
+    fn guest_memory_u32(manager: &mut PluginManager, plugin_id: &str, offset: usize) -> u32 {
+        let plugin = manager.plugins.get_mut(plugin_id).expect("plugin present");
+        let instance = plugin.instance.expect("instance present");
+        let store = plugin.store.as_mut().expect("store present");
+        let memory = instance
+            .get_memory(&mut *store, "memory")
+            .expect("guest exports memory");
+        let mut bytes = [0u8; 4];
+        memory.read(&*store, offset, &mut bytes).expect("read guest memory");
+        u32::from_le_bytes(bytes)
+    }
+
     fn manifest_json() -> String {
         r#"{
             "id": "com.example.test",
@@ -421,7 +609,7 @@ mod tests {
         grants.grant("com.example.test", Capability::ReadText);
         grants.grant("com.example.test", Capability::Annotate);
 
-        manager.enable(manifest, grants).unwrap();
+        manager.enable(manifest, grants, guest(RECORDING_GUEST)).unwrap();
         assert_eq!(
             manager.state("com.example.test"),
             Some(&PluginState::Enabled)
@@ -435,7 +623,7 @@ mod tests {
         let mut grants = GrantStore::new();
         grants.grant("com.example.test", Capability::Network); // not declared
 
-        let result = manager.enable(manifest, grants);
+        let result = manager.enable(manifest, grants, guest(RECORDING_GUEST));
         assert!(result.is_err());
         assert!(matches!(
             result,
@@ -444,17 +632,131 @@ mod tests {
     }
 
     #[test]
-    fn load_plugin() {
+    fn load_runs_the_plugins_own_code() {
+        // The old test asserted only that the state became Running, which it
+        // did while the host compiled a `(nop)` stub and ignored the plugin.
         let mut manager = PluginManager::new().unwrap();
-        let manifest = test_manifest();
-        let grants = GrantStore::new();
-        manager.enable(manifest, grants).unwrap();
+        let mut grants = GrantStore::new();
+        grants.grant("com.example.test", Capability::ReadText);
+        manager
+            .enable(test_manifest(), grants, guest(RECORDING_GUEST))
+            .unwrap();
 
         manager.load("com.example.test").unwrap();
+
         assert_eq!(
             manager.state("com.example.test"),
             Some(&PluginState::Running)
         );
+        assert_eq!(
+            guest_memory_u32(&mut manager, "com.example.test", 0),
+            0x00c0_ffee,
+            "the guest's `run` never executed: its marker is not in its memory"
+        );
+    }
+
+    #[test]
+    fn an_ungranted_host_function_is_absent_from_the_instance() {
+        // ADR-014 §2 and SDS §11.3: undeclared capabilities are *unlinkable*,
+        // not denied at call time. The linker used to wire every host function
+        // into every plugin and check the grant inside the call, so an
+        // ungranted plugin still held the import and got -1 back. [T-12]
+        let mut manager = PluginManager::new().unwrap();
+        manager
+            .enable(test_manifest(), GrantStore::new(), guest(RECORDING_GUEST))
+            .unwrap();
+
+        let result = manager.load("com.example.test");
+
+        let Err(PluginError::Runtime(RuntimeError::Instantiate(detail))) = &result else {
+            panic!("expected an unknown-import failure, got {result:?}");
+        };
+        assert!(
+            detail.contains("host_get_page_count"),
+            "the error must name the import that was absent: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_granted_host_function_is_callable_from_the_guest() {
+        // The other half of the seam: with ReadText granted, the same guest
+        // links and the host's return value lands in guest memory. [T-12]
+        let mut manager = PluginManager::new().unwrap();
+        manager
+            .enable(test_manifest(), read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
+        manager.load("com.example.test").unwrap();
+
+        // The store reports 0 pages until the coordinator fills it in, so the
+        // marker at offset 0 is what distinguishes "ran" from "never ran".
+        assert_eq!(
+            guest_memory_u32(&mut manager, "com.example.test", 0),
+            0x00c0_ffee
+        );
+        assert_eq!(
+            guest_memory_u32(&mut manager, "com.example.test", 4),
+            0,
+            "a granted host_get_page_count must not report denial"
+        );
+    }
+
+    #[test]
+    fn a_trapping_guest_fails_the_load_and_counts_a_failure() {
+        let mut manager = PluginManager::new().unwrap();
+        manager
+            .enable(test_manifest(), GrantStore::new(), guest(TRAPPING_GUEST))
+            .unwrap();
+
+        let result = manager.load("com.example.test");
+
+        assert!(
+            matches!(result, Err(PluginError::GuestTrap { .. })),
+            "expected a trap, got {result:?}"
+        );
+        assert_eq!(
+            manager.state("com.example.test"),
+            Some(&PluginState::Enabled),
+            "a plugin that trapped on start must not be reported as Running"
+        );
+        assert_eq!(
+            manager.plugins["com.example.test"].failure_count, 1,
+            "the circuit breaker must see the fault"
+        );
+    }
+
+    #[test]
+    fn a_module_without_run_is_rejected() {
+        let mut manager = PluginManager::new().unwrap();
+        manager
+            .enable(test_manifest(), GrantStore::new(), guest(GUEST_WITHOUT_RUN))
+            .unwrap();
+
+        let result = manager.load("com.example.test");
+
+        assert!(
+            matches!(&result, Err(PluginError::MissingExport { export, .. }) if export == "run"),
+            "expected a missing-`run` error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_that_is_not_webassembly_is_rejected() {
+        let mut manager = PluginManager::new().unwrap();
+        manager
+            .enable(test_manifest(), GrantStore::new(), b"not wasm at all".to_vec())
+            .unwrap();
+
+        assert!(matches!(
+            manager.load("com.example.test"),
+            Err(PluginError::Runtime(RuntimeError::Compile(_)))
+        ));
+    }
+
+    #[test]
+    fn enable_rejects_a_plugin_with_no_module() {
+        let mut manager = PluginManager::new().unwrap();
+        let result = manager.enable(test_manifest(), GrantStore::new(), Vec::new());
+        assert!(matches!(result, Err(PluginError::EmptyModule(_))));
     }
 
     #[test]
@@ -465,23 +767,71 @@ mod tests {
     }
 
     #[test]
-    fn invoke_action() {
+    fn invoke_action_calls_the_named_export() {
         let mut manager = PluginManager::new().unwrap();
-        let manifest = test_manifest();
-        let grants = GrantStore::new();
-        manager.enable(manifest, grants).unwrap();
+        manager
+            .enable(test_manifest(), read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
         manager.load("com.example.test").unwrap();
 
-        let result = manager.invoke_action("com.example.test", "count", "{}");
-        assert!(result.is_ok());
+        manager
+            .invoke_action("com.example.test", "count", "{}")
+            .unwrap();
+
+        assert_eq!(
+            guest_memory_u32(&mut manager, "com.example.test", 8),
+            7,
+            "`count` did not run: the host returned success without calling it"
+        );
+    }
+
+    #[test]
+    fn invoking_an_action_the_plugin_does_not_export_fails() {
+        // The old implementation returned `{"status":"ok",...}` for any action
+        // name at all, including ones no plugin had ever declared. [GR-8]
+        let mut manager = PluginManager::new().unwrap();
+        manager
+            .enable(test_manifest(), read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
+        manager.load("com.example.test").unwrap();
+
+        let result = manager.invoke_action("com.example.test", "no_such_action", "{}");
+
+        assert!(
+            matches!(&result, Err(PluginError::MissingExport { export, .. })
+                if export == "no_such_action"),
+            "expected a missing-export error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn unload_calls_the_guest_shutdown_hook() {
+        let mut manager = PluginManager::new().unwrap();
+        manager
+            .enable(test_manifest(), read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
+        manager.load("com.example.test").unwrap();
+        assert!(!manager.plugins["com.example.test"].shutdown_hook_called);
+
+        manager.unload("com.example.test").unwrap();
+
+        assert!(
+            manager.plugins["com.example.test"].shutdown_hook_called,
+            "the guest's shutdown hook was never called"
+        );
+        assert_eq!(
+            manager.state("com.example.test"),
+            Some(&PluginState::Disabled)
+        );
     }
 
     #[test]
     fn invoke_action_not_running() {
         let mut manager = PluginManager::new().unwrap();
         let manifest = test_manifest();
-        let grants = GrantStore::new();
-        manager.enable(manifest, grants).unwrap();
+        manager
+            .enable(manifest, read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
         // Don't load — still Enabled.
 
         let result = manager.invoke_action("com.example.test", "count", "{}");
@@ -492,8 +842,9 @@ mod tests {
     fn unload_plugin() {
         let mut manager = PluginManager::new().unwrap();
         let manifest = test_manifest();
-        let grants = GrantStore::new();
-        manager.enable(manifest, grants).unwrap();
+        manager
+            .enable(manifest, read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
         manager.load("com.example.test").unwrap();
 
         manager.unload("com.example.test").unwrap();
@@ -507,8 +858,9 @@ mod tests {
     fn circuit_breaker_trips() {
         let mut manager = PluginManager::new().unwrap();
         let manifest = test_manifest();
-        let grants = GrantStore::new();
-        manager.enable(manifest, grants).unwrap();
+        manager
+            .enable(manifest, read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
         manager.load("com.example.test").unwrap();
 
         // Record 3 failures to trip the breaker.
@@ -524,8 +876,9 @@ mod tests {
     fn circuit_breaker_resets_on_success() {
         let mut manager = PluginManager::new().unwrap();
         let manifest = test_manifest();
-        let grants = GrantStore::new();
-        manager.enable(manifest, grants).unwrap();
+        manager
+            .enable(manifest, read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
         manager.load("com.example.test").unwrap();
 
         // Record 2 failures (below threshold).
@@ -544,8 +897,9 @@ mod tests {
     fn plugin_ids() {
         let mut manager = PluginManager::new().unwrap();
         let manifest = test_manifest();
-        let grants = GrantStore::new();
-        manager.enable(manifest, grants).unwrap();
+        manager
+            .enable(manifest, read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
 
         let ids = manager.plugin_ids();
         assert_eq!(ids, vec!["com.example.test"]);
@@ -557,7 +911,7 @@ mod tests {
         let manifest = test_manifest();
         let mut grants = GrantStore::new();
         grants.grant("com.example.test", Capability::ReadText);
-        manager.enable(manifest, grants).unwrap();
+        manager.enable(manifest, grants, guest(RECORDING_GUEST)).unwrap();
 
         assert!(manager.has_capability("com.example.test", &Capability::ReadText));
         assert!(!manager.has_capability("com.example.test", &Capability::Annotate));
@@ -567,8 +921,9 @@ mod tests {
     fn remove_plugin() {
         let mut manager = PluginManager::new().unwrap();
         let manifest = test_manifest();
-        let grants = GrantStore::new();
-        manager.enable(manifest, grants).unwrap();
+        manager
+            .enable(manifest, read_text_granted(), guest(RECORDING_GUEST))
+            .unwrap();
 
         let removed = manager.remove("com.example.test");
         assert!(removed);
