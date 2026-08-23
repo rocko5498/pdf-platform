@@ -1729,8 +1729,19 @@ fn extract_xref_offsets(_bytes: &[u8]) -> Vec<(u32, u64)> {
     Vec::new()
 }
 ///
-/// Pipeline file format: one step per section, type=merge/split/etc.
-/// See `pdf_model::batch::BatchPipeline::serialize()` for the format.
+/// Pipeline file format: one stanza per step, opening with `type=`.
+///
+///   type=merge|split_per_page|split_chunked|extract_pages|optimize|ocr|
+///        watermark|bates_number|index
+///
+/// Keys: `input=` (repeatable for merge), `output=`, `output_dir=`,
+/// `pages_per_file=`, `first=`, `last=`, `text=`, `lang=`, `with_text=`,
+/// `profile=`, `start=`, `width=`, `root=` (the enrolled root for `index`).
+///
+/// A stanza missing a key its step needs, an unknown step type, and an
+/// unrecognized line are all errors: dropping them quietly would run a
+/// shorter pipeline and still report success. [GR-8]
+/// See `pdf_model::batch::BatchPipeline::serialize()` for the emitted form.
 fn cmd_batch(pipeline_path: &Path) {
     use pdf_model::batch::{BatchPipeline, BatchStep};
 
@@ -1765,6 +1776,7 @@ fn cmd_batch(pipeline_path: &Path) {
     let mut current_profile: Option<String> = None;
     let mut current_start: u32 = 1;
     let mut current_width: usize = 6;
+    let mut current_root: Option<PathBuf> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -1779,14 +1791,17 @@ fn cmd_batch(pipeline_path: &Path) {
         if line.starts_with("type=") {
             // Flush previous step.
             if let Some(ref step_type) = current_type {
-                flush_batch_step(
+                if let Err(error) = flush_batch_step(
                     &mut pipeline, step_type, &current_inputs,
                     current_output.as_deref(), current_output_dir.as_deref(),
                     current_pages_per_file, current_first, current_last,
                     current_text.as_deref(), current_profile.as_deref(),
                     current_language.as_deref(), current_with_text,
-                    current_start, current_width,
-                );
+                    current_start, current_width, current_root.as_deref(),
+                ) {
+                    eprintln!("error: {}: {error}", pipeline_path.display());
+                    process::exit(1);
+                }
             }
             current_type = Some(line[5..].to_string());
             current_inputs.clear();
@@ -1796,6 +1811,9 @@ fn cmd_batch(pipeline_path: &Path) {
             current_profile = None;
             current_language = None;
             current_with_text = false;
+            current_root = None;
+        } else if let Some(val) = line.strip_prefix("root=") {
+            current_root = Some(PathBuf::from(val));
         } else if let Some(val) = line.strip_prefix("input=") {
             current_inputs.push(PathBuf::from(val));
         } else if let Some(val) = line.strip_prefix("output=") {
@@ -1820,18 +1838,30 @@ fn cmd_batch(pipeline_path: &Path) {
             current_start = val.parse().unwrap_or(1);
         } else if let Some(val) = line.strip_prefix("width=") {
             current_width = val.parse().unwrap_or(6);
+        } else {
+            // A key this parser does not know is a typo, and skipping it
+            // quietly produces a step built from defaults — or no step at all
+            // — while the run still reports success. [GR-8, PRIN-6]
+            eprintln!(
+                "error: {}: unrecognized line '{line}'",
+                pipeline_path.display()
+            );
+            process::exit(1);
         }
     }
     // Flush last step.
     if let Some(ref step_type) = current_type {
-        flush_batch_step(
+        if let Err(error) = flush_batch_step(
             &mut pipeline, step_type, &current_inputs,
             current_output.as_deref(), current_output_dir.as_deref(),
             current_pages_per_file, current_first, current_last,
             current_text.as_deref(), current_profile.as_deref(),
             current_language.as_deref(), current_with_text,
-            current_start, current_width,
-        );
+            current_start, current_width, current_root.as_deref(),
+        ) {
+            eprintln!("error: {}: {error}", pipeline_path.display());
+            process::exit(1);
+        }
     }
 
     if pipeline.step_count() == 0 {
@@ -1867,7 +1897,93 @@ fn cmd_batch(pipeline_path: &Path) {
 /// document — matches the existing sidecar-journal convention in
 /// `DocumentCoordinator::compute_sidecar_path`). [ADR-019 §3, ADR-021]
 fn index_state_dir() -> PathBuf {
-    std::env::temp_dir().join("pdf-platform-index")
+    // Overridable so that a test — or a user keeping more than one index —
+    // does not have to share the default location.
+    match std::env::var_os("PDF_PLATFORM_INDEX_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::temp_dir().join("pdf-platform-index"),
+    }
+}
+
+/// Reindex one enrolled root, or every enrolled root when `only` is `None`.
+///
+/// The `index reindex` subcommand and the `Index` batch step both call this:
+/// `FR-BATCH` requires an operation to behave identically singly and in a
+/// pipeline, and two copies of this sequence would drift.
+fn reindex_enrolled(only: Option<&Path>) -> Result<Vec<String>, String> {
+    use coordinator::broker::load_enrollment_registry;
+    use coordinator::indexing::{load_registry, reindex_enrollment, save_registry};
+    use search::tantivy_backend::CrossDocumentIndex;
+
+    let state_dir = index_state_dir();
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|e| format!("cannot create index state directory: {e}"))?;
+    let file_registry_path = state_dir.join("file-registry.bin");
+    let enrollment_registry = load_enrollment_registry(&state_dir.join("enrollments.bin"))
+        .map_err(|e| format!("cannot load enrollment registry: {e}"))?;
+
+    // Enrolled roots are stored canonicalized; compare canonical forms or this
+    // silently matches nothing (Windows canonicalize prepends \\?\).
+    let targets: Vec<([u8; 16], PathBuf)> = match only {
+        Some(dir) => {
+            let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+            enrollment_registry
+                .enrollments()
+                .filter(|(_, root)| *root == canonical)
+                .map(|(id, root)| (id, root.to_path_buf()))
+                .collect()
+        }
+        None => enrollment_registry
+            .enrollments()
+            .map(|(id, root)| (id, root.to_path_buf()))
+            .collect(),
+    };
+    if targets.is_empty() {
+        return Err(match only {
+            Some(dir) => format!(
+                "{} is not an enrolled root; enroll it before indexing it",
+                dir.display()
+            ),
+            None => "no enrolled roots to reindex".to_string(),
+        });
+    }
+
+    let worker = find_worker();
+    let mut file_registry = load_registry(&file_registry_path).unwrap_or_default();
+    let mut index = CrossDocumentIndex::open_or_create(&state_dir.join("tantivy"))
+        .map_err(|e| format!("cannot open index: {e}"))?;
+
+    let mut lines = Vec::new();
+    let mut failures = Vec::new();
+    for (id, root) in &targets {
+        let report = reindex_enrollment(
+            &worker,
+            &enrollment_registry,
+            *id,
+            root,
+            &mut file_registry,
+            &mut index,
+        );
+        lines.push(format!(
+            "{}: scanned {}, reindexed {}, skipped {}, pages {}",
+            root.display(),
+            report.files_scanned,
+            report.files_reindexed,
+            report.files_skipped_unchanged,
+            report.pages_indexed
+        ));
+        for (path, message) in &report.errors {
+            failures.push(format!("{}: {message}", path.display()));
+        }
+    }
+    save_registry(&file_registry, &file_registry_path)
+        .map_err(|e| format!("cannot save file registry: {e}"))?;
+
+    if failures.is_empty() {
+        Ok(lines)
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 /// Cross-document indexing: enroll/list/reindex/remove/search. [ADR-019 §3]
@@ -1948,67 +2064,18 @@ fn cmd_index(args: &[String]) {
             }
         }
         "reindex" => {
-            let worker = find_worker();
-            let mut file_registry = load_registry(&file_registry_path).unwrap_or_default();
-            let mut index = match CrossDocumentIndex::open_or_create(&tantivy_dir) {
-                Ok(i) => i,
-                Err(e) => {
-                    eprintln!("error: cannot open index: {e}");
-                    process::exit(2);
+            match reindex_enrolled(args.get(1).map(Path::new)) {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                    process::exit(0);
                 }
-            };
-            let targets: Vec<([u8; 16], PathBuf)> = match args.get(1) {
-                Some(dir) => {
-                    // Enrolled roots are stored canonicalized (see `enroll`);
-                    // compare against the canonical form of the argument too,
-                    // or this silently matches nothing (e.g. Windows
-                    // canonicalize prepends \\?\).
-                    let canonical = Path::new(dir)
-                        .canonicalize()
-                        .unwrap_or_else(|_| PathBuf::from(dir));
-                    enrollment_registry
-                        .enrollments()
-                        .filter(|(_, root)| *root == canonical)
-                        .map(|(id, root)| (id, root.to_path_buf()))
-                        .collect()
-                }
-                None => enrollment_registry
-                    .enrollments()
-                    .map(|(id, root)| (id, root.to_path_buf()))
-                    .collect(),
-            };
-            if targets.is_empty() {
-                eprintln!("error: no matching enrollment(s) to reindex");
-                process::exit(1);
-            }
-            let mut any_errors = false;
-            for (id, root) in &targets {
-                let report = reindex_enrollment(
-                    &worker,
-                    &enrollment_registry,
-                    *id,
-                    root,
-                    &mut file_registry,
-                    &mut index,
-                );
-                println!(
-                    "{}: scanned {}, reindexed {}, skipped {}, pages {}",
-                    root.display(),
-                    report.files_scanned,
-                    report.files_reindexed,
-                    report.files_skipped_unchanged,
-                    report.pages_indexed
-                );
-                for (path, message) in &report.errors {
-                    eprintln!("  error: {}: {message}", path.display());
-                    any_errors = true;
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    process::exit(1);
                 }
             }
-            if let Err(e) = save_registry(&file_registry, &file_registry_path) {
-                eprintln!("error: cannot save file registry: {e}");
-                process::exit(2);
-            }
-            process::exit(if any_errors { 1 } else { 0 });
         }
         "remove" => {
             let Some(dir) = args.get(1) else {
@@ -2093,6 +2160,13 @@ fn hex_id(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Turn one parsed stanza into a pipeline step.
+///
+/// Every arm used to be `if let Some(..) = ..` with no `else`, so a stanza
+/// missing its `output=` — or naming a step type this build does not know —
+/// produced no step at all and the pipeline ran on, reporting success for work
+/// it had silently dropped. Each shortfall is now an error naming what is
+/// missing. [GR-8, PRIN-6, UX-ERR-3]
 fn flush_batch_step(
     pipeline: &mut pdf_model::batch::BatchPipeline,
     step_type: &str,
@@ -2108,101 +2182,103 @@ fn flush_batch_step(
     include_pages_with_text: bool,
     start: u32,
     width: usize,
-) {
+    root: Option<&Path>,
+) -> Result<(), String> {
+    let one_input = || -> Result<PathBuf, String> {
+        inputs
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("step '{step_type}' has no input="))
+    };
+    let an_output = || -> Result<PathBuf, String> {
+        output
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("step '{step_type}' has no output="))
+    };
+    let a_directory = || -> Result<PathBuf, String> {
+        output_dir
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("step '{step_type}' has no output_dir="))
+    };
+
     match step_type {
         "merge" => {
-            if inputs.len() >= 2 {
-                if let Some(out) = output {
-                    pipeline.add_step(pdf_model::batch::BatchStep::Merge {
-                        inputs: inputs.to_vec(),
-                        output: out.to_path_buf(),
-                    });
-                }
+            if inputs.len() < 2 {
+                return Err(format!(
+                    "step 'merge' needs at least two input= lines, found {}",
+                    inputs.len()
+                ));
             }
+            pipeline.add_step(pdf_model::batch::BatchStep::Merge {
+                inputs: inputs.to_vec(),
+                output: an_output()?,
+            });
         }
         "split_per_page" => {
-            if let Some(inp) = inputs.first() {
-                if let Some(dir) = output_dir {
-                    pipeline.add_step(pdf_model::batch::BatchStep::SplitPerPage {
-                        input: inp.clone(),
-                        output_dir: dir.to_path_buf(),
-                    });
-                }
-            }
+            pipeline.add_step(pdf_model::batch::BatchStep::SplitPerPage {
+                input: one_input()?,
+                output_dir: a_directory()?,
+            });
         }
         "split_chunked" => {
-            if let Some(inp) = inputs.first() {
-                if let Some(dir) = output_dir {
-                    pipeline.add_step(pdf_model::batch::BatchStep::SplitChunked {
-                        input: inp.clone(),
-                        pages_per_file,
-                        output_dir: dir.to_path_buf(),
-                    });
-                }
-            }
+            pipeline.add_step(pdf_model::batch::BatchStep::SplitChunked {
+                input: one_input()?,
+                pages_per_file,
+                output_dir: a_directory()?,
+            });
         }
         "extract_pages" => {
-            if let Some(inp) = inputs.first() {
-                if let Some(out) = output {
-                    pipeline.add_step(pdf_model::batch::BatchStep::ExtractPages {
-                        input: inp.clone(),
-                        first,
-                        last,
-                        output: out.to_path_buf(),
-                    });
-                }
-            }
+            pipeline.add_step(pdf_model::batch::BatchStep::ExtractPages {
+                input: one_input()?,
+                first,
+                last,
+                output: an_output()?,
+            });
         }
         "ocr" => {
-            if let Some(inp) = inputs.first() {
-                if let Some(out) = output {
-                    pipeline.add_step(pdf_model::batch::BatchStep::Ocr {
-                        input: inp.clone(),
-                        language: language.unwrap_or("eng").to_string(),
-                        include_pages_with_text,
-                        output: out.to_path_buf(),
-                    });
-                }
-            }
+            pipeline.add_step(pdf_model::batch::BatchStep::Ocr {
+                input: one_input()?,
+                language: language.unwrap_or("eng").to_string(),
+                include_pages_with_text,
+                output: an_output()?,
+            });
         }
         "optimize" => {
-            if let Some(inp) = inputs.first() {
-                if let Some(out) = output {
-                    pipeline.add_step(pdf_model::batch::BatchStep::Optimize {
-                        input: inp.clone(),
-                        output: out.to_path_buf(),
-                        profile: profile.unwrap_or("screen").to_string(),
-                    });
-                }
-            }
+            pipeline.add_step(pdf_model::batch::BatchStep::Optimize {
+                input: one_input()?,
+                output: an_output()?,
+                profile: profile.unwrap_or("screen").to_string(),
+            });
         }
         "watermark" => {
-            if let Some(inp) = inputs.first() {
-                if let Some(out) = output {
-                    pipeline.add_step(pdf_model::batch::BatchStep::Watermark {
-                        input: inp.clone(),
-                        text: text.unwrap_or("").to_string(),
-                        output: out.to_path_buf(),
-                    });
-                }
-            }
+            pipeline.add_step(pdf_model::batch::BatchStep::Watermark {
+                input: one_input()?,
+                text: text
+                    .filter(|t| !t.is_empty())
+                    .ok_or("step 'watermark' has no text=")?
+                    .to_string(),
+                output: an_output()?,
+            });
         }
         "bates_number" => {
-            if let Some(inp) = inputs.first() {
-                if let Some(out) = output {
-                    pipeline.add_step(pdf_model::batch::BatchStep::BatesNumber {
-                        input: inp.clone(),
-                        start,
-                        width,
-                        output: out.to_path_buf(),
-                    });
-                }
-            }
+            pipeline.add_step(pdf_model::batch::BatchStep::BatesNumber {
+                input: one_input()?,
+                start,
+                width,
+                output: an_output()?,
+            });
         }
-        _ => {
-            eprintln!("warning: unknown step type '{step_type}', skipping");
+        "index" => {
+            pipeline.add_step(pdf_model::batch::BatchStep::Index {
+                root: root
+                    .map(Path::to_path_buf)
+                    .ok_or("step 'index' has no root=")?,
+            });
         }
+        other => return Err(format!("unknown step type '{other}'")),
     }
+    Ok(())
+
 }
 
 fn find_worker() -> PathBuf {
@@ -2499,6 +2575,11 @@ fn execute_cli_pipeline(
                 }
                 run_ocr(input, &args).map(|_| vec![output.clone()])
             }
+            // Same helper `index reindex` calls, for the same reason as OCR
+            // above: one implementation for single and batch invocation.
+            BatchStep::Index { root } => {
+                reindex_enrolled(Some(root)).map(|_| vec![root.clone()])
+            }
             _ => pdf_model::batch::execute_step(step, &|input, output, profile| {
                 coordinator::broker::optimize_with_verification(output, |candidate_path| {
                     pdf_model::assembly_ops::optimize_pdf(input, candidate_path, profile)
@@ -2588,5 +2669,173 @@ mod stamp_tests {
             "the difference is too faint to be drawn text: max channel delta {}",
             diff.max_channel_delta
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use pdf_model::batch::{BatchPipeline, BatchStep};
+
+    /// `PDF_PLATFORM_INDEX_DIR` is process-wide, so the two tests that set it
+    /// cannot run at the same time.
+    static INDEX_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn step(step_type: &str, inputs: &[PathBuf], output: Option<&Path>, root: Option<&Path>)
+        -> Result<BatchPipeline, String>
+    {
+        let mut pipeline = BatchPipeline::new("test");
+        flush_batch_step(
+            &mut pipeline, step_type, inputs, output, None, 2, 1, 1, None, None, None,
+            false, 1, 6, root,
+        )?;
+        Ok(pipeline)
+    }
+
+    #[test]
+    fn a_stanza_missing_its_output_is_an_error_not_a_dropped_step() {
+        // Every arm was `if let Some(..)` with no `else`: a stanza missing
+        // `output=` produced no step, the pipeline ran the remaining steps and
+        // printed "Pipeline completed successfully". [GR-8]
+        let error = step("optimize", &[PathBuf::from("in.pdf")], None, None)
+            .expect_err("a step with no output must not be silently dropped");
+        assert!(error.contains("output="), "{error}");
+    }
+
+    #[test]
+    fn a_merge_with_one_input_is_an_error() {
+        let error = step("merge", &[PathBuf::from("only.pdf")], Some(Path::new("out.pdf")), None)
+            .expect_err("merge needs two inputs");
+        assert!(error.contains("two input"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_step_type_is_an_error() {
+        let error = step("teleport", &[PathBuf::from("in.pdf")], Some(Path::new("out.pdf")), None)
+            .expect_err("an unknown step type must not be ignored");
+        assert!(error.contains("teleport"), "{error}");
+    }
+
+    #[test]
+    fn an_index_stanza_needs_a_root() {
+        let error = step("index", &[], None, None).expect_err("index needs root=");
+        assert!(error.contains("root="), "{error}");
+
+        let pipeline = step("index", &[], None, Some(Path::new("/enrolled"))).unwrap();
+        assert!(matches!(
+            pipeline.steps.first(),
+            Some(BatchStep::Index { .. })
+        ));
+    }
+
+    /// A one-page PDF whose content stream really contains `text`.
+    fn pdf_with_text(text: &str) -> Vec<u8> {
+        use std::io::Write as _;
+        let content = format!("BT /F1 24 Tf 72 700 Td ({text}) Tj ET");
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n");
+        offsets.push(bytes.len());
+        write!(
+            bytes,
+            "4 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n",
+            content.len()
+        )
+        .unwrap();
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n",
+        );
+        let xref = bytes.len();
+        write!(bytes, "xref\n0 {}\n", offsets.len() + 1).unwrap();
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in &offsets {
+            writeln!(bytes, "{offset:010} 00000 n ").unwrap();
+        }
+        write!(
+            bytes,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_batch_index_step_makes_the_document_findable() {
+        // FR-BATCH: an operation must behave identically singly and in a
+        // pipeline. The observable is a search hit for a word that exists only
+        // inside the document the step indexed — not that the step returned Ok.
+        // [FR-BATCH, ADR-019 §3, T-10]
+        use coordinator::broker::{save_enrollment_registry, IndexEnrollmentRegistry};
+        use search::tantivy_backend::CrossDocumentIndex;
+        let _guard = INDEX_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+
+        let base = std::env::temp_dir().join(format!(
+            "pdf-platform-batch-index-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let docs = base.join("docs");
+        let state = base.join("state");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("PDF_PLATFORM_INDEX_DIR", &state);
+
+        std::fs::write(docs.join("report.pdf"), pdf_with_text("Xylophone Quarterly")).unwrap();
+
+        let mut enrollments = IndexEnrollmentRegistry::default();
+        enrollments.enroll(&docs).unwrap();
+        save_enrollment_registry(&enrollments, &state.join("enrollments.bin")).unwrap();
+
+        let mut pipeline = BatchPipeline::new("index-run");
+        pipeline.add_step(BatchStep::Index { root: docs.clone() });
+        let results = execute_cli_pipeline(&pipeline);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "index step failed: {}", results[0].message);
+
+        let index = CrossDocumentIndex::open_or_create(&state.join("tantivy")).unwrap();
+        let hits = index.search("Xylophone", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "the batch step reported success but the document is not in the index"
+        );
+
+        std::env::remove_var("PDF_PLATFORM_INDEX_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_batch_index_step_for_an_unenrolled_root_fails_loudly() {
+        // Enrollment is the boundary that keeps indexing away from files the
+        // user never offered; a batch file must not be a way around it.
+        let _guard = INDEX_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!(
+            "pdf-platform-batch-index-unenrolled-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::env::set_var("PDF_PLATFORM_INDEX_DIR", base.join("state"));
+
+        let mut pipeline = BatchPipeline::new("index-run");
+        pipeline.add_step(BatchStep::Index { root: base.clone() });
+        let results = execute_cli_pipeline(&pipeline);
+
+        assert!(!results[0].success);
+        assert!(
+            results[0].message.contains("not an enrolled root"),
+            "{}",
+            results[0].message
+        );
+
+        std::env::remove_var("PDF_PLATFORM_INDEX_DIR");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
