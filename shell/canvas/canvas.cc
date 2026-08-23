@@ -896,7 +896,9 @@ void MainWindow::buildMenuBar() {
             action->setObjectName(item.action);
             action->setData(item.action);
             action->setShortcut(registry.key(item.action));
-            action->setAccessibleName(QString(item.title).remove(QLatin1Char('&')));
+            // QAction is not a widget and has no accessible name of its own:
+            // Qt derives it from the action's text, mnemonic stripped. The
+            // menu itself is a widget, so that one is named above.
             const QString id = item.action;
             connect(action, &QAction::triggered, this, [this, id]() { triggerAction(id); });
         }
