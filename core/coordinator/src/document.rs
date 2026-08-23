@@ -426,6 +426,28 @@ impl DocumentCoordinator {
             .map_err(|e| SessionError::Io(e))?;
         let original_len = original_bytes.len() as u32;
 
+        // What the source trailer said, carried into the one we append.
+        let trailer = source_trailer(&original_bytes, self.summary.root_obj_num);
+        // An encrypted document encrypts its strings and streams. The objects
+        // this writer appends are plaintext, so a reader that decrypts them —
+        // which is every conforming reader — gets noise: a stamped or filled
+        // encrypted file would come back corrupt, silently, in someone else's
+        // application. Encrypting on write is a crypto change and needs a human
+        // owner (AI-6); until then the honest outcome is to refuse, and to say
+        // why. Saving an unmodified encrypted document is still fine, because
+        // nothing new is written.
+        // [FR-SAVE, FR-SEC-1, PRIN-1, GR-8, AI-6, UX-ERR-3]
+        // `dirty_objects` is cleared by `bump_revision`, so by save time it says
+        // nothing about whether the writer has work to do. The predicate that
+        // matters is the writer's own: does the overlay contribute any object?
+        let writes_objects = (1..self.next_obj_num).any(|n| self.overlay.get_object(n).is_some());
+        if trailer.encrypt_obj_num.is_some() && writes_objects {
+            return Err(SessionError::Protocol(
+                "this document is encrypted, and saving changes to it would write                  unencrypted objects into it that other readers would decrypt into                  nonsense. Encrypted write support is not implemented; remove the                  encryption first, or save a decrypted copy."
+                    .into(),
+            ));
+        }
+
         let mut file = std::fs::File::create(output_path)
             .map_err(|e| SessionError::Io(e))?;
 
@@ -440,8 +462,7 @@ impl DocumentCoordinator {
         // [SDS §3.3, FR-SAVE, PRIN-1]
         let prev_xref_offset = pdf_cos::scan::find_startxref(&original_bytes).unwrap_or(0) as u32;
 
-        // What the source trailer said, carried into the one we append.
-        let trailer = source_trailer(&original_bytes, self.summary.root_obj_num);
+
 
         let result = IncrementalWriter::write_incremental(
             &mut file,
