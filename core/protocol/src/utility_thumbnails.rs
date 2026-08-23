@@ -6,6 +6,14 @@ const FRAME_BYTES: usize = 36;
 const MAX_THUMBNAIL_EDGE: u32 = 1024;
 
 /// One bounded page-thumbnail raster request.
+///
+/// `width`/`height` and `scale` must agree: the engine renders the page at
+/// `scale`, and width/height then **crop** that raster from its top-left
+/// corner. Asking for 16x16 at scale 0.25 on a letter page does not give a
+/// shrunken page — it gives the top-left 16x16 pixels of a 153x198 raster.
+/// Compute `scale` from the page's own size so that `page_width * scale` is
+/// the width you asked for. No product code builds one of these yet; the note
+/// is here so the first caller that does gets it right. [ADR-007]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThumbnailRequest {
     /// Zero-based page index.

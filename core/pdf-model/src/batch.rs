@@ -338,15 +338,21 @@ pub fn execute_step(
              through the CLI.",
             root.display()
         )),
+        // These refusals used to say the coordinator page-injection path "is
+        // not wired up". It is: `cli::execute_cli_pipeline` runs both steps
+        // through the same `run_stamp` the `stamp` subcommand uses. What is
+        // true is that *this* executor cannot reach it (ADR-025 layering), as
+        // for OCR and indexing above. The old wording sent a reader looking
+        // for code that was already there. [ADR-025, PRIN-6, UX-ERR-3]
         BatchStep::Watermark { text, .. } => Err(format!(
-            "watermark '{text}' not applied: batch stamping needs the \
-             coordinator page injection path, which is not wired up. \
+            "watermark '{text}' not applied: stamping needs the coordinator's \
+             page-injection path, which the model-level executor does not have. Run it through the CLI. \
              Refusing rather than writing an unstamped file."
         )),
         BatchStep::BatesNumber { start, width, .. } => Err(format!(
             "Bates numbering from {start} (width {width}) not applied: batch \
-             stamping needs the coordinator page injection path, which is not \
-             wired up. Refusing rather than writing an unnumbered file."
+             stamping needs the coordinator's page-injection path, which the model-level executor does not have. Run it through the CLI. \
+             Refusing rather than writing an unnumbered file."
         )),
     }
 }
@@ -455,9 +461,9 @@ mod tests {
             output: "stamped.pdf".into(),
         };
         let error = execute_step(&step, &default_optimize)
-            .expect_err("an unimplemented stamp must not report success");
+            .expect_err("a step this executor cannot run must not report success");
         assert!(
-            error.contains("page injection"),
+            error.contains("page-injection"),
             "the refusal must say why: {error}"
         );
         assert!(
@@ -485,9 +491,9 @@ mod tests {
             output: out.clone(),
         };
         let error = execute_step(&step, &default_optimize)
-            .expect_err("an unimplemented stamp must not report success");
+            .expect_err("a step this executor cannot run must not report success");
         assert!(
-            error.contains("page injection"),
+            error.contains("page-injection"),
             "the refusal must say why: {error}"
         );
         assert!(!out.exists(), "a refused step must leave no artifact");
