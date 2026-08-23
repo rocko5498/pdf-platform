@@ -188,7 +188,11 @@ fn generate_text_markup_appearance(
     // PDF content stream: draw a filled semi-transparent rectangle.
     let c = color;
     write!(&mut buf, "{:.3} {:.3} {:.3} rg\n", c.r, c.g, c.b).unwrap();
-    write!(&mut buf, "{:.3} g\n", c.a).unwrap(); // alpha via gray (simplified)
+    // The next line used to be `{alpha} g`, described as "alpha via gray".
+    // `g` sets the *grey fill colour*, so it overwrote the RGB fill that had
+    // just been set: a yellow highlight at alpha 0.4 painted 40% grey. Opacity
+    // is carried by the annotation's `/CA`, written in the annotation
+    // dictionary above, which is where PDF puts it. [FR-ANNOT-1, PRIN-1]
 
     // Fill the rect.
     write!(&mut buf, "{:.1} {:.1} {:.1} {:.1} re f\n",
