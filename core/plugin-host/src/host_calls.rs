@@ -9,11 +9,18 @@ use crate::grant::GrantStore;
 use crate::manifest::{Capability, PluginManifest};
 use crate::runtime::PluginInstanceState;
 
-/// Link all host functions into a wasmtime Linker.
+/// Link the host functions this plugin is entitled to into a wasmtime Linker.
 ///
-/// This registers the WIT interface functions as host imports.
+/// Only functions covered by `granted` are wired in. A plugin that imports one
+/// it was not granted fails to instantiate with an unknown-import error: the
+/// capability is **absent from the instance, not merely denied at call time**,
+/// which is what `ADR-014 §2` and `SDS §11.3` require. Every function also
+/// re-checks its grant, so a revocation after link still denies.
+///
+/// `host_log` and `host_free_handle` need no capability (`SDS §11.3`).
 pub fn link_host_functions(
     linker: &mut Linker<PluginInstanceState>,
+    granted: &[Capability],
 ) -> Result<(), wasmtime::Error> {
     // Host logging (always available, no capability required)
     linker.func_wrap(
@@ -40,138 +47,150 @@ pub fn link_host_functions(
         },
     )?;
 
-    // Host get page count (requires ReadText capability)
-    linker.func_wrap(
-        "env",
-        "host_get_page_count",
-        |caller: Caller<'_, PluginInstanceState>| -> i32 {
-            let state = caller.data();
-            if !check_capability(&state.manifest, &state.grants, &Capability::ReadText) {
-                eprintln!(
-                    "[plugin:{}] host_get_page_count denied: ReadText not granted",
-                    state.manifest.id
-                );
-                return -1;
-            }
-            // Route to coordinator's page count via the shared store.
-            state.page_count as i32
-        },
-    )?;
+    if granted.contains(&Capability::ReadText) {
+        // Host get page count (requires ReadText capability)
+        linker.func_wrap(
+            "env",
+            "host_get_page_count",
+            |caller: Caller<'_, PluginInstanceState>| -> i32 {
+                let state = caller.data();
+                if !check_capability(&state.manifest, &state.grants, &Capability::ReadText) {
+                    eprintln!(
+                        "[plugin:{}] host_get_page_count denied: ReadText not granted",
+                        state.manifest.id
+                    );
+                    return -1;
+                }
+                // Route to coordinator's page count via the shared store.
+                state.page_count as i32
+            },
+        )?;
+    }
 
-    // Host get page text (requires ReadText capability)
-    linker.func_wrap(
-        "env",
-        "host_get_page_text",
-        |caller: Caller<'_, PluginInstanceState>,
-         page_index: i32|
-         -> i32 {
-            let state = caller.data();
-            if !check_capability(&state.manifest, &state.grants, &Capability::ReadText) {
-                eprintln!(
-                    "[plugin:{}] host_get_page_text denied: ReadText not granted",
-                    state.manifest.id
-                );
-                return -1;
-            }
-            // Route to coordinator's text extraction via the shared store.
-            // Return the handle to the text data in the shared result store.
-            if let Some(text) = state.page_texts.get(&(page_index as u32)) {
-                let handle = state.next_handle;
-                // In a full implementation, we'd store the text in a shared
-                // result buffer and return the handle. For now, log it.
-                eprintln!(
-                    "[plugin:{}] got text for page {} ({} chars)",
-                    state.manifest.id,
-                    page_index,
-                    text.len()
-                );
-                handle as i32
-            } else {
+    if granted.contains(&Capability::ReadText) {
+        // Host get page text (requires ReadText capability)
+        linker.func_wrap(
+            "env",
+            "host_get_page_text",
+            |caller: Caller<'_, PluginInstanceState>,
+             page_index: i32|
+             -> i32 {
+                let state = caller.data();
+                if !check_capability(&state.manifest, &state.grants, &Capability::ReadText) {
+                    eprintln!(
+                        "[plugin:{}] host_get_page_text denied: ReadText not granted",
+                        state.manifest.id
+                    );
+                    return -1;
+                }
+                // Route to coordinator's text extraction via the shared store.
+                // Return the handle to the text data in the shared result store.
+                if let Some(text) = state.page_texts.get(&(page_index as u32)) {
+                    let handle = state.next_handle;
+                    // In a full implementation, we'd store the text in a shared
+                    // result buffer and return the handle. For now, log it.
+                    eprintln!(
+                        "[plugin:{}] got text for page {} ({} chars)",
+                        state.manifest.id,
+                        page_index,
+                        text.len()
+                    );
+                    handle as i32
+                } else {
+                    -1
+                }
+            },
+        )?;
+    }
+
+    if granted.contains(&Capability::ReadStructure) {
+        // Host get outline (requires ReadStructure capability)
+        linker.func_wrap(
+            "env",
+            "host_get_outline",
+            |caller: Caller<'_, PluginInstanceState>| -> i32 {
+                let state = caller.data();
+                if !check_capability(&state.manifest, &state.grants, &Capability::ReadStructure) {
+                    eprintln!(
+                        "[plugin:{}] host_get_outline denied: ReadStructure not granted",
+                        state.manifest.id
+                    );
+                    return -1;
+                }
+                // Route to coordinator's outline via the shared store.
                 -1
-            }
-        },
-    )?;
+            },
+        )?;
+    }
 
-    // Host get outline (requires ReadStructure capability)
-    linker.func_wrap(
-        "env",
-        "host_get_outline",
-        |caller: Caller<'_, PluginInstanceState>| -> i32 {
-            let state = caller.data();
-            if !check_capability(&state.manifest, &state.grants, &Capability::ReadStructure) {
+    if granted.contains(&Capability::ReadStructure) {
+        // Host get layers (requires ReadStructure capability)
+        linker.func_wrap(
+            "env",
+            "host_get_layers",
+            |caller: Caller<'_, PluginInstanceState>| -> i32 {
+                let state = caller.data();
+                if !check_capability(&state.manifest, &state.grants, &Capability::ReadStructure) {
+                    eprintln!(
+                        "[plugin:{}] host_get_layers denied: ReadStructure not granted",
+                        state.manifest.id
+                    );
+                    return -1;
+                }
+                // Route to coordinator's layers via the shared store.
+                -1
+            },
+        )?;
+    }
+
+    if granted.contains(&Capability::ReadStructure) {
+        // Host get attachments (requires ReadStructure capability)
+        linker.func_wrap(
+            "env",
+            "host_get_attachments",
+            |caller: Caller<'_, PluginInstanceState>| -> i32 {
+                let state = caller.data();
+                if !check_capability(&state.manifest, &state.grants, &Capability::ReadStructure) {
+                    eprintln!(
+                        "[plugin:{}] host_get_attachments denied: ReadStructure not granted",
+                        state.manifest.id
+                    );
+                    return -1;
+                }
+                // Route to coordinator's attachments via the shared store.
+                -1
+            },
+        )?;
+    }
+
+    if granted.contains(&Capability::Annotate) {
+        // Host submit annotation (requires Annotate capability)
+        linker.func_wrap(
+            "env",
+            "host_submit_annotation",
+            |caller: Caller<'_, PluginInstanceState>,
+             _ptr: i32,
+             _len: i32|
+             -> i64 {
+                let state = caller.data();
+                if !check_capability(&state.manifest, &state.grants, &Capability::Annotate) {
+                    eprintln!(
+                        "[plugin:{}] host_submit_annotation denied: Annotate not granted",
+                        state.manifest.id
+                    );
+                    return -1;
+                }
+                // Route to coordinator as Command::AddAnnotation.
+                // In a full implementation, we'd parse the annotation data
+                // from the WASM memory and submit it as a Command.
                 eprintln!(
-                    "[plugin:{}] host_get_outline denied: ReadStructure not granted",
+                    "[plugin:{}] submit_annotation called (would route to coordinator)",
                     state.manifest.id
                 );
-                return -1;
-            }
-            // Route to coordinator's outline via the shared store.
-            -1
-        },
-    )?;
-
-    // Host get layers (requires ReadStructure capability)
-    linker.func_wrap(
-        "env",
-        "host_get_layers",
-        |caller: Caller<'_, PluginInstanceState>| -> i32 {
-            let state = caller.data();
-            if !check_capability(&state.manifest, &state.grants, &Capability::ReadStructure) {
-                eprintln!(
-                    "[plugin:{}] host_get_layers denied: ReadStructure not granted",
-                    state.manifest.id
-                );
-                return -1;
-            }
-            // Route to coordinator's layers via the shared store.
-            -1
-        },
-    )?;
-
-    // Host get attachments (requires ReadStructure capability)
-    linker.func_wrap(
-        "env",
-        "host_get_attachments",
-        |caller: Caller<'_, PluginInstanceState>| -> i32 {
-            let state = caller.data();
-            if !check_capability(&state.manifest, &state.grants, &Capability::ReadStructure) {
-                eprintln!(
-                    "[plugin:{}] host_get_attachments denied: ReadStructure not granted",
-                    state.manifest.id
-                );
-                return -1;
-            }
-            // Route to coordinator's attachments via the shared store.
-            -1
-        },
-    )?;
-
-    // Host submit annotation (requires Annotate capability)
-    linker.func_wrap(
-        "env",
-        "host_submit_annotation",
-        |caller: Caller<'_, PluginInstanceState>,
-         _ptr: i32,
-         _len: i32|
-         -> i64 {
-            let state = caller.data();
-            if !check_capability(&state.manifest, &state.grants, &Capability::Annotate) {
-                eprintln!(
-                    "[plugin:{}] host_submit_annotation denied: Annotate not granted",
-                    state.manifest.id
-                );
-                return -1;
-            }
-            // Route to coordinator as Command::AddAnnotation.
-            // In a full implementation, we'd parse the annotation data
-            // from the WASM memory and submit it as a Command.
-            eprintln!(
-                "[plugin:{}] submit_annotation called (would route to coordinator)",
-                state.manifest.id
-            );
-            0
-        },
-    )?;
+                0
+            },
+        )?;
+    }
 
     // Host free handle (always available)
     linker.func_wrap(

@@ -30,15 +30,17 @@ impl CoordinatorPluginHost {
         self.manager.discover(manifest_bytes)
     }
 
-    /// Enable a plugin with the given capability grants.
+    /// Enable a plugin with the given capability grants and its module bytes.
     ///
-    /// The plugin is not loaded yet (lazy loading on first use).
+    /// `module_wasm` comes from the plugin package alongside the manifest
+    /// (`SDS §11.1`). The plugin is instantiated on first use, not here.
     pub fn enable(
         &mut self,
         manifest: PluginManifest,
         grants: GrantStore,
+        module_wasm: Vec<u8>,
     ) -> Result<(), PluginError> {
-        self.manager.enable(manifest, grants)
+        self.manager.enable(manifest, grants, module_wasm)
     }
 
     /// Load (instantiate) a plugin by ID.
@@ -146,6 +148,12 @@ mod tests {
         .into()
     }
 
+    /// A guest exporting the entry point and the action these tests invoke.
+    /// It imports nothing, so it links whatever the grants are.
+    fn test_guest() -> Vec<u8> {
+        br#"(module (func (export "run")) (func (export "test")))"#.to_vec()
+    }
+
     #[test]
     fn create_plugin_host() {
         let host = CoordinatorPluginHost::new();
@@ -164,7 +172,7 @@ mod tests {
         let mut host = CoordinatorPluginHost::new().unwrap();
         let manifest = test_manifest();
         let grants = GrantStore::new();
-        host.enable(manifest, grants).unwrap();
+        host.enable(manifest, grants, test_guest()).unwrap();
         host.load("com.example.coordinator").unwrap();
         assert_eq!(
             host.state("com.example.coordinator"),
@@ -173,15 +181,23 @@ mod tests {
     }
 
     #[test]
-    fn invoke_action() {
+    fn invoke_action_reaches_the_guest_through_the_coordinator() {
+        // `is_ok()` was true while the manager returned a canned JSON string
+        // without calling anything. An action the guest does not export is the
+        // observable that separates dispatch from decoration. [T-10, T-12]
         let mut host = CoordinatorPluginHost::new().unwrap();
-        let manifest = test_manifest();
-        let grants = GrantStore::new();
-        host.enable(manifest, grants).unwrap();
+        host.enable(test_manifest(), GrantStore::new(), test_guest())
+            .unwrap();
         host.load("com.example.coordinator").unwrap();
 
-        let result = host.invoke_action("com.example.coordinator", "test", "{}");
-        assert!(result.is_ok());
+        host.invoke_action("com.example.coordinator", "test", "{}")
+            .expect("the guest exports `test`");
+
+        let missing = host.invoke_action("com.example.coordinator", "absent", "{}");
+        assert!(
+            matches!(&missing, Err(PluginError::MissingExport { export, .. }) if export == "absent"),
+            "expected a missing-export error, got {missing:?}"
+        );
     }
 
     #[test]
@@ -189,7 +205,7 @@ mod tests {
         let mut host = CoordinatorPluginHost::new().unwrap();
         let manifest = test_manifest();
         let grants = GrantStore::new();
-        host.enable(manifest, grants).unwrap();
+        host.enable(manifest, grants, test_guest()).unwrap();
         host.load("com.example.coordinator").unwrap();
         host.unload("com.example.coordinator").unwrap();
 
@@ -204,7 +220,7 @@ mod tests {
         let mut host = CoordinatorPluginHost::new().unwrap();
         let manifest = test_manifest();
         let grants = GrantStore::new();
-        host.enable(manifest, grants).unwrap();
+        host.enable(manifest, grants, test_guest()).unwrap();
 
         let ids = host.plugin_ids();
         assert_eq!(ids, vec!["com.example.coordinator"]);
@@ -216,7 +232,7 @@ mod tests {
         let manifest = test_manifest();
         let mut grants = GrantStore::new();
         grants.grant("com.example.coordinator", Capability::ReadText);
-        host.enable(manifest, grants).unwrap();
+        host.enable(manifest, grants, test_guest()).unwrap();
 
         assert!(host.has_capability("com.example.coordinator", &Capability::ReadText));
         assert!(!host.has_capability("com.example.coordinator", &Capability::Annotate));
@@ -227,7 +243,7 @@ mod tests {
         let mut host = CoordinatorPluginHost::new().unwrap();
         let manifest = test_manifest();
         let grants = GrantStore::new();
-        host.enable(manifest, grants).unwrap();
+        host.enable(manifest, grants, test_guest()).unwrap();
 
         host.remove("com.example.coordinator");
         assert!(host.state("com.example.coordinator").is_none());
@@ -238,7 +254,7 @@ mod tests {
         let mut host = CoordinatorPluginHost::new().unwrap();
         let manifest = test_manifest();
         let grants = GrantStore::new();
-        host.enable(manifest, grants).unwrap();
+        host.enable(manifest, grants, test_guest()).unwrap();
         host.load("com.example.coordinator").unwrap();
 
         // Record 3 failures to trip the breaker.
