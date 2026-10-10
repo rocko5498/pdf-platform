@@ -86,7 +86,13 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
         ));
     }
 
-    let xref_offset = find_startxref(data).ok_or(ScanError::NoStartxref)?;
+    let (xref_offset, in_tail) = locate_startxref(data).ok_or(ScanError::NoStartxref)?;
+    if !in_tail {
+        leniency.push(LeniencyEvent::new(
+            "startxref-before-tail",
+            "no startxref in the final 1024 bytes; used the last one earlier in the file",
+        ));
+    }
     // The whole chain, not just the newest section: see `parse_xref_chain`.
     let xref = parse_xref_chain(data, xref_offset, &mut leniency)?;
     // Objects a PDF 1.5+ producer stored inside object streams: on such a
@@ -187,8 +193,47 @@ pub struct XrefEntry {
 /// Public because an incremental writer cannot honour `/Prev` without it: the
 /// new xref section must point at the one it supersedes. [SDS §3.3, FR-SAVE]
 pub fn find_startxref(data: &[u8]) -> Option<usize> {
+    locate_startxref(data).map(|(value, _)| value)
+}
+
+/// How far from the end of the file ISO 32000-1 7.5.5 says `startxref` lives.
+const STARTXREF_TAIL: usize = 1024;
+
+/// The value of the last `startxref`, and whether it was within the final
+/// [`STARTXREF_TAIL`] bytes.
+///
+/// The specification puts it there, and the search used to look nowhere else, so
+/// a file with more than a kilobyte after its `%%EOF` (padding added by a mail
+/// gateway, a wrapper, a download manager) failed with "no startxref marker
+/// found" while PDFium opened it without complaint. Readers that are lenient
+/// about this are the norm; the caller is told when the fallback was used so it
+/// can be recorded. [FR-VIEW-2, SDS §10.4, GR-8]
+fn locate_startxref(data: &[u8]) -> Option<(usize, bool)> {
+    if let Some(value) = find_startxref_in_tail(data) {
+        return Some((value, true));
+    }
     const NEEDLE: &[u8] = b"startxref";
-    let search_start = data.len().saturating_sub(1024);
+    let tail_start = data.len().saturating_sub(STARTXREF_TAIL);
+    // Include the bytes that could begin a marker straddling the boundary.
+    let head_end = (tail_start + NEEDLE.len() - 1).min(data.len());
+    let head = &data[..head_end];
+    let pos = head.windows(NEEDLE.len()).rposition(|w| w == NEEDLE)?;
+    let mut i = pos + NEEDLE.len();
+    while i < head.len() && matches!(head[i], b' ' | b'\r' | b'\n') {
+        i += 1;
+    }
+    let start = i;
+    while i < data.len() && data[i].is_ascii_digit() {
+        i += 1;
+    }
+    let value = std::str::from_utf8(&data[start..i]).ok()?.parse().ok()?;
+    Some((value, false))
+}
+
+/// The specification's search: the last `startxref` in the final 1024 bytes.
+fn find_startxref_in_tail(data: &[u8]) -> Option<usize> {
+    const NEEDLE: &[u8] = b"startxref";
+    let search_start = data.len().saturating_sub(STARTXREF_TAIL);
     let tail = &data[search_start..];
     // Find the last occurrence of NEEDLE.
     //
@@ -993,6 +1038,59 @@ startxref
         );
     }
 
+
+    #[test]
+    fn a_startxref_more_than_a_kilobyte_from_the_end_is_found_and_recorded() {
+        // Padding after %%EOF (a mail gateway, a wrapper, a download manager)
+        // pushed `startxref` out of the final 1024 bytes and the file failed with
+        // "no startxref marker found" while PDFium opened it. [FR-VIEW-2, GR-8]
+        let plain = incrementally_updated_document();
+        let expected = find_startxref(&plain).expect("startxref in a normal file");
+
+        let mut padded = plain.clone();
+        padded.extend(std::iter::repeat(b' ').take(5000));
+        assert_eq!(find_startxref(&padded), Some(expected), "the same section must be found");
+
+        let structure = scan_bytes(&padded).expect("a padded file is a valid file");
+        assert_eq!(structure.page_count, 1);
+        assert!(
+            structure.leniency.iter().any(|e| e.kind.contains("startxref-before-tail")),
+            "the fallback must be recorded, not silent: {:?}",
+            structure.leniency
+        );
+    }
+
+    #[test]
+    fn a_startxref_in_the_final_kilobyte_needs_no_repair() {
+        // The control: the recorded event must mean something. [T-11]
+        let structure = scan_bytes(&incrementally_updated_document()).expect("valid");
+        assert!(
+            !structure.leniency.iter().any(|e| e.kind.contains("startxref-before-tail")),
+            "{:?}",
+            structure.leniency
+        );
+    }
+
+    #[test]
+    fn the_last_startxref_wins_beyond_the_tail_too() {
+        // Two complete revisions, then padding: the newer one must be used.
+        let mut data = incrementally_updated_document();
+        let newest = find_startxref(&data).expect("startxref");
+        data.extend(std::iter::repeat(b'\n').take(4000));
+        assert_eq!(find_startxref(&data), Some(newest));
+        assert_ne!(newest, 0);
+    }
+
+    #[test]
+    fn a_file_with_no_startxref_anywhere_is_still_an_error() {
+        let mut data = b"%PDF-1.4\n1 0 obj\n<< >>\nendobj\n".to_vec();
+        data.extend(std::iter::repeat(b' ').take(5000));
+        assert_eq!(find_startxref(&data), None);
+        assert!(
+            matches!(scan_bytes(&data), Err(ScanError::NoStartxref)),
+            "a file with no startxref must say so, not report an empty document"
+        );
+    }
 
     /// The layout ISO 32000-1 Annex F gives a linearized ("fast web view")
     /// file: a first-page cross-reference section near the start of the file,
