@@ -171,7 +171,9 @@ pub fn parse_classic_xref(
 /// The xref stream is a PDF object with `/Type /XRef` containing binary-encoded
 /// xref data. The `/W` array specifies field widths; `/Index` specifies ranges.
 pub fn parse_xref_stream(
-    data: &[u8],
+    // The file itself is not needed: an xref stream is self-contained, and the
+    // parameter is kept so callers read the same way for both section kinds.
+    _data: &[u8],
     stream_obj_body: &[u8],
     leniency: &mut Vec<LeniencyEvent>,
 ) -> Result<XrefTable, String> {
