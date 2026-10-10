@@ -377,6 +377,294 @@ pub fn build_delete_pages_group(
     Ok(group)
 }
 
+/// Parents and subtree sizes for a page tree. [FR-ORG-1]
+struct TreeIndex<'a> {
+    by_number: std::collections::HashMap<u32, &'a PageTreeNode>,
+    parent: std::collections::HashMap<u32, u32>,
+}
+
+impl<'a> TreeIndex<'a> {
+    fn new(nodes: &'a [PageTreeNode]) -> Self {
+        let mut parent = std::collections::HashMap::new();
+        for node in nodes {
+            for kid in node.kids.iter().flatten() {
+                parent.insert(*kid, node.obj_num);
+            }
+        }
+        Self { by_number: nodes.iter().map(|n| (n.obj_num, n)).collect(), parent }
+    }
+
+    /// Ancestors of `node`, nearest first.
+    fn ancestors(&self, node: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut current = node;
+        while let Some(&p) = self.parent.get(&current) {
+            out.push(p);
+            current = p;
+            if out.len() > 64 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Pages at or below `node`.
+    fn leaves_under(&self, node: u32) -> u32 {
+        match self.by_number.get(&node).and_then(|n| n.kids.as_ref()) {
+            None => 1,
+            Some(kids) => kids.iter().map(|k| self.leaves_under(*k)).sum(),
+        }
+    }
+}
+
+/// Edits to a set of `/Pages` nodes: their new kids, and how many pages each
+/// gains. Applied once per node, so several changes under one parent become one
+/// rewrite.
+#[derive(Default)]
+struct TreeEdits {
+    kids: std::collections::HashMap<u32, Vec<u32>>,
+    delta: std::collections::HashMap<u32, i64>,
+}
+
+impl TreeEdits {
+    fn finish(self, nodes: &[PageTreeNode], group: &mut CommandGroup) -> Result<(), String> {
+        let index = TreeIndex::new(nodes);
+        for node in nodes {
+            let touched = self.kids.contains_key(&node.obj_num) || self.delta.contains_key(&node.obj_num);
+            if !touched {
+                continue;
+            }
+            let kids = self
+                .kids
+                .get(&node.obj_num)
+                .cloned()
+                .or_else(|| node.kids.clone())
+                .ok_or_else(|| format!("object {} is a page, not a /Pages node", node.obj_num))?;
+            let count = i64::from(index.leaves_under(node.obj_num)) + self.delta.get(&node.obj_num).copied().unwrap_or(0);
+            let count = u32::try_from(count).map_err(|_| "the page count would go negative".to_string())?;
+            group.push(Box::new(crate::command::SetObjectCommand {
+                obj_num: node.obj_num,
+                new_bytes: set_kids_and_count(&node.bytes, &kids, count)?,
+                old_bytes: Some(node.bytes.clone()),
+            }));
+        }
+        Ok(())
+    }
+}
+
+/// Sorted, distinct, in-range page indices as page object numbers, in document
+/// order.
+fn chosen_pages(leaves: &[u32], page_indices: &[u32]) -> Result<Vec<u32>, String> {
+    if page_indices.is_empty() {
+        return Err("no pages chosen".into());
+    }
+    let mut sorted: Vec<u32> = page_indices.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+        .iter()
+        .map(|&i| {
+            leaves.get(i as usize).copied().ok_or_else(|| {
+                format!("page {} is not in the document, which has {} page(s)", i + 1, leaves.len())
+            })
+        })
+        .collect()
+}
+
+/// Move pages so the first of them lands at zero-based position `to` of the
+/// resulting document; the moved pages keep their relative order.
+///
+/// Only a move that is a reordering of one `/Pages` node's `/Kids` is supported:
+/// every moved page must share a parent, and the result must be reachable by
+/// reordering that node alone. A page that changes parent would also change what
+/// it inherits (`/MediaBox`, `/Rotate`, `/Resources`), and is refused by name
+/// rather than silently altering how the page looks. A flat tree, which is most
+/// documents, is always fine. [FR-ORG-1, PRIN-1, GR-8]
+pub fn build_move_pages_group(
+    nodes: &[PageTreeNode],
+    page_indices: &[u32],
+    to: u32,
+) -> Result<CommandGroup, String> {
+    let leaves = leaf_pages(nodes)?;
+    let moved = chosen_pages(&leaves, page_indices)?;
+    let remaining: Vec<u32> = leaves.iter().copied().filter(|l| !moved.contains(l)).collect();
+    if to as usize > remaining.len() {
+        return Err(format!(
+            "position {} is past the end: after taking {} page(s) out, {} remain",
+            to + 1,
+            moved.len(),
+            remaining.len()
+        ));
+    }
+    let mut desired = remaining[..to as usize].to_vec();
+    desired.extend(&moved);
+    desired.extend(&remaining[to as usize..]);
+    if desired == leaves {
+        return Err("the pages are already there".into());
+    }
+
+    let index = TreeIndex::new(nodes);
+    let parent = *index.parent.get(&moved[0]).ok_or("the page has no parent in the tree")?;
+    if moved.iter().any(|m| index.parent.get(m) != Some(&parent)) {
+        return Err("the chosen pages belong to different branches of the page tree; \
+                    moving between branches is not supported"
+            .into());
+    }
+
+    let node = index.by_number[&parent];
+    let kids = node.kids.clone().unwrap_or_default();
+    let remaining_kids: Vec<u32> = kids.iter().copied().filter(|k| !moved.contains(k)).collect();
+    let after = to as usize + moved.len();
+    let position = match desired.get(after) {
+        Some(&anchor) => {
+            // The kid of this node that holds the page the moved ones must precede.
+            let mut holder = anchor;
+            while index.parent.get(&holder) != Some(&parent) {
+                holder = *index.parent.get(&holder).ok_or_else(|| {
+                    "that move crosses into another branch of the page tree, which is not supported".to_string()
+                })?;
+            }
+            remaining_kids
+                .iter()
+                .position(|k| *k == holder)
+                .ok_or_else(|| "that move crosses into another branch of the page tree".to_string())?
+        }
+        None => remaining_kids.len(),
+    };
+    let mut new_kids = remaining_kids[..position].to_vec();
+    new_kids.extend(&moved);
+    new_kids.extend(&remaining_kids[position..]);
+
+    // The order the whole document would have: it must be the one asked for.
+    let mut check = nodes.to_vec();
+    if let Some(n) = check.iter_mut().find(|n| n.obj_num == parent) {
+        n.kids = Some(new_kids.clone());
+    }
+    if leaf_pages(&check)? != desired {
+        return Err("that move crosses into another branch of the page tree, which is not supported".into());
+    }
+
+    let mut group = CommandGroup::new(format!("Move {} page(s)", moved.len()));
+    let mut edits = TreeEdits::default();
+    edits.kids.insert(parent, new_kids);
+    edits.finish(nodes, &mut group)?;
+    Ok(group)
+}
+
+/// The same object with a new number: `N G obj ...` becomes `M 0 obj ...`.
+fn renumbered(bytes: &[u8], new_number: u32) -> Result<Vec<u8>, String> {
+    let at = bytes
+        .windows(3)
+        .position(|w| w == b"obj")
+        .ok_or_else(|| "the object has no obj keyword".to_string())?;
+    let mut out = format!("{new_number} 0 ").into_bytes();
+    out.extend_from_slice(&bytes[at..]);
+    Ok(out)
+}
+
+/// Duplicate pages: each copy is a new page object right after its original, in
+/// the same parent, sharing the original's content and resources by reference.
+///
+/// A page that has annotations is refused: the copy would share the original's
+/// annotation objects, and a form field or note cannot belong to two pages.
+/// Returns the group and the next free object number. [FR-ORG-1, PRIN-1, GR-8]
+pub fn build_duplicate_pages_group(
+    nodes: &[PageTreeNode],
+    page_indices: &[u32],
+    next_obj_num: u32,
+) -> Result<(CommandGroup, u32), String> {
+    let leaves = leaf_pages(nodes)?;
+    let chosen = chosen_pages(&leaves, page_indices)?;
+    let index = TreeIndex::new(nodes);
+
+    let mut group = CommandGroup::new(format!("Duplicate {} page(s)", chosen.len()));
+    let mut edits = TreeEdits::default();
+    let mut copies: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut next = next_obj_num;
+    for &leaf in &chosen {
+        let node = index.by_number[&leaf];
+        if node.bytes.windows(b"/Annots".len()).any(|w| w == b"/Annots") {
+            return Err(format!(
+                "page object {leaf} has annotations; duplicating a page that has annotations \
+                 is not supported, because the copy would share them"
+            ));
+        }
+        copies.insert(leaf, next);
+        group.push(Box::new(crate::command::SetObjectCommand {
+            obj_num: next,
+            new_bytes: renumbered(&node.bytes, next)?,
+            old_bytes: None,
+        }));
+        next += 1;
+        for ancestor in index.ancestors(leaf) {
+            *edits.delta.entry(ancestor).or_insert(0) += 1;
+        }
+    }
+    for (&leaf, &copy) in &copies {
+        let parent = *index.parent.get(&leaf).ok_or("the page has no parent in the tree")?;
+        let current = edits.kids.entry(parent).or_insert_with(|| index.by_number[&parent].kids.clone().unwrap_or_default());
+        let at = current.iter().position(|k| *k == leaf).ok_or("the page is not among its parent's kids")?;
+        current.insert(at + 1, copy);
+    }
+    edits.finish(nodes, &mut group)?;
+    Ok((group, next))
+}
+
+/// Insert one blank page so it becomes zero-based page `at` of the result.
+///
+/// It joins the parent of the page it sits next to, and takes that page's media
+/// box unless `size` (width, height in points) is given. [FR-ORG-1]
+pub fn build_insert_blank_group(
+    nodes: &[PageTreeNode],
+    at: u32,
+    size: Option<[f64; 2]>,
+    next_obj_num: u32,
+) -> Result<(CommandGroup, u32), String> {
+    let leaves = leaf_pages(nodes)?;
+    if at as usize > leaves.len() {
+        return Err(format!("position {} is past the end: the document has {} page(s)", at + 1, leaves.len()));
+    }
+    let index = TreeIndex::new(nodes);
+    let (neighbour, before) = match leaves.get(at as usize) {
+        Some(&l) => (l, true),
+        None => (*leaves.last().ok_or("the document has no pages")?, false),
+    };
+    let parent = *index.parent.get(&neighbour).ok_or("the page has no parent in the tree")?;
+    let [width, height] = match size {
+        Some(s) => s,
+        None => {
+            let b = effective_media_box(nodes, neighbour).unwrap_or([0.0, 0.0, 612.0, 792.0]);
+            [(b[2] - b[0]).abs(), (b[3] - b[1]).abs()]
+        }
+    };
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return Err(format!("a page of {width} x {height} points is not a page"));
+    }
+
+    let new_bytes = format!(
+        "{next_obj_num} 0 obj\n<< /Type /Page /Parent {parent} 0 R /MediaBox [0 0 {} {}] /Resources << >> >>\nendobj\n",
+        pdf_number(width),
+        pdf_number(height)
+    )
+    .into_bytes();
+
+    let mut group = CommandGroup::new("Insert a blank page".to_string());
+    group.push(Box::new(crate::command::SetObjectCommand {
+        obj_num: next_obj_num,
+        new_bytes,
+        old_bytes: None,
+    }));
+    let mut kids = index.by_number[&parent].kids.clone().unwrap_or_default();
+    let place = kids.iter().position(|k| *k == neighbour).ok_or("the page is not among its parent's kids")?;
+    kids.insert(if before { place } else { place + 1 }, next_obj_num);
+    let mut edits = TreeEdits::default();
+    edits.kids.insert(parent, kids);
+    for ancestor in std::iter::once(parent).chain(index.ancestors(parent)) {
+        *edits.delta.entry(ancestor).or_insert(0) += 1;
+    }
+    edits.finish(nodes, &mut group)?;
+    Ok((group, next_obj_num + 1))
+}
 /// Build a rotate-pages command group, patching each page in place.
 ///
 /// `pages` is `(object number, current page bytes, rotation the page has now)`
@@ -731,4 +1019,144 @@ mod tests {
         assert!(text(&overlay, 5).contains("[10 10 100 100]"));
         group.undo(&mut overlay).unwrap();
         assert_eq!(overlay.get_object(5).unwrap(), page.as_slice());
+    }
+
+    fn flat3() -> Vec<PageTreeNode> {
+        vec![
+            node(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            page(3, 2),
+            page(4, 2),
+            page(5, 2),
+        ]
+    }
+
+    fn kids_of(overlay: &CowOverlay, n: u32) -> Vec<u32> {
+        kid_references(overlay.get_object(n).expect("object")).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_page_moves_to_the_front_or_back_of_a_flat_tree() {
+        let mut overlay = CowOverlay::new();
+        build_move_pages_group(&flat3(), &[2], 0).unwrap().apply(&mut overlay).unwrap();
+        assert_eq!(kids_of(&overlay, 2), [5, 3, 4]);
+        assert!(text(&overlay, 2).contains("/Count 3"), "a move changes no count");
+
+        let mut overlay = CowOverlay::new();
+        build_move_pages_group(&flat3(), &[0], 2).unwrap().apply(&mut overlay).unwrap();
+        assert_eq!(kids_of(&overlay, 2), [4, 5, 3]);
+    }
+
+    #[test]
+    fn several_pages_move_together_and_keep_their_order() {
+        let mut overlay = CowOverlay::new();
+        build_move_pages_group(&flat3(), &[0, 1], 1).unwrap().apply(&mut overlay).unwrap();
+        assert_eq!(kids_of(&overlay, 2), [5, 3, 4], "pages 1 and 2 land after page 3, still in order");
+    }
+
+    #[test]
+    fn a_move_within_one_branch_of_a_nested_tree_touches_only_that_branch() {
+        let group = build_move_pages_group(&nested(), &[1], 0).unwrap();
+        assert_eq!(group.len(), 1, "only branch A is rewritten");
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        assert_eq!(kids_of(&overlay, 3), [6, 5]);
+        assert!(overlay.get_object(2).is_none() && overlay.get_object(4).is_none());
+    }
+
+    #[test]
+    fn a_move_that_would_change_a_pages_parent_is_refused() {
+        let err = build_move_pages_group(&nested(), &[0], 3).unwrap_err();
+        assert!(err.contains("branch"), "moving page 1 to the end crosses into branch B: {err}");
+        let err = build_move_pages_group(&nested(), &[0, 2], 0).unwrap_err();
+        assert!(err.contains("different branches"), "{err}");
+    }
+
+    #[test]
+    fn a_move_that_changes_nothing_or_goes_nowhere_is_refused_by_name() {
+        assert!(build_move_pages_group(&flat3(), &[1], 1).unwrap_err().contains("already there"));
+        assert!(build_move_pages_group(&flat3(), &[0], 9).unwrap_err().contains("past the end"));
+        assert!(build_move_pages_group(&flat3(), &[7], 0).unwrap_err().contains("page 8"));
+        assert!(build_move_pages_group(&flat3(), &[], 0).is_err());
+    }
+
+    #[test]
+    fn a_move_can_be_undone_exactly() {
+        let nodes = flat3();
+        let original = nodes[0].bytes.clone();
+        let group = build_move_pages_group(&nodes, &[2], 0).unwrap();
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        group.undo(&mut overlay).unwrap();
+        assert_eq!(overlay.get_object(2).unwrap(), original.as_slice());
+    }
+
+    #[test]
+    fn duplicating_inserts_a_copy_right_after_each_original_and_counts_it() {
+        let (group, next) = build_duplicate_pages_group(&flat3(), &[0, 1], 10).unwrap();
+        assert_eq!(next, 12, "two objects were allocated");
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        assert_eq!(kids_of(&overlay, 2), [3, 10, 4, 11, 5]);
+        assert!(text(&overlay, 2).contains("/Count 5"));
+        let copy = text(&overlay, 10);
+        assert!(copy.starts_with("10 0 obj\n") && copy.contains("/Type /Page") && copy.contains("/Parent 2 0 R"), "{copy}");
+    }
+
+    #[test]
+    fn duplicating_in_a_nested_tree_counts_every_ancestor() {
+        let (group, _) = build_duplicate_pages_group(&nested(), &[0], 20).unwrap();
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        assert_eq!(kids_of(&overlay, 3), [5, 20, 6]);
+        assert!(text(&overlay, 3).contains("/Count 3"));
+        assert!(text(&overlay, 2).contains("/Count 5"), "the root counts pages");
+        assert!(overlay.get_object(4).is_none(), "branch B is untouched");
+    }
+
+    #[test]
+    fn a_page_with_annotations_is_not_duplicated() {
+        let mut nodes = flat3();
+        nodes[2] = node(4, "<< /Type /Page /Parent 2 0 R /Annots [9 0 R] >>");
+        let err = build_duplicate_pages_group(&nodes, &[1], 10).unwrap_err();
+        assert!(err.contains("annotations"), "{err}");
+    }
+
+    #[test]
+    fn a_blank_page_goes_where_asked_and_takes_its_neighbours_size() {
+        for (at, expected) in [(0u32, vec![10, 3, 4, 5]), (1, vec![3, 10, 4, 5]), (3, vec![3, 4, 5, 10])] {
+            let (group, next) = build_insert_blank_group(&flat3(), at, None, 10).unwrap();
+            assert_eq!(next, 11);
+            let mut overlay = CowOverlay::new();
+            group.apply(&mut overlay).unwrap();
+            assert_eq!(kids_of(&overlay, 2), expected, "inserted at {at}");
+            assert!(text(&overlay, 2).contains("/Count 4"));
+            let blank = text(&overlay, 10);
+            assert!(blank.contains("/MediaBox [0 0 612 792]") && blank.contains("/Parent 2 0 R"), "{blank}");
+        }
+    }
+
+    #[test]
+    fn a_blank_page_in_a_nested_tree_joins_its_neighbours_branch() {
+        // Before page 3 (the first page of branch B).
+        let (group, _) = build_insert_blank_group(&nested(), 2, Some([100.0, 200.5]), 30).unwrap();
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        assert_eq!(kids_of(&overlay, 4), [30, 7, 8]);
+        assert!(text(&overlay, 4).contains("/Count 3") && text(&overlay, 2).contains("/Count 5"));
+        assert!(text(&overlay, 30).contains("/MediaBox [0 0 100 200.5]") && text(&overlay, 30).contains("/Parent 4 0 R"));
+    }
+
+    #[test]
+    fn a_blank_page_takes_the_size_the_neighbour_inherits_and_bad_sizes_are_refused() {
+        let nodes = vec![
+            node(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>"),
+            node(3, "<< /Type /Page /Parent 2 0 R >>"),
+        ];
+        let (group, _) = build_insert_blank_group(&nodes, 1, None, 9).unwrap();
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        assert!(text(&overlay, 9).contains("/MediaBox [0 0 300 400]"), "{}", text(&overlay, 9));
+        assert!(build_insert_blank_group(&nodes, 5, None, 9).unwrap_err().contains("past the end"));
+        assert!(build_insert_blank_group(&nodes, 0, Some([0.0, 100.0]), 9).is_err());
+        assert!(build_insert_blank_group(&nodes, 0, Some([f64::NAN, 100.0]), 9).is_err());
     }}

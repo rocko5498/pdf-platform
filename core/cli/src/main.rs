@@ -80,6 +80,9 @@ fn main() {
         "rotate",
         "delete-pages",
         "crop",
+        "move-pages",
+        "duplicate-pages",
+        "insert-blank",
         "stamp",
         "redact-by-term",
         "validate-signatures",
@@ -162,6 +165,18 @@ fn main() {
         cmd_crop(&path, &rest);
         return;
     }
+    if cmd == "move-pages" {
+        cmd_move_pages(&path, &rest);
+        return;
+    }
+    if cmd == "duplicate-pages" {
+        cmd_duplicate_pages(&path, &rest);
+        return;
+    }
+    if cmd == "insert-blank" {
+        cmd_insert_blank(&path, &rest);
+        return;
+    }
     if cmd == "stamp" {
         cmd_stamp(&path, &rest);
         return;
@@ -225,6 +240,9 @@ fn usage() {
          \x20 pdf-platform rotate <file> --pages 1,3-5 --degrees 90|180|270 -o <out.pdf>\n\
          \x20 pdf-platform delete-pages <file> --pages 2,4-6 -o <out.pdf>\n\
          \x20 pdf-platform crop <file> --pages 1,3-5 --box llx,lly,urx,ury -o <out.pdf>\n\
+         \x20 pdf-platform move-pages <file> --pages 3 --to 1 -o <out.pdf>\n\
+         \x20 pdf-platform duplicate-pages <file> --pages 2,4 -o <out.pdf>\n\
+         \x20 pdf-platform insert-blank <file> --at 2 [--size 612,792] -o <out.pdf>\n\
          \x20 pdf-platform optimize <file> -o <out.pdf> [screen|print|archive]\n\
          \x20 pdf-platform stamp <file> --text \"WATERMARK\" -o <out.pdf>\n\
          \x20 pdf-platform stamp <file> --bates-start 1 --bates-width 6 -o <out.pdf>\n\
@@ -1280,11 +1298,148 @@ fn cmd_crop(path: &Path, rest: &[String]) {
         }
     }
 }
+/// A one-based position, as a zero-based index.
+fn parse_position(value: &str, flag: &str) -> Result<u32, String> {
+    match value.trim().parse::<u32>() {
+        Ok(n) if n >= 1 => Ok(n - 1),
+        Ok(_) => Err(format!("{flag} is 1-based; 0 is not a position")),
+        Err(_) => Err(format!("{flag} must be a whole number, got '{value}'")),
+    }
+}
+
+/// `width,height` in points, both positive and finite.
+fn parse_size(spec: &str) -> Result<[f64; 2], String> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() != 2 {
+        return Err(format!("--size needs width,height, got {} value(s)", parts.len()));
+    }
+    let mut out = [0.0; 2];
+    for (slot, part) in out.iter_mut().zip(&parts) {
+        *slot = match part.trim().parse::<f64>() {
+            Ok(n) if n.is_finite() && n > 0.0 => n,
+            _ => return Err(format!("'{}' is not a positive number", part.trim())),
+        };
+    }
+    Ok(out)
+}
+
+/// Move pages. [FR-ORG-1, FR-ORG-2, FR-CLI-1]
+///
+/// Usage: pdf-platform move-pages <file> --pages 3 --to 1 -o <out.pdf>
+///
+/// `--to` is the one-based position the first moved page has in the result.
+fn cmd_move_pages(path: &Path, rest: &[String]) {
+    let (_, out) = parse_dash_o(rest).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+    let Some(pages) = flag_value(rest, "--pages") else {
+        eprintln!("error: move-pages needs --pages 3");
+        process::exit(1);
+    };
+    let to = match flag_value(rest, "--to") {
+        Some(v) => parse_position(v, "--to").unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }),
+        None => {
+            eprintln!("error: move-pages needs --to <position>");
+            process::exit(1);
+        }
+    };
+    match run_page_edit(path, &out, pages, PageEdit::Move(to)) {
+        Ok(count) => {
+            println!("moved {count} page(s) to position {} -> {}", to + 1, out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// Duplicate pages, each copy right after its original. [FR-ORG-1, FR-ORG-2]
+///
+/// Usage: pdf-platform duplicate-pages <file> --pages 2,4 -o <out.pdf>
+fn cmd_duplicate_pages(path: &Path, rest: &[String]) {
+    let (_, out) = parse_dash_o(rest).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+    let Some(pages) = flag_value(rest, "--pages") else {
+        eprintln!("error: duplicate-pages needs --pages 2,4");
+        process::exit(1);
+    };
+    match run_page_edit(path, &out, pages, PageEdit::Duplicate) {
+        Ok(count) => {
+            println!("duplicated {count} page(s) -> {}", out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// Insert one blank page. [FR-ORG-1, FR-ORG-2]
+///
+/// Usage: pdf-platform insert-blank <file> --at 2 [--size 612,792] -o <out.pdf>
+///
+/// `--at` is the one-based position the new page has in the result.
+fn cmd_insert_blank(path: &Path, rest: &[String]) {
+    let (_, out) = parse_dash_o(rest).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+    let at = match flag_value(rest, "--at") {
+        Some(v) => parse_position(v, "--at").unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }),
+        None => {
+            eprintln!("error: insert-blank needs --at <position>");
+            process::exit(1);
+        }
+    };
+    let size = flag_value(rest, "--size").map(|spec| {
+        parse_size(spec).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(1);
+        })
+    });
+    match run_insert_blank(path, &out, at, size) {
+        Ok(()) => {
+            println!("inserted a blank page as page {} -> {}", at + 1, out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// Open `input`, insert a blank page at zero-based `at`, save to `output`.
+fn run_insert_blank(input: &Path, output: &Path, at: u32, size: Option<[f64; 2]>) -> Result<(), String> {
+    let worker = find_worker();
+    let mut coordinator = coordinator::document::DocumentCoordinator::open(&worker, input)
+        .map_err(|e| e.to_string())?;
+    let result = coordinator
+        .insert_blank_page(at, size)
+        .and_then(|()| coordinator.save_incremental(output));
+    let _ = coordinator.close();
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
 /// What `run_page_edit` does to the chosen pages.
 enum PageEdit {
     Rotate(u32),
     Delete,
     Crop([f64; 4]),
+    /// Zero-based position of the first moved page in the result.
+    Move(u32),
+    Duplicate,
 }
 
 /// Open `input`, apply `edit` to the pages `spec` names, save to `output`.
@@ -1303,6 +1458,8 @@ fn run_page_edit(input: &Path, output: &Path, spec: &str, edit: PageEdit) -> Res
         PageEdit::Rotate(degrees) => coordinator.rotate_pages(&pages, degrees),
         PageEdit::Delete => coordinator.delete_pages(&pages),
         PageEdit::Crop(rect) => coordinator.crop_pages(&pages, rect),
+        PageEdit::Move(to) => coordinator.move_pages(&pages, to),
+        PageEdit::Duplicate => coordinator.duplicate_pages(&pages),
     }
     .and_then(|()| coordinator.save_incremental(output));
     let _ = coordinator.close();
@@ -3778,6 +3935,64 @@ mod crop_tests {
         assert!(!output.exists(), "a refused crop left a file behind");
         let error = run_page_edit(&input, &output, "1", PageEdit::Crop([300.0, 0.0, 100.0, 300.0])).unwrap_err();
         assert!(error.contains("not a rectangle"), "{error}");
+        assert!(!output.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+#[cfg(test)]
+mod reorder_tests {
+    use super::page_edit_tests::{markers, numbered_pdf, scratch};
+    use super::*;
+
+    #[test]
+    fn positions_are_one_based_and_sizes_are_positive_pairs() {
+        assert_eq!(parse_position("1", "--to").unwrap(), 0);
+        assert_eq!(parse_position(" 7 ", "--to").unwrap(), 6);
+        for bad in ["0", "-1", "two", "", "1.5"] {
+            assert!(parse_position(bad, "--to").is_err(), "'{bad}' must be an error");
+        }
+        assert_eq!(parse_size("612,792").unwrap(), [612.0, 792.0]);
+        for bad in ["612", "612,792,1", "0,792", "-5,10", "a,b", "NaN,10", "inf,10"] {
+            assert!(parse_size(bad).is_err(), "'{bad}' must be an error");
+        }
+    }
+
+    #[test]
+    fn move_duplicate_and_insert_change_the_document_as_asked() {
+        let dir = scratch("reorder");
+        let input = dir.join("in.pdf");
+        std::fs::write(&input, numbered_pdf(3)).unwrap();
+
+        let moved = dir.join("moved.pdf");
+        run_page_edit(&input, &moved, "3", PageEdit::Move(0)).expect("move");
+        assert_eq!(markers(&moved), ["PAGEMARK3", "PAGEMARK1", "PAGEMARK2"]);
+
+        let duplicated = dir.join("dup.pdf");
+        run_page_edit(&input, &duplicated, "1", PageEdit::Duplicate).expect("duplicate");
+        assert_eq!(markers(&duplicated), ["PAGEMARK1", "PAGEMARK1", "PAGEMARK2", "PAGEMARK3"]);
+
+        let blank = dir.join("blank.pdf");
+        run_insert_blank(&input, &blank, 0, Some([300.0, 400.0])).expect("insert");
+        assert_eq!(markers(&blank), ["<none>", "PAGEMARK1", "PAGEMARK2", "PAGEMARK3"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_cannot_be_done_is_refused_and_leaves_no_file() {
+        let dir = scratch("reorder-refused");
+        let (input, output) = (dir.join("in.pdf"), dir.join("out.pdf"));
+        std::fs::write(&input, numbered_pdf(3)).unwrap();
+
+        for (case, error) in [
+            ("a move that changes nothing", run_page_edit(&input, &output, "2", PageEdit::Move(1)).unwrap_err()),
+            ("a position past the end", run_page_edit(&input, &output, "1", PageEdit::Move(9)).unwrap_err()),
+            ("a page past the end", run_page_edit(&input, &output, "9", PageEdit::Duplicate).unwrap_err()),
+        ] {
+            assert!(!error.is_empty(), "{case}");
+            assert!(!output.exists(), "{case} left a file behind");
+        }
+        let error = run_insert_blank(&input, &output, 9, None).unwrap_err();
+        assert!(error.contains("past the end"), "{error}");
         assert!(!output.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
