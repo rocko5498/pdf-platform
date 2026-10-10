@@ -109,3 +109,55 @@ pub fn scratch(name: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
+
+/// A four-page document whose page tree is nested: root -> branch A (pages 1, 2)
+/// and branch B (pages 3, 4). Page n draws `PAGEMARKn`.
+pub fn nested_numbered_pdf() -> Vec<u8> {
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),                                  // 1
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 4 >>".to_vec(),                    // 2
+        b"<< /Type /Pages /Parent 2 0 R /Kids [6 0 R 7 0 R] /Count 2 >>".to_vec(),      // 3
+        b"<< /Type /Pages /Parent 2 0 R /Kids [8 0 R 9 0 R] /Count 2 >>".to_vec(),      // 4
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),             // 5
+    ];
+    for index in 0..4u32 {
+        let parent = if index < 2 { 3 } else { 4 };
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent {parent} 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents {} 0 R >>",
+                10 + index
+            )
+            .into_bytes(),
+        ); // 6..9
+    }
+    for index in 0..4u32 {
+        let content = format!("BT\n/F1 24 Tf\n72 700 Td\n(PAGEMARK{}) Tj\nET\n", index + 1);
+        objects.push(
+            [
+                format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+                content.as_bytes(),
+                b"endstream",
+            ]
+            .concat(),
+        ); // 10..13
+    }
+    assemble(&objects)
+}
+
+/// Two pages that carry no `/MediaBox` of their own: the size is inherited from
+/// the `/Pages` node, as Word and LaTeX write it. 300 x 400 points, not letter.
+pub fn inherited_box_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 300 400] \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        [b"<< /Length 41 >>\nstream\n".as_slice(), b"BT /F1 24 Tf 20 300 Td (PAGEMARK1) Tj ET\n", b"endstream"].concat(),
+        [b"<< /Length 41 >>\nstream\n".as_slice(), b"BT /F1 24 Tf 20 300 Td (PAGEMARK2) Tj ET\n", b"endstream"].concat(),
+    ];
+    assemble(&objects)
+}

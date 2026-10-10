@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use pdf_model::command::{CommandGroup, SetObjectCommand};
 use pdf_model::journal::UndoJournal;
 use pdf_model::overlay::CowOverlay;
-use pdf_model::organize::{build_delete_pages_group, build_rotate_pages_group};
+use pdf_model::organize::{
+    build_delete_pages_group, build_rotate_pages_group, kid_references, leaf_pages, PageTreeNode,
+};
 use pdf_model::stamp::{Stamp, StampPosition};
 use pdf_write::IncrementalWriter;
 use protocol::inspect::StructuralSummary;
@@ -494,67 +496,81 @@ impl DocumentCoordinator {
 
     /// Execute a delete-pages operation end-to-end.
     ///
-    /// Reads the real Pages object from the worker, parses the Kids array,
-    /// and builds a proper command group. [FR-ORG, M3]
+    /// Reads the whole page tree from the worker, whatever its depth, and
+    /// rewrites only the nodes that lose a page, in place. [FR-ORG-1, ADR-012]
     pub fn delete_pages(&mut self, page_indices: &[u32]) -> Result<(), SessionError> {
-        // Find the Pages parent object. Typically object 2 in simple PDFs,
-        // but we search for it in the catalog's /Pages reference.
-        let pages_obj_num = self.find_pages_object()?;
-
-        // Read the current Kids array from the worker.
-        let pages_bytes = self.session.get_object(pages_obj_num)?;
-        let pages_text = String::from_utf8_lossy(&pages_bytes);
-
-        // The whole Pages object, not the contents between the brackets.
-        //
-        // This used to pass `extract_kids_array`'s output — the text *inside*
-        // `/Kids [ ... ]` — while `build_delete_pages_group` looks for the
-        // literal "/Kids [" in what it receives. It never found it, so every
-        // delete failed with "could not parse Kids array". The model's own test
-        // passed a whole page-tree object, so nothing caught the mismatch.
-        // [FR-ORG-1, PRIN-1]
-        let group = build_delete_pages_group(
-            page_indices,
-            pages_obj_num,
-            &pages_bytes,
-            self.summary.page_count,
-        )
-        .map_err(SessionError::Protocol)?;
-
+        let nodes = self.page_tree()?;
+        let group = build_delete_pages_group(&nodes, page_indices).map_err(SessionError::Protocol)?;
         self.apply_command_group(group)
     }
 
     /// Rotate pages by the specified degrees.
     ///
-    /// Reads actual /Rotate values from the worker for each page. [FR-ROTATE, M3]
+    /// Each page is patched from its own current bytes. [FR-ROTATE, M3]
     pub fn rotate_pages(&mut self, page_indices: &[u32], degrees: u32) -> Result<(), SessionError> {
-        // Find the Pages object to get the Kids array.
-        let pages_obj_num = self.find_pages_object()?;
-        let pages_bytes = self.session.get_object(pages_obj_num)?;
-        let pages_text = String::from_utf8_lossy(&pages_bytes);
+        let nodes = self.page_tree()?;
+        let leaves = leaf_pages(&nodes).map_err(SessionError::Protocol)?;
 
-        // Parse kid references to get page object numbers.
-        let kid_refs = self.parse_kid_references(&pages_text);
-
-        // Fetch each page as it stands. Rotation patches the existing
-        // dictionary, so the bytes are the input — passing object numbers and
-        // rotations separately is what let the caller and the builder disagree
-        // about which was which. [FR-ROTATE]
+        // Rotation patches the existing dictionary, so the bytes are the input —
+        // passing object numbers and rotations separately is what let the caller
+        // and the builder disagree about which was which. [FR-ROTATE]
         let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
         for &page_idx in page_indices {
-            let obj_num = *kid_refs.get(page_idx as usize).ok_or_else(|| {
-                SessionError::Protocol(format!("page {page_idx} is not in the page tree"))
+            let obj_num = *leaves.get(page_idx as usize).ok_or_else(|| {
+                SessionError::Protocol(format!(
+                    "page {} is not in the document, which has {} page(s)",
+                    page_idx + 1,
+                    leaves.len()
+                ))
             })?;
-            let bytes = self.session.get_object(obj_num)?;
+            let bytes = nodes
+                .iter()
+                .find(|n| n.obj_num == obj_num)
+                .map(|n| n.bytes.clone())
+                .ok_or_else(|| SessionError::Protocol(format!("page object {obj_num} was not read")))?;
             pages.push((obj_num, bytes));
         }
 
-        let group = build_rotate_pages_group(&pages, degrees)
-            .map_err(SessionError::Protocol)?;
-
+        let group = build_rotate_pages_group(&pages, degrees).map_err(SessionError::Protocol)?;
         self.apply_command_group(group)
     }
 
+    /// Read the whole page tree, root first, in document order.
+    ///
+    /// Every edit that addresses a page by index needs the real leaves: the
+    /// root's `/Kids` are pages only in a flat tree, and in a nested one they
+    /// are branches, which is how `delete-pages --pages 2` once removed a whole
+    /// branch while reporting one page. A tree deeper than 64 levels, larger
+    /// than 100,000 nodes, or that revisits a node is an error. [GR-7, GR-8]
+    fn page_tree(&mut self) -> Result<Vec<PageTreeNode>, SessionError> {
+        const MAX_NODES: usize = 100_000;
+        const MAX_DEPTH: usize = 64;
+
+        let root = self.find_pages_object()?;
+        let mut nodes: Vec<PageTreeNode> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![(root, 0usize)];
+        while let Some((obj_num, depth)) = stack.pop() {
+            if depth > MAX_DEPTH {
+                return Err(SessionError::Protocol("the page tree is nested too deeply".into()));
+            }
+            if !seen.insert(obj_num) {
+                return Err(SessionError::Protocol(format!("the page tree visits object {obj_num} twice")));
+            }
+            if nodes.len() >= MAX_NODES {
+                return Err(SessionError::Protocol("the page tree is larger than this reader supports".into()));
+            }
+            let bytes = self.session.get_object(obj_num)?;
+            let kids = kid_references(&bytes).map_err(SessionError::Protocol)?;
+            if let Some(kids) = &kids {
+                for &kid in kids.iter().rev() {
+                    stack.push((kid, depth + 1));
+                }
+            }
+            nodes.push(PageTreeNode { obj_num, bytes, kids });
+        }
+        Ok(nodes)
+    }
     /// Apply the same text stamp to every page as one undoable edit. [FR-BATCH-1, M6]
     pub fn apply_stamp(&mut self, stamp: &Stamp) -> Result<(), SessionError> {
         let pages = self.stamp_page_objects()?;
@@ -589,20 +605,26 @@ impl DocumentCoordinator {
     }
 
     fn stamp_page_objects(&mut self) -> Result<Vec<(u32, Vec<u8>)>, SessionError> {
-        let pages_obj_num = self.find_pages_object()?;
-        let pages_bytes = self.session.get_object(pages_obj_num)?;
-        let page_refs = self.parse_kid_references(&String::from_utf8_lossy(&pages_bytes));
-        if page_refs.len() != self.summary.page_count as usize {
-            return Err(SessionError::Protocol(
-                "stamping nested page trees is not yet supported".into(),
-            ));
+        let nodes = self.page_tree()?;
+        let leaves = leaf_pages(&nodes).map_err(SessionError::Protocol)?;
+        if leaves.len() != self.summary.page_count as usize {
+            return Err(SessionError::Protocol(format!(
+                "the page tree lists {} page(s) but the document reports {}",
+                leaves.len(),
+                self.summary.page_count
+            )));
         }
-        page_refs
+        leaves
             .into_iter()
-            .map(|obj_num| self.session.get_object(obj_num).map(|bytes| (obj_num, bytes)))
+            .map(|obj_num| {
+                nodes
+                    .iter()
+                    .find(|n| n.obj_num == obj_num)
+                    .map(|n| (obj_num, n.bytes.clone()))
+                    .ok_or_else(|| SessionError::Protocol(format!("page object {obj_num} was not read")))
+            })
             .collect()
     }
-
     /// Find the Pages parent object number by reading the catalog. [SDS §3.1]
     fn find_pages_object(&mut self) -> Result<u32, SessionError> {
         // The catalog is whatever the trailer's /Root names. This read object 1
@@ -641,27 +663,6 @@ impl DocumentCoordinator {
             "catalog (object {}) names no /Pages",
             self.summary.root_obj_num
         )))
-    }
-
-
-    /// Parse kid references from a Pages object string into object numbers.
-    fn parse_kid_references(&self, pages_text: &str) -> Vec<u32> {
-        let mut refs = Vec::new();
-        if let Some(start) = pages_text.find("/Kids [") {
-            let array_start = start + "/Kids [".len();
-            if let Some(end) = pages_text[array_start..].find(']') {
-                let array = &pages_text[array_start..array_start + end];
-                let tokens: Vec<&str> = array.split_whitespace().collect();
-                for chunk in tokens.chunks(3) {
-                    if chunk.len() == 3 && chunk[2] == "R" {
-                        if let Ok(num) = chunk[0].parse::<u32>() {
-                            refs.push(num);
-                        }
-                    }
-                }
-            }
-        }
-        refs
     }
 
 
@@ -766,17 +767,19 @@ impl DocumentCoordinator {
     /// Resolve a page index to its object number and current serialized
     /// bytes. [FR-OCR-1]
     pub fn page_object(&mut self, page_index: u32) -> Result<(u32, Vec<u8>), SessionError> {
-        let pages_obj_num = self.find_pages_object()?;
-        let pages_bytes = self.session.get_object(pages_obj_num)?;
-        let pages_text = String::from_utf8_lossy(&pages_bytes);
-        let kid_refs = self.parse_kid_references(&pages_text);
-        let page_obj_num = *kid_refs.get(page_index as usize).ok_or_else(|| {
+        let nodes = self.page_tree()?;
+        let leaves = leaf_pages(&nodes).map_err(SessionError::Protocol)?;
+        let page_obj_num = *leaves.get(page_index as usize).ok_or_else(|| {
             SessionError::Protocol(format!(
                 "page {page_index} out of range ({} pages)",
-                kid_refs.len()
+                leaves.len()
             ))
         })?;
-        let page_bytes = self.session.get_object(page_obj_num)?;
+        let page_bytes = nodes
+            .into_iter()
+            .find(|n| n.obj_num == page_obj_num)
+            .map(|n| n.bytes)
+            .ok_or_else(|| SessionError::Protocol(format!("page object {page_obj_num} was not read")))?;
         Ok((page_obj_num, page_bytes))
     }
 
@@ -1640,8 +1643,18 @@ mod tests {
         let mut overlay = CowOverlay::new();
         let mut journal = UndoJournal::new();
 
-        let kids = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n";
-        let group = pdf_model::organize::build_delete_pages_group(&[1], 2, kids, 3).unwrap();
+        let node = |obj_num: u32, dict: &str| {
+            let bytes = format!("{obj_num} 0 obj\n{dict}\nendobj\n").into_bytes();
+            let kids = pdf_model::organize::kid_references(&bytes).unwrap();
+            pdf_model::organize::PageTreeNode { obj_num, bytes, kids }
+        };
+        let nodes = vec![
+            node(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            node(3, "<< /Type /Page /Parent 2 0 R >>"),
+            node(4, "<< /Type /Page /Parent 2 0 R >>"),
+            node(5, "<< /Type /Page /Parent 2 0 R >>"),
+        ];
+        let group = pdf_model::organize::build_delete_pages_group(&nodes, &[1]).unwrap();
 
         group.apply(&mut overlay).unwrap();
         journal.record(group);

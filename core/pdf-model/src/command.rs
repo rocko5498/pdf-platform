@@ -195,7 +195,7 @@ impl Command for SetObjectCommand {
 }
 
 /// Simple base64 encoding for command serialization.
-pub(crate) fn base64_encode(data: &[u8]) -> String {
+fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
