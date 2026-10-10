@@ -995,15 +995,36 @@ fn scan_and_encode(
     let ds = scan_file(file).map_err(|e| e.to_string())?;
     // Prefer page meta from the already-loaded engine — never re-open the handle. [ADR-005]
     let page_dimensions = page_dimensions_from_engine(pdfium);
+
+    // The page count has the same authority. The scan reads the page tree
+    // itself, and on an encrypted document whose objects live in (encrypted)
+    // object streams it cannot: it reports no pages, and the viewer opened such
+    // a file as an empty document while PDFium had the real count. The engine's
+    // count wins when there is one, and a disagreement is recorded rather than
+    // silently resolved. [ADR-005, FR-VIEW-2, GR-8]
+    let mut leniency_events: Vec<String> = ds.leniency.iter().map(|e| e.to_string()).collect();
+    let page_count = if page_dimensions.is_empty() {
+        ds.page_count
+    } else {
+        let engine_count = page_dimensions.len() as u32;
+        if engine_count != ds.page_count {
+            leniency_events.push(format!(
+                "[page-count-mismatch] the structure scan counted {} page(s); the engine counted \
+                 {engine_count}, which is used",
+                ds.page_count
+            ));
+        }
+        engine_count
+    };
     Ok(StructuralSummary {
         root_obj_num: ds.root_obj_num,
-        page_count: ds.page_count,
+        page_count,
         has_acroform: ds.has_acroform,
         has_xfa: ds.has_xfa,
         has_js: ds.has_js,
         sig_count: ds.sig_count,
-        leniency_count: ds.leniency.len() as u32,
-        leniency_events: ds.leniency.iter().map(|e| e.to_string()).collect(),
+        leniency_count: leniency_events.len() as u32,
+        leniency_events,
         page_dimensions,
         original_offsets: ds.xref_offsets,
     })
