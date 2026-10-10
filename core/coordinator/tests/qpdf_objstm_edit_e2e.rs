@@ -39,6 +39,13 @@ fn a_predictor_filtered_document_can_be_stamped_and_saved() {
     coord.save_incremental(&stamped).expect("save");
     let _ = coord.close();
 
+    // A second reader's verdict on the file we wrote, not ours. [FR-SAVE-1]
+    if common::qpdf_or_skip() {
+        let check = std::process::Command::new("qpdf").arg("--check").arg(&stamped).output().expect("run qpdf");
+        let said = String::from_utf8_lossy(&check.stdout).to_string() + &String::from_utf8_lossy(&check.stderr);
+        assert!(check.status.code() == Some(0), "qpdf --check: {said}");
+    }
+
     let mut reopened = DocumentCoordinator::open(&worker_path(), &stamped).expect("reopen");
     let pages = reopened.page_count();
     let text: String = reopened
