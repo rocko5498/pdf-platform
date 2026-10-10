@@ -75,6 +75,8 @@ fn main() {
         "split",
         "optimize",
         "extract-pages",
+        "rotate",
+        "delete-pages",
         "stamp",
         "redact-by-term",
         "validate-signatures",
@@ -137,6 +139,14 @@ fn main() {
         cmd_extract_pages(&path, &rest);
         return;
     }
+    if cmd == "rotate" {
+        cmd_rotate(&path, &rest);
+        return;
+    }
+    if cmd == "delete-pages" {
+        cmd_delete_pages(&path, &rest);
+        return;
+    }
     if cmd == "stamp" {
         cmd_stamp(&path, &rest);
         return;
@@ -195,6 +205,8 @@ fn usage() {
          \x20 pdf-platform merge <file1> <file2> [...] -o <out.pdf>\n\
          \x20 pdf-platform split <file> -o <outdir>\n\
          \x20 pdf-platform extract-pages <file> <first> <last> -o <out.pdf>\n\
+         \x20 pdf-platform rotate <file> --pages 1,3-5 --degrees 90|180|270 -o <out.pdf>\n\
+         \x20 pdf-platform delete-pages <file> --pages 2,4-6 -o <out.pdf>\n\
          \x20 pdf-platform optimize <file> -o <out.pdf> [screen|print|archive]\n\
          \x20 pdf-platform stamp <file> --text \"WATERMARK\" -o <out.pdf>\n\
          \x20 pdf-platform stamp <file> --bates-start 1 --bates-width 6 -o <out.pdf>\n\
@@ -938,6 +950,139 @@ fn cmd_optimize(path: &Path, rest: &[String]) {
             process::exit(2);
         }
     }
+}
+
+/// Parse `1,3-5` into zero-based page indices, sorted and without repeats.
+///
+/// Pages are 1-based on the command line, as in `extract-pages`. Every
+/// malformed piece is an error naming the piece: a list that silently dropped
+/// `three` would rotate or delete a different set of pages than the user typed.
+/// [UX-ERR-3, GR-8, PRIN-1]
+fn parse_page_list(spec: &str, page_count: u32) -> Result<Vec<u32>, String> {
+    if spec.trim().is_empty() {
+        return Err("--pages needs a list such as 1,3-5".into());
+    }
+    let number = |text: &str| -> Result<u32, String> {
+        match text.trim().parse::<u32>() {
+            Ok(n) if n >= 1 => Ok(n),
+            Ok(_) => Err("page numbers are 1-based; 0 is not a page".to_string()),
+            Err(_) => Err(format!("'{}' is not a page number", text.trim())),
+        }
+    };
+    let mut pages = std::collections::BTreeSet::new();
+    for piece in spec.split(',') {
+        let (first, last) = match piece.split_once('-') {
+            Some((a, b)) => (number(a)?, number(b)?),
+            None => {
+                let n = number(piece)?;
+                (n, n)
+            }
+        };
+        check_page_range(first, last)?;
+        if last > page_count {
+            return Err(format!("page {last} is past the end: the document has {page_count} page(s)"));
+        }
+        pages.extend((first..=last).map(|p| p - 1));
+    }
+    Ok(pages.into_iter().collect())
+}
+
+/// `--pages <list>` from a command's arguments, if present.
+fn flag_value<'a>(rest: &'a [String], flag: &str) -> Option<&'a str> {
+    rest.iter().position(|s| s == flag).and_then(|i| rest.get(i + 1)).map(String::as_str)
+}
+
+/// Rotate pages and save. [FR-ORG-1, FR-ORG-2, FR-CLI-1]
+///
+/// Usage: pdf-platform rotate <file> --pages 1,3-5 --degrees 90|180|270 -o <out.pdf>
+fn cmd_rotate(path: &Path, rest: &[String]) {
+    let (_, out) = parse_dash_o(rest).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+    let Some(pages) = flag_value(rest, "--pages") else {
+        eprintln!("error: rotate needs --pages 1,3-5");
+        process::exit(1);
+    };
+    let degrees = match flag_value(rest, "--degrees").map(|d| d.trim().parse::<u32>()) {
+        Some(Ok(d)) if matches!(d, 90 | 180 | 270) => d,
+        Some(_) => {
+            eprintln!("error: --degrees must be 90, 180 or 270");
+            process::exit(1);
+        }
+        None => {
+            eprintln!("error: rotate needs --degrees 90|180|270");
+            process::exit(1);
+        }
+    };
+    match run_page_edit(path, &out, pages, PageEdit::Rotate(degrees)) {
+        Ok(count) => {
+            println!("rotated {count} page(s) by {degrees} degrees -> {}", out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// Delete pages and save. [FR-ORG-1, FR-ORG-2, FR-CLI-1]
+///
+/// Usage: pdf-platform delete-pages <file> --pages 2,4-6 -o <out.pdf>
+fn cmd_delete_pages(path: &Path, rest: &[String]) {
+    let (_, out) = parse_dash_o(rest).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+    let Some(pages) = flag_value(rest, "--pages") else {
+        eprintln!("error: delete-pages needs --pages 2,4-6");
+        process::exit(1);
+    };
+    match run_page_edit(path, &out, pages, PageEdit::Delete) {
+        Ok(count) => {
+            println!("deleted {count} page(s) -> {}", out.display());
+            // Saving is incremental (ADR-012): the earlier revision, with the
+            // deleted pages, is still in the file. Say so. [PRIN-6, FR-SAVE-2]
+            println!(
+                "note: the pages are gone from the page tree; their bytes remain in the file \
+                 as an earlier revision until it is rewritten"
+            );
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// What `run_page_edit` does to the chosen pages.
+enum PageEdit {
+    Rotate(u32),
+    Delete,
+}
+
+/// Open `input`, apply `edit` to the pages `spec` names, save to `output`.
+/// Returns how many pages were changed.
+fn run_page_edit(input: &Path, output: &Path, spec: &str, edit: PageEdit) -> Result<usize, String> {
+    let worker = find_worker();
+    let mut coordinator = coordinator::document::DocumentCoordinator::open(&worker, input)
+        .map_err(|e| e.to_string())?;
+    let total = coordinator.page_count();
+    let pages = parse_page_list(spec, total)?;
+    if matches!(edit, PageEdit::Delete) && pages.len() as u32 >= total {
+        let _ = coordinator.close();
+        return Err("that would delete every page; a document needs at least one".into());
+    }
+    let result = match edit {
+        PageEdit::Rotate(degrees) => coordinator.rotate_pages(&pages, degrees),
+        PageEdit::Delete => coordinator.delete_pages(&pages),
+    }
+    .and_then(|()| coordinator.save_incremental(output));
+    let _ = coordinator.close();
+    result.map_err(|e| e.to_string())?;
+    Ok(pages.len())
 }
 
 /// Apply a watermark or Bates stamp to all pages of a PDF. [FR-STAMP]
@@ -3185,6 +3330,172 @@ mod export_tests {
         assert!(parse_export_dpi(&args(&["--dpi"])).is_err(), "a flag with no value");
         assert!(parse_export_dpi(&args(&["--dpi=300"])).is_err(), "unknown spelling");
         assert!(parse_export_dpi(&args(&["300"])).is_err(), "a stray argument");
+    }
+}
+
+#[cfg(test)]
+mod page_edit_tests {
+    use super::*;
+    use coordinator::document::DocumentCoordinator;
+
+    /// A document of `pages` pages, page n drawing `PAGEMARKn`, so a test can
+    /// read the result back and check *which* pages survived.
+    fn numbered_pdf(pages: u32) -> Vec<u8> {
+        let mut objects: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()];
+        let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 4 + i * 2)).collect();
+        objects.push(
+            format!("<< /Type /Pages /Kids [{}] /Count {pages} >>", kids.join(" ")).into_bytes(),
+        );
+        objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
+        for index in 0..pages {
+            objects.push(
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+                    5 + index * 2
+                )
+                .into_bytes(),
+            );
+            let content = format!("BT\n/F1 24 Tf\n72 700 Td\n(PAGEMARK{}) Tj\nET\n", index + 1);
+            objects.push(
+                [
+                    format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+                    content.as_bytes(),
+                    b"endstream",
+                ]
+                .concat(),
+            );
+        }
+        let mut bytes: Vec<u8> = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_at = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        for offset in &offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pdf-platform-page-edit-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn markers(path: &Path) -> Vec<String> {
+        let worker = find_worker();
+        let mut coord = DocumentCoordinator::open(&worker, path).expect("open result");
+        let mut out = Vec::new();
+        for page in 0..coord.page_count() {
+            let text: String = coord
+                .get_page_text(page)
+                .expect("extract")
+                .lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push(
+                text.split_whitespace()
+                    .find(|t| t.starts_with("PAGEMARK"))
+                    .unwrap_or("<none>")
+                    .to_string(),
+            );
+        }
+        let _ = coord.close();
+        out
+    }
+
+    #[test]
+    fn the_page_list_is_one_based_sorted_and_strict() {
+        assert_eq!(parse_page_list("1", 5).unwrap(), [0]);
+        assert_eq!(parse_page_list("3-5,1", 5).unwrap(), [0, 2, 3, 4], "sorted, ranges expanded");
+        assert_eq!(parse_page_list("2,2,1-2", 5).unwrap(), [0, 1], "no repeats");
+        for (bad, why) in [
+            ("", "empty"),
+            ("0", "page 0"),
+            ("two", "not a number"),
+            ("1,x", "a bad piece after a good one"),
+            ("4-2", "reversed range"),
+            ("1-9", "past the end"),
+            ("-3", "missing start"),
+            ("1-", "missing end"),
+        ] {
+            assert!(parse_page_list(bad, 5).is_err(), "'{bad}' ({why}) must be an error");
+        }
+        assert!(parse_page_list("9", 5).unwrap_err().contains("5 page"), "the error names the page count");
+    }
+
+    #[test]
+    fn deleting_a_page_removes_exactly_that_page() {
+        let dir = scratch("delete");
+        let input = dir.join("in.pdf");
+        let output = dir.join("out.pdf");
+        std::fs::write(&input, numbered_pdf(3)).unwrap();
+
+        let changed = run_page_edit(&input, &output, "2", PageEdit::Delete).expect("delete");
+        assert_eq!(changed, 1);
+        assert_eq!(markers(&output), ["PAGEMARK1", "PAGEMARK3"], "page 2 must be the one that went");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_every_page_is_refused_and_writes_nothing() {
+        let dir = scratch("delete-all");
+        let input = dir.join("in.pdf");
+        let output = dir.join("out.pdf");
+        std::fs::write(&input, numbered_pdf(3)).unwrap();
+
+        let error = run_page_edit(&input, &output, "1-3", PageEdit::Delete).unwrap_err();
+        assert!(error.contains("every page"), "{error}");
+        assert!(!output.exists(), "a refused edit left a file behind");
+
+        let error = run_page_edit(&input, &output, "7", PageEdit::Delete).unwrap_err();
+        assert!(error.contains("past the end"), "{error}");
+        assert!(!output.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_a_page_turns_that_page_and_only_that_page() {
+        let dir = scratch("rotate");
+        let input = dir.join("in.pdf");
+        let output = dir.join("out.pdf");
+        std::fs::write(&input, numbered_pdf(3)).unwrap();
+
+        run_page_edit(&input, &output, "2", PageEdit::Rotate(90)).expect("rotate");
+
+        let worker = find_worker();
+        let mut coord = DocumentCoordinator::open(&worker, &output).expect("open result");
+        let first = coord.render_page(0, 1.0).expect("render 1");
+        let second = coord.render_page(1, 1.0).expect("render 2");
+        let third = coord.render_page(2, 1.0).expect("render 3");
+        // A quarter turn either way swaps the sides, so the sizes cannot tell
+        // 90 from 270; the rotation the engine reports can.
+        let rotations: Vec<u32> =
+            coord.summary().page_dimensions_f().iter().map(|(_, _, r)| *r).collect();
+        let _ = coord.close();
+
+        assert_eq!(rotations, [0, 90, 0], "page 2 must be turned 90, not 270");
+        assert_eq!((first.width, first.height), (612, 792), "page 1 must be untouched");
+        assert_eq!((second.width, second.height), (792, 612), "a quarter turn swaps the sides");
+        assert_eq!((third.width, third.height), (612, 792), "page 3 must be untouched");
+        assert_eq!(markers(&output), ["PAGEMARK1", "PAGEMARK2", "PAGEMARK3"], "no page may be lost");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
