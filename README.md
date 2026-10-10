@@ -84,6 +84,7 @@ cargo run -p cli --bin pdf-platform -- revisions in.pdf
 cargo run -p cli --bin pdf-platform -- sanitize in.pdf -o clean.pdf
 cargo run -p cli --bin pdf-platform -- rotate in.pdf --pages 1,3-5 --degrees 90 -o out.pdf
 cargo run -p cli --bin pdf-platform -- delete-pages in.pdf --pages 2 -o out.pdf
+cargo run -p cli --bin pdf-platform -- crop in.pdf --pages 1 --box 10,10,500,700 -o out.pdf
 cargo run -p cli --bin pdf-platform -- export-images in.pdf -o images/ --dpi 150
 cargo run -p cli --bin pdf-platform -- export-html in.pdf -o out.html
 cargo run -p cli --bin pdf-platform -- redact-by-term doc.pdf --term "SECRET"

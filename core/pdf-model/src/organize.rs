@@ -61,6 +61,99 @@ pub fn page_rotation(page_bytes: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
+/// The raw value of `/Key` in an object, if present: a token such as `90`, or
+/// an array such as `[0 0 612 792]`. The key must be a whole name, so `/Rotate`
+/// does not match `/RotateBy`. An indirect value (`N G R`) is returned as
+/// written; callers that need a number treat it as unsupported.
+fn entry_value(bytes: &[u8], key: &str) -> Option<String> {
+    let key = key.as_bytes();
+    let mut from = 0;
+    while let Some(found) = bytes[from..].windows(key.len()).position(|w| w == key) {
+        let at = from + found;
+        let after = at + key.len();
+        let whole_name = bytes
+            .get(after)
+            .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b'[' | b'<' | b'(' | b'/' | b'>'));
+        if whole_name {
+            let mut i = after;
+            while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            if bytes.get(i) == Some(&b'[') {
+                let close = bytes[i..].iter().position(|&b| b == b']')? + i;
+                return Some(String::from_utf8_lossy(&bytes[i..=close]).into_owned());
+            }
+            let end = bytes[i..]
+                .iter()
+                .position(|b| matches!(b, b'/' | b'>' | b'[' | b'<'))
+                .map_or(bytes.len(), |p| p + i);
+            let value = String::from_utf8_lossy(&bytes[i..end]).trim().to_string();
+            return (!value.is_empty()).then_some(value);
+        }
+        from = after;
+    }
+    None
+}
+
+/// The value `leaf` has for an inheritable key: its own, else the nearest
+/// ancestor's. `/MediaBox`, `/CropBox`, `/Rotate` and `/Resources` are inherited
+/// through `/Pages` nodes, which is why producers put them there. [FR-ORG-1]
+fn inherited_value(nodes: &[PageTreeNode], leaf: u32, key: &str) -> Option<String> {
+    let by_number: std::collections::HashMap<u32, &PageTreeNode> =
+        nodes.iter().map(|n| (n.obj_num, n)).collect();
+    let mut parent_of = std::collections::HashMap::new();
+    for node in nodes {
+        for kid in node.kids.iter().flatten() {
+            parent_of.insert(*kid, node.obj_num);
+        }
+    }
+    let mut current = Some(leaf);
+    let mut hops = 0;
+    while let Some(number) = current {
+        if let Some(value) = by_number.get(&number).and_then(|n| entry_value(&n.bytes, key)) {
+            return Some(value);
+        }
+        hops += 1;
+        if hops > 64 {
+            return None;
+        }
+        current = parent_of.get(&number).copied();
+    }
+    None
+}
+
+/// The rotation a page actually has: its own `/Rotate`, else an ancestor's,
+/// else 0, normalised to 0, 90, 180 or 270. [FR-ROTATE]
+#[must_use]
+pub fn effective_rotation(nodes: &[PageTreeNode], leaf: u32) -> u32 {
+    inherited_value(nodes, leaf, "/Rotate")
+        .and_then(|v| v.parse::<i64>().ok())
+        .map_or(0, |degrees| degrees.rem_euclid(360) as u32)
+}
+
+/// The `/MediaBox` a page actually has, as `[llx, lly, urx, ury]`.
+pub fn effective_media_box(nodes: &[PageTreeNode], leaf: u32) -> Result<[f64; 4], String> {
+    let raw = inherited_value(nodes, leaf, "/MediaBox")
+        .ok_or_else(|| "the page has no /MediaBox of its own or from an ancestor".to_string())?;
+    parse_rect(&raw).map_err(|why| format!("the /MediaBox {raw:?} is not usable: {why}"))
+}
+
+/// `[a b c d]` as four finite numbers.
+fn parse_rect(raw: &str) -> Result<[f64; 4], String> {
+    let inner = raw.trim().strip_prefix('[').and_then(|s| s.strip_suffix(']')).ok_or("not an array")?;
+    let numbers: Vec<f64> = inner
+        .split_whitespace()
+        .map(|t| t.parse::<f64>().map_err(|_| format!("'{t}' is not a number")))
+        .collect::<Result<_, _>>()?;
+    let [a, b, c, d] = numbers[..] else {
+        return Err(format!("{} numbers instead of 4", numbers.len()));
+    };
+    if ![a, b, c, d].iter().all(|n| n.is_finite()) {
+        return Err("a value is not finite".into());
+    }
+    Ok([a, b, c, d])
+}
+
 /// One node of a document's page tree, as read from the file. [FR-ORG-1]
 #[derive(Debug, Clone)]
 pub struct PageTreeNode {
@@ -286,17 +379,21 @@ pub fn build_delete_pages_group(
 
 /// Build a rotate-pages command group, patching each page in place.
 ///
-/// `pages` is `(object number, current page bytes)` for every page to rotate.
-/// The bytes are required for two reasons: rotation must preserve the rest of
-/// the page dictionary, and undo must restore exactly what was there.
+/// `pages` is `(object number, current page bytes, rotation the page has now)`
+/// for every page to rotate. The rotation the page has is its own `/Rotate` or
+/// the one it inherits (see [`effective_rotation`]): adding to the page's own
+/// value alone turned a page that inherited 90 into a page rotated by the new
+/// amount, not by 90 plus it. The bytes are required for two reasons: rotation
+/// must preserve the rest of the page dictionary, and undo must restore exactly
+/// what was there.
 ///
-/// The previous signature took page *indices* alongside a list the caller
-/// populated with page *object numbers*, and matched one against the other — so
+/// An earlier signature took page *indices* alongside a list the caller
+/// populated with page *object numbers*, and matched one against the other, so
 /// the lookup never succeeded and rotation silently did nothing. Taking the
 /// pages themselves removes the mismatch rather than documenting it.
 /// [FR-ROTATE, ADR-012, PRIN-1]
 pub fn build_rotate_pages_group(
-    pages: &[(u32, Vec<u8>)],
+    pages: &[(u32, Vec<u8>, u32)],
     degrees: u32,
 ) -> Result<CommandGroup, String> {
     if pages.is_empty() {
@@ -307,8 +404,8 @@ pub fn build_rotate_pages_group(
     }
 
     let mut group = CommandGroup::new(format!("Rotate {} page(s) by {degrees}°", pages.len()));
-    for (obj_num, page_bytes) in pages {
-        let rotation = (page_rotation(page_bytes) + degrees) % 360;
+    for (obj_num, page_bytes, current) in pages {
+        let rotation = (current + degrees) % 360;
         let new_bytes = set_page_rotation(page_bytes, rotation)?;
         group.push(Box::new(crate::command::SetObjectCommand {
             obj_num: *obj_num,
@@ -319,6 +416,86 @@ pub fn build_rotate_pages_group(
     Ok(group)
 }
 
+/// A number as PDF writes it: no exponent, no trailing zeros.
+fn pdf_number(n: f64) -> String {
+    let text = format!("{n:.4}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Set a page's `/CropBox`, replacing an existing one or adding it, and leave
+/// every other key alone. [FR-ORG, PRIN-1]
+fn set_page_crop_box(page_bytes: &[u8], rect: [f64; 4]) -> Result<Vec<u8>, String> {
+    let array = format!("[{} {} {} {}]", pdf_number(rect[0]), pdf_number(rect[1]), pdf_number(rect[2]), pdf_number(rect[3]));
+    const KEY: &[u8] = b"/CropBox";
+    if let Some(at) = page_bytes.windows(KEY.len()).position(|w| w == KEY) {
+        let mut i = at + KEY.len();
+        while page_bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if page_bytes.get(i) != Some(&b'[') {
+            return Err("the page's /CropBox is not an inline array".to_string());
+        }
+        let close = page_bytes[i..]
+            .iter()
+            .position(|&b| b == b']')
+            .ok_or_else(|| "the page's /CropBox is never closed".to_string())?
+            + i;
+        let mut out = Vec::with_capacity(page_bytes.len() + 16);
+        out.extend_from_slice(&page_bytes[..at]);
+        out.extend_from_slice(format!("/CropBox {array}").as_bytes());
+        out.extend_from_slice(&page_bytes[close + 1..]);
+        return Ok(out);
+    }
+    let end = page_bytes
+        .windows(2)
+        .rposition(|w| w == b">>")
+        .ok_or_else(|| "page object has no dictionary end".to_string())?;
+    let mut out = Vec::with_capacity(page_bytes.len() + 32);
+    out.extend_from_slice(&page_bytes[..end]);
+    out.extend_from_slice(format!(" /CropBox {array} ").as_bytes());
+    out.extend_from_slice(&page_bytes[end..]);
+    Ok(out)
+}
+
+/// Build a crop command group.
+///
+/// `pages` is `(object number, current bytes, the page's effective /MediaBox)`.
+/// The box must be a real rectangle (`llx < urx`, `lly < ury`) and lie within
+/// every page's `/MediaBox`: a crop box outside the media box is clipped by
+/// readers to something other than what the user typed, and the command should
+/// not claim to have done what it did not. [FR-ORG, GR-8, UX-ERR-3]
+pub fn build_crop_pages_group(
+    pages: &[(u32, Vec<u8>, [f64; 4])],
+    rect: [f64; 4],
+) -> Result<CommandGroup, String> {
+    if pages.is_empty() {
+        return Err("no pages to crop".into());
+    }
+    let [x0, y0, x1, y1] = rect;
+    if ![x0, y0, x1, y1].iter().all(|n| n.is_finite()) || x1 <= x0 || y1 <= y0 {
+        return Err(format!(
+            "the crop box [{x0} {y0} {x1} {y1}] is not a rectangle: it needs llx < urx and lly < ury"
+        ));
+    }
+    let mut group = CommandGroup::new(format!("Crop {} page(s)", pages.len()));
+    for (obj_num, page_bytes, media) in pages {
+        // Media boxes may be written with their corners in either order.
+        let (m_x0, m_x1) = (media[0].min(media[2]), media[0].max(media[2]));
+        let (m_y0, m_y1) = (media[1].min(media[3]), media[1].max(media[3]));
+        if x0 < m_x0 || y0 < m_y0 || x1 > m_x1 || y1 > m_y1 {
+            return Err(format!(
+                "the crop box [{x0} {y0} {x1} {y1}] extends past page object {obj_num}'s media box \
+                 [{m_x0} {m_y0} {m_x1} {m_y1}]"
+            ));
+        }
+        group.push(Box::new(crate::command::SetObjectCommand {
+            obj_num: *obj_num,
+            new_bytes: set_page_crop_box(page_bytes, rect)?,
+            old_bytes: Some(page_bytes.clone()),
+        }));
+    }
+    Ok(group)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,4 +641,94 @@ mod tests {
         ];
         assert!(leaf_pages(&looping).unwrap_err().contains("twice"));
     }
-}
+
+    #[test]
+    fn an_entry_is_found_by_whole_name_and_in_either_shape() {
+        assert_eq!(entry_value(b"<< /Rotate 90 /X 1 >>", "/Rotate").as_deref(), Some("90"));
+        assert_eq!(entry_value(b"<< /RotateBy 5 >>", "/Rotate"), None, "a longer name is a different key");
+        assert_eq!(
+            entry_value(b"<< /MediaBox [0 0 612 792] /Rotate 0 >>", "/MediaBox").as_deref(),
+            Some("[0 0 612 792]")
+        );
+        assert_eq!(entry_value(b"<< /Type /Page >>", "/Rotate"), None);
+    }
+
+    #[test]
+    fn a_page_inherits_rotation_and_size_from_the_nearest_ancestor_that_has_them() {
+        let nodes = vec![
+            node(2, "<< /Type /Pages /Kids [3 0 R] /Count 2 /MediaBox [0 0 300 400] /Rotate 90 >>"),
+            node(3, "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R 6 0 R] /Count 2 >>"),
+            node(5, "<< /Type /Page /Parent 3 0 R >>"),
+            node(6, "<< /Type /Page /Parent 3 0 R /Rotate 180 /MediaBox [0 0 100 200] >>"),
+        ];
+        assert_eq!(effective_rotation(&nodes, 5), 90, "inherited through two levels");
+        assert_eq!(effective_rotation(&nodes, 6), 180, "its own value wins");
+        assert_eq!(effective_media_box(&nodes, 5).unwrap(), [0.0, 0.0, 300.0, 400.0]);
+        assert_eq!(effective_media_box(&nodes, 6).unwrap(), [0.0, 0.0, 100.0, 200.0]);
+    }
+
+    #[test]
+    fn rotation_is_normalised_and_a_missing_or_broken_box_is_an_error() {
+        let rot = |v: &str| {
+            let n = vec![node(2, &format!("<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate {v} >>")), node(3, "<< /Type /Page /Parent 2 0 R >>")];
+            effective_rotation(&n, 3)
+        };
+        assert_eq!((rot("-90"), rot("450"), rot("0")), (270, 90, 0));
+        let bare = vec![node(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"), node(3, "<< /Type /Page /Parent 2 0 R >>")];
+        assert_eq!(effective_rotation(&bare, 3), 0);
+        assert!(effective_media_box(&bare, 3).unwrap_err().contains("no /MediaBox"));
+        let broken = vec![node(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612] >>"), node(3, "<< /Type /Page /Parent 2 0 R >>")];
+        assert!(effective_media_box(&broken, 3).unwrap_err().contains("3 numbers instead of 4"));
+    }
+
+    #[test]
+    fn rotating_adds_to_the_rotation_the_page_has_even_when_it_is_inherited() {
+        // The page has no /Rotate of its own and inherits 90: a further quarter
+        // turn is 180, not 90. [FR-ROTATE]
+        let page = b"5 0 obj\n<< /Type /Page /Parent 3 0 R >>\nendobj\n".to_vec();
+        let group = build_rotate_pages_group(&[(5, page, 90)], 90).unwrap();
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        assert!(text(&overlay, 5).contains("/Rotate 180"), "{}", text(&overlay, 5));
+    }
+
+    #[test]
+    fn a_crop_box_replaces_or_adds_and_keeps_everything_else() {
+        let with = b"6 0 obj\n<< /Type /Page /CropBox [0 0 50 50] /Parent 2 0 R >>\nendobj\n";
+        let out = String::from_utf8(set_page_crop_box(with, [10.0, 20.5, 200.0, 300.0]).unwrap()).unwrap();
+        assert!(out.contains("/CropBox [10 20.5 200 300]") && !out.contains("[0 0 50 50]"), "{out}");
+        assert!(out.contains("/Parent 2 0 R") && out.starts_with("6 0 obj\n") && out.ends_with("endobj\n"));
+
+        let without = b"6 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n";
+        let out = String::from_utf8(set_page_crop_box(without, [0.0, 0.0, 100.0, 100.0]).unwrap()).unwrap();
+        assert!(out.contains("/CropBox [0 0 100 100]") && out.contains("/Type /Page"), "{out}");
+    }
+
+    #[test]
+    fn a_crop_is_refused_unless_it_is_a_rectangle_inside_every_media_box() {
+        let page = |n: u32| (n, format!("{n} 0 obj\n<< /Type /Page >>\nendobj\n").into_bytes(), [0.0, 0.0, 612.0, 792.0]);
+        let ok = build_crop_pages_group(&[page(5), page(6)], [10.0, 10.0, 200.0, 300.0]).unwrap();
+        assert_eq!(ok.len(), 2);
+        for (rect, why) in [
+            ([200.0, 10.0, 10.0, 300.0], "left of right"),
+            ([10.0, 300.0, 200.0, 10.0], "bottom above top"),
+            ([10.0, 10.0, 10.0, 300.0], "zero width"),
+            ([f64::NAN, 0.0, 10.0, 10.0], "not a number"),
+        ] {
+            assert!(build_crop_pages_group(&[page(5)], rect).unwrap_err().contains("not a rectangle"), "{why}");
+        }
+        let outside = build_crop_pages_group(&[page(5)], [0.0, 0.0, 700.0, 300.0]).unwrap_err();
+        assert!(outside.contains("past page object 5") && outside.contains("media box"), "{outside}");
+        assert!(build_crop_pages_group(&[], [0.0, 0.0, 1.0, 1.0]).is_err());
+    }
+
+    #[test]
+    fn a_crop_can_be_undone_exactly() {
+        let page = b"5 0 obj\n<< /Type /Page /CropBox [1 2 3 4] >>\nendobj\n".to_vec();
+        let group = build_crop_pages_group(&[(5, page.clone(), [0.0, 0.0, 612.0, 792.0])], [10.0, 10.0, 100.0, 100.0]).unwrap();
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        assert!(text(&overlay, 5).contains("[10 10 100 100]"));
+        group.undo(&mut overlay).unwrap();
+        assert_eq!(overlay.get_object(5).unwrap(), page.as_slice());
+    }}
