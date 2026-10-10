@@ -80,6 +80,10 @@ cargo run -p cli --bin pdf-platform -- export-text path/to/file.pdf 0
 cargo run -p cli --bin pdf-platform -- optimize-preflight path/to/file.pdf screen
 cargo run -p cli --bin pdf-platform -- merge a.pdf b.pdf -o out.pdf
 cargo run -p cli --bin pdf-platform -- split in.pdf -o split-out/
+cargo run -p cli --bin pdf-platform -- rotate in.pdf --pages 1,3-5 --degrees 90 -o out.pdf
+cargo run -p cli --bin pdf-platform -- delete-pages in.pdf --pages 2 -o out.pdf
+cargo run -p cli --bin pdf-platform -- export-images in.pdf -o images/ --dpi 150
+cargo run -p cli --bin pdf-platform -- export-html in.pdf -o out.html
 cargo run -p cli --bin pdf-platform -- redact-by-term doc.pdf --term "SECRET"
 cargo run -p cli --bin pdf-platform -- validate-signatures doc.pdf
 cargo run -p cli --bin pdf-platform -- validate-pdf-a doc.pdf --level 2b
