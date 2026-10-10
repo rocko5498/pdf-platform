@@ -519,14 +519,15 @@ fn decompress_stream(
     }
 
     if contains(dict, b"/FlateDecode") || contains(dict, b"/Fl ") {
-        // FlateDecode (zlib/deflate).
-        flate2_decompress(content).map_err(|e| {
+        // FlateDecode (zlib/deflate), then any predictor the dictionary names.
+        let inflated = flate2_decompress(content).map_err(|e| {
             leniency.push(LeniencyEvent::new(
                 "xref-stream-decompress-failed",
                 &format!("FlateDecode failed: {e}"),
             ));
             format!("FlateDecode failed: {e}")
-        })
+        })?;
+        apply_predictor(dict, inflated, leniency)
     } else if contains(dict, b"/None") {
         // No compression.
         Ok(content.to_vec())
@@ -537,6 +538,112 @@ fn decompress_stream(
             "unknown stream filter; using raw data",
         ));
         Ok(content.to_vec())
+    }
+}
+
+/// The stream dictionary: everything before the `stream` keyword.
+fn dictionary_part(body: &[u8]) -> &[u8] {
+    match body.windows(b"stream".len()).position(|w| w == b"stream") {
+        Some(end) => &body[..end],
+        None => body,
+    }
+}
+
+/// Undo the predictor a stream's `/DecodeParms` names. [ISO 32000-1 7.4.4.4]
+///
+/// Nearly every producer that writes a cross-reference stream (qpdf, pdfTeX,
+/// Word, Acrobat) filters it with `/Predictor 12`, the PNG "Up" predictor, to
+/// make it compress better. This reader ignored predictors, so the entries came
+/// out as noise: `Pages: 0`, `unknown xref entry type 15`, and an object stream
+/// that could not be located. The tests that said modern PDFs worked used
+/// hand-built streams with no predictor. [FR-VIEW-2, GR-8, PRIN-1]
+///
+/// PNG predictors 10-15 and TIFF predictor 2 (8 bits per component) are
+/// handled. Anything else is an error rather than a silent pass-through, because
+/// unfiltered garbage is exactly the failure this fixes.
+fn apply_predictor(
+    dict: &[u8],
+    decoded: Vec<u8>,
+    leniency: &mut Vec<LeniencyEvent>,
+) -> Result<Vec<u8>, String> {
+    let dict = dictionary_part(dict);
+    let predictor = find_stream_int(dict, b"/Predictor").unwrap_or(1);
+    if predictor <= 1 {
+        return Ok(decoded);
+    }
+    let columns = find_stream_int(dict, b"/Columns").unwrap_or(1);
+    let colors = find_stream_int(dict, b"/Colors").unwrap_or(1);
+    let bits = find_stream_int(dict, b"/BitsPerComponent").unwrap_or(8);
+    if !(1..=(1 << 20)).contains(&columns) || !(1..=32).contains(&colors) || !matches!(bits, 1 | 2 | 4 | 8 | 16) {
+        return Err(format!(
+            "unusable predictor parameters: Columns {columns}, Colors {colors}, BitsPerComponent {bits}"
+        ));
+    }
+    let row_bytes = ((colors * bits * columns + 7) / 8) as usize;
+    let bytes_per_pixel = (((colors * bits) + 7) / 8).max(1) as usize;
+
+    match predictor {
+        2 => {
+            if bits != 8 {
+                return Err(format!("TIFF predictor with {bits} bits per component is not supported"));
+            }
+            let mut out = decoded;
+            for row in out.chunks_mut(row_bytes) {
+                for i in bytes_per_pixel..row.len() {
+                    row[i] = row[i].wrapping_add(row[i - bytes_per_pixel]);
+                }
+            }
+            Ok(out)
+        }
+        10..=15 => {
+            let stride = row_bytes + 1;
+            if decoded.len() % stride != 0 {
+                leniency.push(LeniencyEvent::new(
+                    "predictor-partial-row",
+                    "stream data does not end on a predictor row boundary; the last partial row is ignored",
+                ));
+            }
+            let rows = decoded.len() / stride;
+            let mut out = Vec::with_capacity(rows * row_bytes);
+            let mut previous = vec![0u8; row_bytes];
+            for line in decoded.chunks_exact(stride) {
+                let filter = line[0];
+                let source = &line[1..];
+                let mut current = vec![0u8; row_bytes];
+                for i in 0..row_bytes {
+                    let left = if i >= bytes_per_pixel { current[i - bytes_per_pixel] } else { 0 };
+                    let up = previous[i];
+                    let up_left = if i >= bytes_per_pixel { previous[i - bytes_per_pixel] } else { 0 };
+                    let predicted = match filter {
+                        0 => 0,
+                        1 => left,
+                        2 => up,
+                        3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                        4 => paeth(left, up, up_left),
+                        other => return Err(format!("unknown PNG predictor row filter {other}")),
+                    };
+                    current[i] = source[i].wrapping_add(predicted);
+                }
+                out.extend_from_slice(&current);
+                previous = current;
+            }
+            Ok(out)
+        }
+        other => Err(format!("unsupported predictor {other}")),
+    }
+}
+
+/// The PNG Paeth predictor (RFC 2083 section 6.6).
+fn paeth(left: u8, up: u8, up_left: u8) -> u8 {
+    let (a, b, c) = (i32::from(left), i32::from(up), i32::from(up_left));
+    let p = a + b - c;
+    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+    if pa <= pb && pa <= pc {
+        left
+    } else if pb <= pc {
+        up
+    } else {
+        up_left
     }
 }
 
@@ -595,6 +702,108 @@ fn skip_eol(data: &[u8], pos: &mut usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The forward PNG filter, written from RFC 2083 independently of the
+    /// decoder under test: the decoder must invert this, not mirror itself.
+    fn png_encode(rows: &[Vec<u8>], filters: &[u8], bytes_per_pixel: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut previous = vec![0u8; rows[0].len()];
+        for (row, &filter) in rows.iter().zip(filters) {
+            out.push(filter);
+            for i in 0..row.len() {
+                let left = if i >= bytes_per_pixel { row[i - bytes_per_pixel] } else { 0 };
+                let up = previous[i];
+                let up_left = if i >= bytes_per_pixel { previous[i - bytes_per_pixel] } else { 0 };
+                let predicted = match filter {
+                    0 => 0,
+                    1 => left,
+                    2 => up,
+                    3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                    4 => {
+                        let p = i32::from(left) + i32::from(up) - i32::from(up_left);
+                        let (pa, pb, pc) = (
+                            (p - i32::from(left)).abs(),
+                            (p - i32::from(up)).abs(),
+                            (p - i32::from(up_left)).abs(),
+                        );
+                        if pa <= pb && pa <= pc { left } else if pb <= pc { up } else { up_left }
+                    }
+                    _ => unreachable!(),
+                };
+                out.push(row[i].wrapping_sub(predicted));
+            }
+            previous = row.clone();
+        }
+        out
+    }
+
+    fn dict(predictor: i32, columns: i32, colors: i32) -> Vec<u8> {
+        format!(
+            "<< /Type /XRef /Filter /FlateDecode /DecodeParms << /Columns {columns} /Colors {colors} \
+             /Predictor {predictor} >> >>\nstream\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn every_png_filter_type_is_undone() {
+        // Four rows, one per filter type, over varied bytes including values
+        // that overflow on addition.
+        let rows: Vec<Vec<u8>> = vec![
+            vec![10, 200, 33, 250, 7, 99],
+            vec![11, 190, 40, 255, 0, 120],
+            vec![250, 5, 60, 1, 128, 129],
+            vec![0, 255, 17, 90, 91, 92],
+            vec![200, 100, 50, 25, 12, 6],
+        ];
+        for bytes_per_pixel in [1usize, 2] {
+            let filters = [0u8, 1, 2, 3, 4];
+            let encoded = png_encode(&rows, &filters, bytes_per_pixel);
+            let columns = (rows[0].len() / bytes_per_pixel) as i32;
+            let mut leniency = Vec::new();
+            let decoded = apply_predictor(&dict(15, columns, bytes_per_pixel as i32), encoded, &mut leniency)
+                .expect("decode");
+            let expected: Vec<u8> = rows.concat();
+            assert_eq!(decoded, expected, "bytes per pixel {bytes_per_pixel}");
+            assert!(leniency.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_stream_without_a_predictor_is_left_alone() {
+        let data = vec![1u8, 2, 3, 4];
+        let out = apply_predictor(b"<< /Filter /FlateDecode >>\nstream\n", data.clone(), &mut Vec::new()).unwrap();
+        assert_eq!(out, data);
+        let out = apply_predictor(&dict(1, 4, 1), data.clone(), &mut Vec::new()).unwrap();
+        assert_eq!(out, data, "/Predictor 1 means none");
+    }
+
+    #[test]
+    fn the_tiff_predictor_adds_each_byte_to_the_one_before() {
+        // Row of 4 single-byte pixels: 1, +1, +1, +1 -> 1, 2, 3, 4.
+        let out = apply_predictor(&dict(2, 4, 1), vec![1, 1, 1, 1], &mut Vec::new()).unwrap();
+        assert_eq!(out, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn what_cannot_be_undone_is_an_error_not_noise() {
+        // An unknown row filter, a predictor we do not implement, and nonsense
+        // parameters must fail loudly: passing the bytes through is the bug.
+        assert!(apply_predictor(&dict(12, 4, 1), vec![9, 1, 2, 3, 4], &mut Vec::new()).is_err());
+        assert!(apply_predictor(&dict(7, 4, 1), vec![0; 8], &mut Vec::new()).is_err());
+        assert!(apply_predictor(&dict(12, 0, 1), vec![0; 8], &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_trailing_partial_row_is_dropped_and_recorded() {
+        let mut leniency = Vec::new();
+        let encoded = png_encode(&[vec![1, 2, 3, 4], vec![5, 6, 7, 8]], &[0, 0], 1);
+        let mut data = encoded;
+        data.extend_from_slice(&[0, 9]); // a row cut short
+        let out = apply_predictor(&dict(12, 4, 1), data, &mut leniency).unwrap();
+        assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(leniency.iter().any(|e| e.kind.contains("predictor-partial-row")), "{leniency:?}");
+    }
 
     #[test]
     fn classic_xref_parse() {
