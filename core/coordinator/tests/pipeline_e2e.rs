@@ -313,10 +313,11 @@ fn e2e_coordinator_full_pipeline() {
 
     // 5. Incremental save
     let mut output = pdf_bytes.clone();
+    let prev = pdf_cos::scan::find_startxref(&pdf_bytes).expect("original startxref") as u32;
     let result = IncrementalWriter::write_incremental(
         &mut output,
         &overlay,
-        0,
+        prev,
         8,
         &summary.original_offsets,
         pdf_bytes.len() as u32,
@@ -398,10 +399,11 @@ fn e2e_scan_save_rescan_preserves_structure() {
 
     // Save
     let mut output = pdf_bytes.clone();
+    let prev = pdf_cos::scan::find_startxref(&pdf_bytes).expect("original startxref") as u32;
     let result = IncrementalWriter::write_incremental(
         &mut output,
         &overlay,
-        0,
+        prev,
         13,
         &offsets,
         pdf_bytes.len() as u32,

@@ -110,7 +110,18 @@ impl IncrementalWriter {
             }
         }
 
-        // Build xref section.
+        // Build the xref section: the objects this save wrote, and nothing else.
+        //
+        // An incremental update lists what it changed and chains to the section
+        // it supersedes with `/Prev`; every untouched object stays where the
+        // earlier section put it. This used to emit a *complete* table built
+        // from `original_offsets`, which worked only while every object was an
+        // ordinary one at a file offset. An object inside an object stream has
+        // no offset, so it was written as `0000000000 00000 n` — in use, at
+        // byte 0 — and a saved qpdf-style document reopened with `/Root`
+        // pointing at the file header and no pages. The reader has followed
+        // `/Prev` chains since 2026-08-23, so the complete table was never
+        // needed. [FR-SAVE-1, ADR-012, SDS §3.3, PRIN-1, GR-8]
         let xref_start = current_pos;
         let max_obj = next_obj_num.max(
             original_offsets.keys().copied().max().unwrap_or(0).max(
@@ -118,35 +129,26 @@ impl IncrementalWriter {
             ) + 1
         );
 
-        let xref_header = format!("xref\n0 {max_obj}\n");
-
-        // Write xref header.
-        write!(writer, "{xref_header}")?;
-        current_pos += xref_header.len() as u32;
-
-        // Write xref entries: for each object, use dirty offset if modified,
-        // otherwise use the original offset from the parsed xref table.
-        for obj_num in 0..max_obj {
-            let offset = if let Some(&off) = dirty_offsets.get(&obj_num) {
-                off
-            } else if let Some(&off) = original_offsets.get(&obj_num) {
-                off
-            } else {
-                0 // Free object or unknown
-            };
-
-            let in_use = dirty_offsets.contains_key(&obj_num)
-                || original_offsets.contains_key(&obj_num);
-
-            let entry = if in_use && obj_num > 0 {
-                format!("{offset:010} 00000 n \n")
-            } else {
-                format!("{offset:010} 65535 f \n")
-            };
-
-            writer.write_all(entry.as_bytes())?;
-            current_pos += entry.len() as u32;
+        let mut section = String::from("xref\n");
+        // The free-list head, which an update section carries by convention.
+        section.push_str("0 1\n0000000000 65535 f \n");
+        // One subsection per run of consecutive object numbers.
+        let mut numbers: Vec<u32> = dirty_offsets.keys().copied().collect();
+        numbers.sort_unstable();
+        let mut at = 0;
+        while at < numbers.len() {
+            let mut end = at + 1;
+            while end < numbers.len() && numbers[end] == numbers[end - 1] + 1 {
+                end += 1;
+            }
+            section.push_str(&format!("{} {}\n", numbers[at], end - at));
+            for number in &numbers[at..end] {
+                section.push_str(&format!("{:010} 00000 n \n", dirty_offsets[number]));
+            }
+            at = end;
         }
+        writer.write_all(section.as_bytes())?;
+        current_pos += section.len() as u32;
 
         // Write trailer.
         //
@@ -243,33 +245,84 @@ mod tests {
         assert!(text.contains("%%EOF"));
     }
 
+    /// The `xref` section of `output`, up to its trailer.
+    fn xref_section(output: &[u8]) -> String {
+        let text = String::from_utf8_lossy(output).into_owned();
+        let start = text.find("xref\n").expect("an xref section");
+        let end = text[start..].find("trailer").expect("a trailer") + start;
+        text[start..end].to_string()
+    }
+
     #[test]
-    fn incremental_write_uses_original_offsets_for_non_dirty() {
+    fn an_update_lists_only_the_objects_it_wrote() {
         let mut overlay = CowOverlay::new();
         overlay.set_object(1, b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec());
 
         let mut offsets = HashMap::new();
-        offsets.insert(2, 200); // obj 2 not dirty, has original offset at 200
-        offsets.insert(3, 350); // obj 3 not dirty, has original offset at 350
+        offsets.insert(2, 200); // untouched: the previous section still owns it
+        offsets.insert(3, 350);
 
         let mut output = Vec::new();
-        let result = IncrementalWriter::write_incremental(
-            &mut output,
-            &overlay,
-            100,
-            5,
-            &offsets,
-            0,
+        IncrementalWriter::write_incremental(
+            &mut output, &overlay, 100, 5, &offsets, 0,
             &TrailerInfo { root_obj_num: 1, ..Default::default() },
-        ).unwrap();
+        )
+        .unwrap();
 
+        let section = xref_section(&output);
+        assert_eq!(
+            section,
+            "xref\n0 1\n0000000000 65535 f \n1 1\n0000000000 00000 n \n",
+            "the free-list head and the one object this save wrote, nothing else"
+        );
+        assert!(!section.contains("0000000200"), "an untouched object was repeated: {section}");
+        assert!(!section.contains("0000000350"), "an untouched object was repeated: {section}");
         let text = String::from_utf8_lossy(&output);
-        // Dirty obj 1 should have offset 0 (start of append)
-        assert!(text.contains("0000000000 00000 n"));
-        // Non-dirty obj 2 should have original offset 200
-        assert!(text.contains("0000000200 00000 n"));
-        // Non-dirty obj 3 should have original offset 350
-        assert!(text.contains("0000000350 00000 n"));
+        assert!(text.contains("/Prev 100"), "the untouched objects are reached through /Prev");
+        assert!(text.contains("/Size 5"), "/Size still covers every object number");
+    }
+
+    #[test]
+    fn objects_that_are_not_consecutive_get_their_own_subsections() {
+        let mut overlay = CowOverlay::new();
+        for n in [1u32, 2, 5, 9] {
+            overlay.set_object(n, format!("{n} 0 obj\n<< >>\nendobj\n").into_bytes());
+        }
+        let mut output = Vec::new();
+        IncrementalWriter::write_incremental(
+            &mut output, &overlay, 100, 10, &HashMap::new(), 0,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
+        )
+        .unwrap();
+
+        let section = xref_section(&output);
+        let headers: Vec<&str> = section.lines().filter(|l| l.split(' ').count() == 2).collect();
+        assert_eq!(headers, ["0 1", "1 2", "5 1", "9 1"], "runs of consecutive numbers: {section}");
+        let entries = section.lines().filter(|l| l.ends_with(" n ")).count();
+        assert_eq!(entries, 4, "one in-use entry per object written: {section}");
+    }
+
+    #[test]
+    fn an_original_object_with_no_file_offset_is_never_written_as_offset_zero() {
+        // An object inside an object stream is "in use" with no offset of its
+        // own; the worker records it as offset 0. Writing that into a classic
+        // table puts the object at the file header. [GR-8, PRIN-1]
+        let mut overlay = CowOverlay::new();
+        overlay.set_object(3, b"3 0 obj\n<< /Type /Page >>\nendobj\n".to_vec());
+        let mut offsets = HashMap::new();
+        offsets.insert(1, 0); // the catalog, compressed in an object stream
+        offsets.insert(2, 0); // the page tree, likewise
+
+        let mut output = Vec::new();
+        IncrementalWriter::write_incremental(
+            &mut output, &overlay, 100, 4, &offsets, 500,
+            &TrailerInfo { root_obj_num: 1, ..Default::default() },
+        )
+        .unwrap();
+
+        let section = xref_section(&output);
+        let in_use_at_zero = section.lines().filter(|l| *l == "0000000000 00000 n ").count();
+        assert_eq!(in_use_at_zero, 0, "an in-use entry at byte 0: {section}");
     }
 
     #[test]
