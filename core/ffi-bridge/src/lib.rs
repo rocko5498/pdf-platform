@@ -377,13 +377,18 @@ fn get_layers_impl() -> Result<String, String> {
         let correlation_id = next_cid(session);
         let event = send_recv(session, Command::GetLayers { correlation_id })?;
         match event {
+            // The names travel with the counts: one `name<TAB>visible` line per
+            // group, as the outline's entries do. The worker has always sent
+            // them; this dropped them, so a panel could only say "2 layers".
+            // [FR-VIEW-4, GR-8]
             WorkerEvent::LayersResult {
                 group_count,
                 total_count,
                 has_layers,
+                data,
                 ..
             } => Ok(format!(
-                "has_layers={has_layers}\ngroups={group_count}\ntotal={total_count}"
+                "has_layers={has_layers}\ngroups={group_count}\ntotal={total_count}\n{data}"
             )),
             WorkerEvent::RenderError { message, .. } => Err(message),
             other => Err(format!("unexpected: {other:?}")),
@@ -1434,7 +1439,7 @@ mod bridge_lifecycle_tests {
     /// demo model when a document has none — which would make a form test pass
     /// without a form ever being read from or written to a file.
     fn acroform_pdf() -> Vec<u8> {
-        let objects: Vec<Vec<u8>> = vec![
+        assemble(&[
             b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R] >> >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
@@ -1444,8 +1449,11 @@ mod bridge_lifecycle_tests {
             b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (claimant) /V () \
                /Rect [72 700 372 724] /DA (/Helv 12 Tf 0 g) /P 3 0 R >>"
                 .to_vec(),
-        ];
+        ])
+    }
 
+    /// Serialize `objects` (object 1 first) into a document with a correct xref.
+    fn assemble(objects: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let mut offsets = Vec::new();
         for (index, body) in objects.iter().enumerate() {
@@ -1518,6 +1526,41 @@ mod bridge_lifecycle_tests {
         let _ = std::fs::remove_file(out.with_extension("xfdf"));
     }
 
+    #[test]
+    fn the_layers_a_document_declares_reach_the_shell_by_name() {
+        let _session = exclusive_session();
+        // The worker has always sent each optional-content group's name and
+        // default visibility; the bridge forwarded only the counts, so a panel
+        // could say "2 layers" and not which. [FR-VIEW-4, GR-8]
+        let _worker = stage_worker_beside_test_executable();
+
+        let source = std::env::temp_dir().join("pdf-platform-bridge-layers.pdf");
+        std::fs::write(
+            &source,
+            assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [4 0 R 5 0 R] \
+                   /D << /Order [4 0 R 5 0 R] /OFF [5 0 R] >> >> >>"
+                    .to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+                b"<< /Type /OCG /Name (Review notes) >>".to_vec(),
+                b"<< /Type /OCG /Name (Draft watermark) >>".to_vec(),
+            ]),
+        )
+        .expect("write layers fixture");
+
+        open_document_impl(&source.to_string_lossy(), "").expect("open");
+        let layers = get_layers_impl().expect("layers");
+        close_document_impl();
+        let _ = std::fs::remove_file(&source);
+
+        assert!(layers.contains("groups=2"), "{layers}");
+        assert!(layers.contains("Review notes\ttrue"), "the visible layer is missing by name: {layers}");
+        assert!(
+            layers.contains("Draft watermark\tfalse"),
+            "the hidden layer is missing by name, or reported visible: {layers}"
+        );
+    }
     #[test]
     fn annotate_save_and_reopen_through_the_bridge() {
         let _session = exclusive_session();
