@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(PDF_PLATFORM_USE_OPENGL "Use QOpenGLWidget for tile compositing" ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets PrintSupport)
 if(PDF_PLATFORM_USE_OPENGL)
     find_package(Qt6 6.5 REQUIRED COMPONENTS OpenGL OpenGLWidgets)
 endif()

@@ -105,6 +105,7 @@ The Qt shell requires Qt 6 (Widgets + OpenGLWidgets) and CMake. The Rust core bu
 | Shortcut | Action |
 |----------|--------|
 | Ctrl+O | Open PDF (password prompt if encrypted) |
+| Ctrl+P | Print through the native dialog (fits each page to the sheet) |
 | Ctrl+F | Find in document |
 | Ctrl+C | Copy current page text |
 | Ctrl+E | Export session annotations as XFDF |

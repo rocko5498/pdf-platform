@@ -1,6 +1,6 @@
 # Version 1 output: printing and export
 
-**Status:** part A (`export-images`) is implemented on branch `feat/v1-export-images`; `export-html` and part B (printing) are proposals only.
+**Status:** part A is implemented (`export-images`, merged in #88; `export-html`, PR #89). Part B (printing) is implemented on branch `feat/v1-print`; see "As built" at the end.
 **Date:** 2026-10-10
 **Cites:** FR-PRINT-1, FR-PRINT-2, FR-PRINT-3, FR-PRINT-5, FR-EXPORT-1, FR-EXPORT-3, FR-CLI-1, SDS §2.6, SDS §4.6, ADR-003, ADR-016, DS-FLOW-PRINT, GR-1, GR-3, GR-4, GR-7, PRIN-1, T-12
 
@@ -55,6 +55,19 @@ Not claimed in V1: vector output, imposition (FR-PRINT-4 is "when delivered"), d
 
 1. A (CLI export) first: no gated area, no new dependency beyond making one function public.
 2. B (printing) second, as its own PR, because it changes the stability contract and the shell build.
+
+## As built: printing (2026-10-10)
+
+Differences from the proposal above, and what is not done:
+
+- **Where the code lives.** `shell/canvas/print_job.{h,cc}` is its own small library (`shell-print`), not `shell/dialogs/print_dialog`, so a test can drive it without a window. `MainWindow::printDocument` is a thin caller: native `QPrintDialog` (range, current page), then `printPages`.
+- **Registry.** `document.print` with `Ctrl+P` and a File ▸ Print… item; `profile_version` 0.2.0 → 0.3.0 (ADR-032). `tools/check-ui-registry` already reserved Ctrl+P for Print.
+- **Pixels come from the viewer's own tile path** (`render_tile` through the bridge), one page at a time, rendered at the printer's resolution clamped to 96–300 DPI and refused above 256 MiB per page (GR-7). No bridge or protocol change.
+- **SDS §2.6 is followed in part.** Page pixels are produced by the worker (Z1), spooling is Qt's native print system, but scaling and placement happen in the shell with `QPainter`, not in a Z1 "document preparation" job. Fine for raster V1; revisit with imposition.
+- **Scaling.** Fit, actual size and custom percent are implemented and tested in `printTargetRect`. The native dialog has no control for them, so the dialog path always fits the page. FR-PRINT-2's scaling options are therefore met in the library and not yet reachable by a user.
+- **Annotations.** There is no "print comments" toggle. PDFium's tiles carry the annotations saved in the file; annotations added this session are drawn by the canvas overlay and are not in the print. A toggle that did nothing would break GR-8, so none is offered. FR-PRINT-2's comments option is open.
+- **Page size.** Like the viewer, the print path takes every page to be the first page's size. A document with mixed page sizes prints wrongly.
+- **Not claimed:** printing to a physical printer (tested only to a PDF printer), print preview, vector output, imposition, driver transparency handling, a screen-reader pass of the flow (FR-PRINT-5 rests on the native dialog being keyboard-operable).
 
 ## Review
 
