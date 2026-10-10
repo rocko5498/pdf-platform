@@ -51,6 +51,12 @@ fn main() -> ExitCode {
         }
     };
 
+    // Whether the catalog marks the document tagged; read once, not per page.
+    let is_tagged = doc_file
+        .as_ref()
+        .and_then(|f| scan_file(f).ok())
+        .is_some_and(|d| d.is_tagged);
+
     let shmem_file: Option<File> = match adopt_shmem_file() {
         Ok(f) => f,
         Err(e) => {
@@ -222,6 +228,7 @@ fn main() -> ExitCode {
                         } => {
                             handle_extract_page(
                                 pdfium.as_ref().map(|e| e as &dyn Extract),
+                                is_tagged,
                                 correlation_id,
                                 page_index,
                                 &mut transport,
@@ -572,6 +579,7 @@ fn handle_render_tile_typed(
 
 fn handle_extract_page(
     extract_engine: Option<&dyn Extract>,
+    is_tagged: bool,
     correlation_id: u64,
     page_index: u32,
     transport: &mut Box<dyn protocol::transport::WorkerTransport>,
@@ -604,7 +612,9 @@ fn handle_extract_page(
                 line_count: model.lines.len() as u32,
                 char_count: model.char_count,
                 reliable: model.reliable,
-                has_structure: model.has_structure,
+                // The engine does not read the structure tree; the catalog says
+                // whether there is one. [FR-A11Y-1, GR-8]
+                has_structure: model.has_structure || is_tagged,
                 full_text: model.full_text(),
                 line_geom,
             };

@@ -13,6 +13,10 @@ pub struct DocumentStructure {
     pub has_acroform: bool,
     pub has_xfa: bool,
     pub has_js: bool,
+    /// The catalog says the document is tagged: `/MarkInfo << /Marked true >>`
+    /// and a `/StructTreeRoot`. Not seen inside an encrypted object stream.
+    /// [FR-A11Y-1]
+    pub is_tagged: bool,
     pub sig_count: u32,
     pub leniency: Vec<LeniencyEvent>,
     /// Parsed xref offsets: maps object number -> byte offset in the file.
@@ -138,6 +142,10 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
             && fetch_key_dict(data, &inflated, &xref, catalog, b"/AcroForm")
                 .map(|d| find_key(d, b"/XFA").is_some())
                 .unwrap_or(false));
+    let is_tagged = find_key(catalog, b"/StructTreeRoot").is_some()
+        && fetch_key_dict(data, &inflated, &xref, catalog, b"/MarkInfo")
+            .map(marked_true)
+            .unwrap_or(false);
     let has_js =
         find_key(catalog, b"/JS").is_some() || names_tree_has_javascript(data, &inflated, &xref, catalog);
 
@@ -166,10 +174,21 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
         has_acroform,
         has_xfa,
         has_js,
+        is_tagged,
         sig_count,
         leniency,
         xref_offsets,
     })
+}
+
+/// `/Marked true` in a `/MarkInfo` dictionary body.
+fn marked_true(mark_info: &[u8]) -> bool {
+    let Some(pos) = find_key(mark_info, b"/Marked") else {
+        return false;
+    };
+    let mut i = pos + b"/Marked".len();
+    skip_ws(mark_info, &mut i);
+    mark_info[i..].starts_with(b"true")
 }
 
 // --- private helpers ---
@@ -1219,5 +1238,52 @@ startxref\n\
         assert!(!ds.has_js);
         assert_eq!(ds.sig_count, 0);
         assert!(ds.leniency.is_empty());
+    }
+
+    /// A one-page file whose catalog carries `extra`, with a true xref table.
+    fn pdf_with_catalog(extra: &str) -> Vec<u8> {
+        let bodies = [
+            format!("<</Type /Catalog /Pages 2 0 R {extra}>>"),
+            "<</Type /Pages /Kids [3 0 R] /Count 1>>".to_string(),
+            "<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>".to_string(),
+        ];
+        let mut out = b"%PDF-1.7
+".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend(format!("{} 0 obj
+{body}
+endobj
+", i + 1).bytes());
+        }
+        let xref = out.len();
+        out.extend(b"xref
+0 4
+0000000000 65535 f 
+");
+        for o in offsets {
+            out.extend(format!("{o:010} 00000 n 
+").bytes());
+        }
+        out.extend(format!("trailer
+<</Size 4 /Root 1 0 R>>
+startxref
+{xref}
+%%EOF").bytes());
+        out
+    }
+
+    #[test]
+    fn a_document_is_tagged_only_when_marked_and_structured() {
+        let tagged = pdf_with_catalog("/MarkInfo << /Marked true >> /StructTreeRoot 9 0 R");
+        assert!(scan_bytes(&tagged).unwrap().is_tagged);
+        // A structure tree the document does not claim to be marked, a mark with
+        // no tree, and neither: none is a tagged document.
+        let unmarked = pdf_with_catalog("/MarkInfo << /Marked false >> /StructTreeRoot 9 0 R");
+        assert!(!scan_bytes(&unmarked).unwrap().is_tagged);
+        let no_tree = pdf_with_catalog("/MarkInfo << /Marked true >>");
+        assert!(!scan_bytes(&no_tree).unwrap().is_tagged);
+        assert!(!scan_bytes(MINIMAL_PDF).unwrap().is_tagged);
     }
 }
