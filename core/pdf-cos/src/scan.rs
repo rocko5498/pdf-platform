@@ -1,4 +1,4 @@
-﻿//! Minimal structural scanner. [ADR-006, SDS Â§14 M0, FR-DIAG-2]
+//! Minimal structural scanner. [ADR-006, SDS Â§14 M0, FR-DIAG-2]
 //!
 //! Reads classic xref tables only. Compressed xref (PDF 1.5+), encryption,
 //! and linearized hint streams are deferred to M1.
@@ -463,6 +463,13 @@ endobj
     Some(object)
 }
 
+/// Whether the file declares itself linearized: a `/Linearized` key in its first
+/// 1024 bytes, where Annex F requires the linearization dictionary to be.
+fn is_linearized(data: &[u8]) -> bool {
+    const KEY: &[u8] = b"/Linearized";
+    data[..data.len().min(1024)].windows(KEY.len()).any(|w| w == KEY)
+}
+
 /// Read the whole cross-reference chain, newest section first. [FR-VIEW-2]
 ///
 /// `parse_xref_table` reads **one** section. An incrementally updated PDF
@@ -558,7 +565,15 @@ pub fn parse_xref_chain(data: &[u8], start: usize, leniency: &mut Vec<LeniencyEv
             None => None,
             // A /Prev must point backwards, into the file. Anything else is
             // damage or malice; either way it is reported, not followed.
+            //
+            // The one lawful exception is a linearized file (ISO 32000-1
+            // Annex F): its first-page section sits near the start and its
+            // `/Prev` points *forward* to the main section at the end. Refusing
+            // that left `Pages: 0` for documents PDFium rendered fine. The
+            // visited-set and section limit above still stop a loop.
+            // [FR-VIEW-2, GR-7, GR-8]
             Some(prev) if prev < current && prev < data.len() => Some(prev),
+            Some(prev) if prev > current && prev < data.len() && is_linearized(data) => Some(prev),
             Some(prev) => {
                 leniency.push(LeniencyEvent::new(
                     "xref-prev-invalid",
@@ -963,6 +978,98 @@ startxref
         );
     }
 
+
+    /// The layout ISO 32000-1 Annex F gives a linearized ("fast web view")
+    /// file: a first-page cross-reference section near the start of the file,
+    /// whose trailer's `/Prev` points *forward* to the main section at the end,
+    /// and a final `startxref` that names the first-page section. Offsets are
+    /// fixed-width so the document can be laid out twice: once to learn where
+    /// the main section lands, once with that number in `/Prev`.
+    ///
+    /// With `linearized` false the object that would carry `/Linearized` is
+    /// ordinary, so the same bytes are an ordinary document with a forward
+    /// `/Prev` — which is damage, not a layout. [FR-VIEW-2]
+    fn linearized_layout(linearized: bool) -> Vec<u8> {
+        use std::io::Write as _;
+        fn build(linearized: bool, main_xref: usize) -> (Vec<u8>, usize) {
+            let mut b: Vec<u8> = b"%PDF-1.4\n".to_vec();
+            let mut at = [0usize; 6];
+
+            at[5] = b.len();
+            if linearized {
+                b.extend_from_slice(b"5 0 obj\n<< /Linearized 1 /L 0000000000 /O 3 /N 1 >>\nendobj\n");
+            } else {
+                b.extend_from_slice(b"5 0 obj\n<< /Producer (x) /X 0000000000 /O 3 /N 1 >>\n\nendobj\n");
+            }
+
+            let first_xref = b.len();
+            // First-page section: objects 3 and 5 only.
+            write!(b, "xref\n3 1\n").unwrap();
+            let placeholder_3 = b.len();
+            b.extend_from_slice(b"0000000000 00000 n \n");
+            write!(b, "5 1\n{:010} 00000 n \n", at[5]).unwrap();
+            write!(
+                b,
+                "trailer\n<< /Size 6 /Root 1 0 R /Prev {main_xref:010} >>\nstartxref\n0\n%%EOF\n"
+            )
+            .unwrap();
+
+            at[3] = b.len();
+            b.extend_from_slice(
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+            );
+            // Patch object 3's offset now that it is known.
+            let entry = format!("{:010} 00000 n \n", at[3]);
+            b[placeholder_3..placeholder_3 + entry.len()].copy_from_slice(entry.as_bytes());
+
+            at[1] = b.len();
+            b.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+            at[2] = b.len();
+            b.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+            at[4] = b.len();
+            b.extend_from_slice(b"4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n");
+
+            let main = b.len();
+            write!(b, "xref\n0 3\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n", at[1], at[2])
+                .unwrap();
+            write!(b, "4 1\n{:010} 00000 n \n", at[4]).unwrap();
+            write!(b, "trailer\n<< /Size 6 >>\nstartxref\n{first_xref}\n%%EOF\n").unwrap();
+            (b, main)
+        }
+        let (_, main) = build(linearized, 0);
+        build(linearized, main).0
+    }
+
+    #[test]
+    fn a_linearized_document_resolves_objects_from_both_sections() {
+        // Annex F puts the catalog and page tree in the *main* section and the
+        // first page in the *first-page* section, with the newest-first chain
+        // running forward through the file. Refusing that `/Prev` left the
+        // product reporting `Pages: 0` for a document PDFium rendered fine.
+        // [FR-VIEW-2, SDS §3.1, GR-8]
+        let data = linearized_layout(true);
+        let structure = scan_bytes(&data).expect("a linearized file is a valid file");
+        assert_eq!(structure.page_count, 1, "the page tree is in the main section");
+        assert!(
+            !structure.leniency.iter().any(|e| e.kind.contains("xref-prev-invalid")),
+            "a linearized forward /Prev is the layout, not damage: {:?}",
+            structure.leniency
+        );
+    }
+
+    #[test]
+    fn a_forward_prev_in_an_ordinary_document_is_still_refused() {
+        // The control: the same bytes without /Linearized are a damaged file,
+        // and a /Prev that points forward must not be followed there. [GR-7, GR-8]
+        let data = linearized_layout(false);
+        let mut leniency = Vec::new();
+        let start = find_startxref(&data).expect("startxref");
+        let _ = parse_xref_chain(&data, start, &mut leniency);
+        assert!(
+            leniency.iter().any(|e| e.kind.contains("xref-prev-invalid")),
+            "an unmarked forward /Prev must be recorded and not followed: {leniency:?}"
+        );
+    }
 
     /// Minimal hand-crafted 1-page PDF with no AcroForm/JS/sigs.
     /// Byte offsets are exact -- do not reformat this literal.
