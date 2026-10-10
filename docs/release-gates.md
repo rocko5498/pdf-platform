@@ -22,6 +22,7 @@ cargo test -p text-extract --test extraction_correctness   # normalization only;
 cargo test -p engine-pdfium --test extraction_accuracy     # real PDF through PDFium
 cd ..
 python tools/check_window_lengths.py   # windows(N) vs needle length
+python tools/check_dead_api.py         # public items nothing calls
 python tools/a11y_audit.py
 python tools/bench/check_p95_gates.py
 python tools/verapdf_writer_gate.py   # needs a JRE; writer output must parse

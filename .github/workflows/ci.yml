@@ -67,6 +67,14 @@ jobs:
       - name: Window/needle length mismatches
         run: python tools/check_window_lengths.py
 
+      # Four defects had the same shape: code written, tested, and never called
+      # by the product — SDS §10.4's xref reconstruction, the OCR job's dispatch
+      # arm, three assembly Commands whose apply() was empty, and SDS §6's whole
+      # render loop. Each was found by reading. This finds them by running.
+      # The allowlist is the ledger of the ones that already exist. [ADR-039, T-11]
+      - name: Public items nothing calls
+        run: python tools/check_dead_api.py
+
       - name: Licence allowlist (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
