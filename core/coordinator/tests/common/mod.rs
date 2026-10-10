@@ -161,3 +161,20 @@ pub fn inherited_box_pdf() -> Vec<u8> {
     ];
     assemble(&objects)
 }
+
+/// `inherited_box_pdf`, with `/Rotate 90` on the `/Pages` node as well: neither
+/// page carries a rotation of its own, both inherit a quarter turn.
+pub fn inherited_rotation_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 300 400] /Rotate 90 \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        [b"<< /Length 41 >>\nstream\n".as_slice(), b"BT /F1 24 Tf 20 300 Td (PAGEMARK1) Tj ET\n", b"endstream"].concat(),
+        [b"<< /Length 41 >>\nstream\n".as_slice(), b"BT /F1 24 Tf 20 300 Td (PAGEMARK2) Tj ET\n", b"endstream"].concat(),
+    ];
+    assemble(&objects)
+}

@@ -14,7 +14,8 @@ use pdf_model::command::{CommandGroup, SetObjectCommand};
 use pdf_model::journal::UndoJournal;
 use pdf_model::overlay::CowOverlay;
 use pdf_model::organize::{
-    build_delete_pages_group, build_rotate_pages_group, kid_references, leaf_pages, PageTreeNode,
+    build_crop_pages_group, build_delete_pages_group, build_rotate_pages_group, effective_media_box,
+    effective_rotation, kid_references, leaf_pages, PageTreeNode,
 };
 use pdf_model::stamp::{Stamp, StampPosition};
 use pdf_write::IncrementalWriter;
@@ -506,7 +507,8 @@ impl DocumentCoordinator {
 
     /// Rotate pages by the specified degrees.
     ///
-    /// Each page is patched from its own current bytes. [FR-ROTATE, M3]
+    /// Each page is patched from its own current bytes, and the new value adds
+    /// to the rotation the page actually has, inherited or not. [FR-ROTATE, M3]
     pub fn rotate_pages(&mut self, page_indices: &[u32], degrees: u32) -> Result<(), SessionError> {
         let nodes = self.page_tree()?;
         let leaves = leaf_pages(&nodes).map_err(SessionError::Protocol)?;
@@ -514,27 +516,57 @@ impl DocumentCoordinator {
         // Rotation patches the existing dictionary, so the bytes are the input —
         // passing object numbers and rotations separately is what let the caller
         // and the builder disagree about which was which. [FR-ROTATE]
-        let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
-        for &page_idx in page_indices {
-            let obj_num = *leaves.get(page_idx as usize).ok_or_else(|| {
-                SessionError::Protocol(format!(
-                    "page {} is not in the document, which has {} page(s)",
-                    page_idx + 1,
-                    leaves.len()
-                ))
-            })?;
-            let bytes = nodes
-                .iter()
-                .find(|n| n.obj_num == obj_num)
-                .map(|n| n.bytes.clone())
-                .ok_or_else(|| SessionError::Protocol(format!("page object {obj_num} was not read")))?;
-            pages.push((obj_num, bytes));
+        let mut pages: Vec<(u32, Vec<u8>, u32)> = Vec::new();
+        for obj_num in Self::pages_at(&leaves, page_indices)? {
+            let bytes = Self::node_bytes(&nodes, obj_num)?;
+            pages.push((obj_num, bytes, effective_rotation(&nodes, obj_num)));
         }
 
         let group = build_rotate_pages_group(&pages, degrees).map_err(SessionError::Protocol)?;
         self.apply_command_group(group)
     }
 
+    /// Set the crop box of the given pages to `[llx, lly, urx, ury]`, which
+    /// must lie within each page's media box. One undoable edit. [FR-ORG]
+    pub fn crop_pages(&mut self, page_indices: &[u32], rect: [f64; 4]) -> Result<(), SessionError> {
+        let nodes = self.page_tree()?;
+        let leaves = leaf_pages(&nodes).map_err(SessionError::Protocol)?;
+
+        let mut pages: Vec<(u32, Vec<u8>, [f64; 4])> = Vec::new();
+        for obj_num in Self::pages_at(&leaves, page_indices)? {
+            let bytes = Self::node_bytes(&nodes, obj_num)?;
+            let media = effective_media_box(&nodes, obj_num).map_err(SessionError::Protocol)?;
+            pages.push((obj_num, bytes, media));
+        }
+
+        let group = build_crop_pages_group(&pages, rect).map_err(SessionError::Protocol)?;
+        self.apply_command_group(group)
+    }
+
+    /// The page objects at the given zero-based indices, or an error naming the
+    /// first index that is not in the document.
+    fn pages_at(leaves: &[u32], page_indices: &[u32]) -> Result<Vec<u32>, SessionError> {
+        page_indices
+            .iter()
+            .map(|&index| {
+                leaves.get(index as usize).copied().ok_or_else(|| {
+                    SessionError::Protocol(format!(
+                        "page {} is not in the document, which has {} page(s)",
+                        index + 1,
+                        leaves.len()
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn node_bytes(nodes: &[PageTreeNode], obj_num: u32) -> Result<Vec<u8>, SessionError> {
+        nodes
+            .iter()
+            .find(|n| n.obj_num == obj_num)
+            .map(|n| n.bytes.clone())
+            .ok_or_else(|| SessionError::Protocol(format!("page object {obj_num} was not read")))
+    }
     /// Read the whole page tree, root first, in document order.
     ///
     /// Every edit that addresses a page by index needs the real leaves: the

@@ -79,6 +79,7 @@ fn main() {
         "sanitize",
         "rotate",
         "delete-pages",
+        "crop",
         "stamp",
         "redact-by-term",
         "validate-signatures",
@@ -157,6 +158,10 @@ fn main() {
         cmd_delete_pages(&path, &rest);
         return;
     }
+    if cmd == "crop" {
+        cmd_crop(&path, &rest);
+        return;
+    }
     if cmd == "stamp" {
         cmd_stamp(&path, &rest);
         return;
@@ -219,6 +224,7 @@ fn usage() {
          \x20 pdf-platform sanitize <file> -o <out.pdf> [--discard-signatures]\n\
          \x20 pdf-platform rotate <file> --pages 1,3-5 --degrees 90|180|270 -o <out.pdf>\n\
          \x20 pdf-platform delete-pages <file> --pages 2,4-6 -o <out.pdf>\n\
+         \x20 pdf-platform crop <file> --pages 1,3-5 --box llx,lly,urx,ury -o <out.pdf>\n\
          \x20 pdf-platform optimize <file> -o <out.pdf> [screen|print|archive]\n\
          \x20 pdf-platform stamp <file> --text \"WATERMARK\" -o <out.pdf>\n\
          \x20 pdf-platform stamp <file> --bates-start 1 --bates-width 6 -o <out.pdf>\n\
@@ -1222,10 +1228,63 @@ fn cmd_delete_pages(path: &Path, rest: &[String]) {
     }
 }
 
+/// Parse `llx,lly,urx,ury` into four finite numbers.
+fn parse_crop_box(spec: &str) -> Result<[f64; 4], String> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() != 4 {
+        return Err(format!("--box needs four numbers llx,lly,urx,ury, got {}", parts.len()));
+    }
+    let mut out = [0.0; 4];
+    for (slot, part) in out.iter_mut().zip(&parts) {
+        *slot = match part.trim().parse::<f64>() {
+            Ok(n) if n.is_finite() => n,
+            _ => return Err(format!("'{}' is not a number", part.trim())),
+        };
+    }
+    Ok(out)
+}
+
+/// Crop pages and save. [FR-ORG, FR-CLI-1]
+///
+/// Usage: pdf-platform crop <file> --pages 1,3-5 --box llx,lly,urx,ury -o <out.pdf>
+///
+/// The box is in PDF points, origin at the bottom left of the unrotated page,
+/// and must lie within each page's media box.
+fn cmd_crop(path: &Path, rest: &[String]) {
+    let (_, out) = parse_dash_o(rest).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+    let Some(pages) = flag_value(rest, "--pages") else {
+        eprintln!("error: crop needs --pages 1,3-5");
+        process::exit(1);
+    };
+    let rect = match flag_value(rest, "--box") {
+        Some(spec) => parse_crop_box(spec).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }),
+        None => {
+            eprintln!("error: crop needs --box llx,lly,urx,ury");
+            process::exit(1);
+        }
+    };
+    match run_page_edit(path, &out, pages, PageEdit::Crop(rect)) {
+        Ok(count) => {
+            println!("cropped {count} page(s) to [{} {} {} {}] -> {}", rect[0], rect[1], rect[2], rect[3], out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
 /// What `run_page_edit` does to the chosen pages.
 enum PageEdit {
     Rotate(u32),
     Delete,
+    Crop([f64; 4]),
 }
 
 /// Open `input`, apply `edit` to the pages `spec` names, save to `output`.
@@ -1243,6 +1302,7 @@ fn run_page_edit(input: &Path, output: &Path, spec: &str, edit: PageEdit) -> Res
     let result = match edit {
         PageEdit::Rotate(degrees) => coordinator.rotate_pages(&pages, degrees),
         PageEdit::Delete => coordinator.delete_pages(&pages),
+        PageEdit::Crop(rect) => coordinator.crop_pages(&pages, rect),
     }
     .and_then(|()| coordinator.save_incremental(output));
     let _ = coordinator.close();
@@ -3670,6 +3730,58 @@ mod page_edit_tests {
     }
 }
 
+#[cfg(test)]
+mod crop_tests {
+    use super::page_edit_tests::{numbered_pdf, scratch};
+    use super::*;
+    use coordinator::document::DocumentCoordinator;
+
+    #[test]
+    fn the_crop_box_is_four_finite_numbers() {
+        assert_eq!(parse_crop_box("10,20,300.5,400").unwrap(), [10.0, 20.0, 300.5, 400.0]);
+        assert_eq!(parse_crop_box(" 0 , 0 , 1 , 1 ").unwrap(), [0.0, 0.0, 1.0, 1.0], "spaces around numbers");
+        for (bad, why) in [("", "empty"), ("1,2,3", "three numbers"), ("1,2,3,4,5", "five"), ("1,2,x,4", "not a number"), ("1,2,NaN,4", "NaN"), ("1,2,inf,4", "infinite")] {
+            assert!(parse_crop_box(bad).is_err(), "'{bad}' ({why}) must be an error");
+        }
+    }
+
+    #[test]
+    fn cropping_a_page_resizes_that_page_only() {
+        let dir = scratch("crop");
+        let (input, output) = (dir.join("in.pdf"), dir.join("out.pdf"));
+        std::fs::write(&input, numbered_pdf(3)).unwrap();
+
+        let changed = run_page_edit(&input, &output, "2", PageEdit::Crop([0.0, 0.0, 200.0, 300.0])).expect("crop");
+        assert_eq!(changed, 1);
+
+        let worker = find_worker();
+        let mut coord = DocumentCoordinator::open(&worker, &output).expect("open result");
+        let sizes: Vec<(u32, u32)> = (0..3)
+            .map(|p| {
+                let r = coord.render_page(p, 1.0).expect("render");
+                (r.width, r.height)
+            })
+            .collect();
+        let _ = coord.close();
+        assert_eq!(sizes, [(612, 792), (200, 300), (612, 792)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crop_that_does_not_fit_is_refused_and_writes_nothing() {
+        let dir = scratch("crop-refused");
+        let (input, output) = (dir.join("in.pdf"), dir.join("out.pdf"));
+        std::fs::write(&input, numbered_pdf(2)).unwrap();
+
+        let error = run_page_edit(&input, &output, "1", PageEdit::Crop([0.0, 0.0, 900.0, 300.0])).unwrap_err();
+        assert!(error.contains("media box"), "{error}");
+        assert!(!output.exists(), "a refused crop left a file behind");
+        let error = run_page_edit(&input, &output, "1", PageEdit::Crop([300.0, 0.0, 100.0, 300.0])).unwrap_err();
+        assert!(error.contains("not a rectangle"), "{error}");
+        assert!(!output.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 #[cfg(test)]
 mod history_tests {
     use super::page_edit_tests::{markers, numbered_pdf, numbered_pdf_with, scratch};

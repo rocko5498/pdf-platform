@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{inherited_box_pdf, nested_numbered_pdf, page_markers, scratch, worker_path};
+use common::{inherited_box_pdf, inherited_rotation_pdf, nested_numbered_pdf, page_markers, scratch, worker_path};
 use coordinator::document::DocumentCoordinator;
 
 fn write(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -152,5 +152,67 @@ fn the_ocr_page_lookup_resolves_the_real_page_in_a_nested_tree() {
 
     assert_eq!(object, 8, "the third page is object 8, the first page of branch B");
     assert!(String::from_utf8_lossy(&bytes).contains("/Type /Page "), "not a page: {:?}", String::from_utf8_lossy(&bytes));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rotating_a_page_that_inherits_its_rotation_adds_to_it() {
+    let dir = scratch("tree-inherited-rotate");
+    let input = write(&dir, "in.pdf", &inherited_rotation_pdf());
+    let output = dir.join("out.pdf");
+
+    let mut before = DocumentCoordinator::open(&worker_path(), &input).expect("open");
+    let rotations_before: Vec<u32> = before.summary().page_dimensions_f().iter().map(|(_, _, r)| *r).collect();
+    let _ = before.close();
+    assert_eq!(rotations_before, [90, 90], "the premise: both pages inherit a quarter turn");
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &input).expect("open");
+    coord.rotate_pages(&[0], 90).expect("rotate page 1");
+    coord.save_incremental(&output).expect("save");
+    let _ = coord.close();
+
+    let mut after = DocumentCoordinator::open(&worker_path(), &output).expect("reopen");
+    let rotations: Vec<u32> = after.summary().page_dimensions_f().iter().map(|(_, _, r)| *r).collect();
+    let _ = after.close();
+    assert_eq!(rotations, [180, 90], "inherited 90 plus 90 is 180; the other page is untouched");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cropping_a_page_changes_that_pages_size_and_no_other() {
+    let dir = scratch("tree-crop");
+    let input = write(&dir, "in.pdf", &nested_numbered_pdf());
+    let output = dir.join("out.pdf");
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &input).expect("open");
+    coord.crop_pages(&[2], [0.0, 0.0, 200.0, 300.0]).expect("crop page 3");
+    coord.save_incremental(&output).expect("save");
+    let _ = coord.close();
+
+    let mut reopened = DocumentCoordinator::open(&worker_path(), &output).expect("reopen");
+    let sizes: Vec<(u32, u32)> = (0..4)
+        .map(|p| {
+            let r = reopened.render_page(p, 1.0).expect("render");
+            (r.width, r.height)
+        })
+        .collect();
+    let _ = reopened.close();
+    assert_eq!(sizes, [(612, 792), (612, 792), (200, 300), (612, 792)], "only page 3 is cropped");
+    assert_eq!(page_markers(&output), ["PAGEMARK1", "PAGEMARK2", "PAGEMARK3", "PAGEMARK4"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_crop_is_checked_against_the_media_box_the_page_inherits() {
+    let dir = scratch("tree-crop-inherited");
+    let input = write(&dir, "in.pdf", &inherited_box_pdf());
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &input).expect("open");
+    // 300 x 400 is inherited from the /Pages node; this box fits a letter page
+    // and not this one.
+    let error = coord.crop_pages(&[0], [0.0, 0.0, 600.0, 700.0]).unwrap_err().to_string();
+    assert!(error.contains("media box"), "{error}");
+    assert!(coord.crop_pages(&[0], [10.0, 10.0, 290.0, 390.0]).is_ok(), "a box inside the inherited one is fine");
+    let _ = coord.close();
     let _ = std::fs::remove_dir_all(&dir);
 }
