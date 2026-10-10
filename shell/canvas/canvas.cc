@@ -10,6 +10,7 @@
 #include "outline_panel.h"
 #include "print_job.h"
 #include "search_panel.h"
+#include "thumbnail_panel.h"
 
 #include <QAccessible>
 #include <QApplication>
@@ -319,6 +320,18 @@ void MainWindow::setupChrome() {
         // TODO(M1): scroll to y offset within page (requires viewport model)
     });
 
+    // Page thumbnails, tabbed with the bookmarks. The panel asks for the pages
+    // in view; the window renders them one at a time. [FR-THUMB-1, FR-NAV-4]
+    thumbs_ = new ThumbnailPanel(this);
+    auto* td = new QDockWidget(QStringLiteral("Pages"), this);
+    td->setObjectName(QStringLiteral("pagesDock"));
+    td->setAccessibleName(QStringLiteral("Pages"));
+    td->setWidget(thumbs_);
+    addDockWidget(Qt::LeftDockWidgetArea, td);
+    tabifyDockWidget(od, td);
+    connect(thumbs_, &ThumbnailPanel::pageActivated, this, &MainWindow::goToPage);
+    connect(thumbs_, &ThumbnailPanel::thumbnailRequested, this, &MainWindow::renderThumbnail);
+
     diagnostics_ = new DiagnosticsPanel(this);
     auto* dd = new QDockWidget(QStringLiteral("Diagnostics"), this);
     dd->setObjectName(QStringLiteral("diagnosticsDock"));
@@ -470,6 +483,10 @@ bool MainWindow::openDocumentWithPassword(const QString& path, const QString& pa
 
     setWindowTitle(QStringLiteral("PDF Platform - %1 (%2 pages)").arg(path_).arg(page_count_));
     refreshPanels();
+    if (thumbs_) {
+        thumbs_->setDocument(int(page_count_), QSizeF(page_width_, page_height_));
+        thumbs_->setCurrentPage(0);
+    }
     announceDocumentStatus();
     canvas_->setFocus(Qt::OtherFocusReason);
     statusBar()->showMessage(
@@ -621,6 +638,25 @@ bool MainWindow::renderVisibleTiles() {
 }
 
 
+void MainWindow::renderThumbnail(int page) {
+    if (page < 0 || page >= int(page_count_) || !shmem_mapping_ || !thumbs_) return;
+    PageSource source;
+    source.shared_region = shmem_mapping_;
+    source.page_count = page_count_;
+    source.page_width_pt = page_width_;
+    source.page_height_pt = page_height_;
+    // 20 DPI: a letter page is 170 pixels wide, which is one or two tiles.
+    QString error;
+    const QImage image = renderPageImage(source, uint32_t(page), 20, &generation_, &error);
+    if (image.isNull()) {
+        // The entry keeps its numbered placeholder; the reason is not shown per
+        // page, but it is not swallowed either. [GR-8]
+        qWarning() << "thumbnail for page" << page + 1 << "failed:" << error;
+        return;
+    }
+    thumbs_->setThumbnail(page, image);
+}
+
 void MainWindow::refreshPanels() {
     // Each panel independently — one worker query must not blank diagnostics. [FR-DIAG, PRIN-6]
     QStringList panel_notes;
@@ -741,6 +777,9 @@ void MainWindow::clearDocumentUi() {
     if (outline_) {
         outline_->clear();
     }
+    if (thumbs_) {
+        thumbs_->clear();
+    }
     if (diagnostics_) {
         diagnostics_->clear();
     }
@@ -785,6 +824,7 @@ void MainWindow::goToPage(int page) {
     current_page_ = uint32_t(page);
     canvas_->clearSelectionOverlay();
     renderCurrentPage();
+    if (thumbs_) thumbs_->setCurrentPage(page);
     announceDocumentStatus();
 }
 
@@ -1270,7 +1310,8 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         if (focused) {
             // Check which dock widget contains the focused widget
             if (auto* dock = qobject_cast<QDockWidget*>(focused->parentWidget())) {
-                if (dock == findChild<QDockWidget*>(QStringLiteral("bookmarksDock"))) {
+                if (dock == findChild<QDockWidget*>(QStringLiteral("bookmarksDock"))
+                    || dock == findChild<QDockWidget*>(QStringLiteral("pagesDock"))) {
                     current = LeftPanel;
                 } else if (dock == findChild<QDockWidget*>(QStringLiteral("diagnosticsDock"))
                            || dock == findChild<QDockWidget*>(QStringLiteral("formsDock"))) {

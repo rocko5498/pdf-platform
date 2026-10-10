@@ -12,6 +12,8 @@ add_library(shell-panels STATIC
     forms_panel.h
     search_panel.cc
     search_panel.h
+    thumbnail_panel.cc
+    thumbnail_panel.h
 )
 target_include_directories(shell-panels PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"

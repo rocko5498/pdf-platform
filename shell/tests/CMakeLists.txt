@@ -132,3 +132,18 @@ set_tests_properties(shell.menu_bar PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;PDF_PLATFORM_UI_REGISTRY=${CMAKE_SOURCE_DIR}/chrome/ui-registry.toml"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
 )
+
+# The thumbnail list asks only for the pages in view. [FR-THUMB-1, T-10]
+add_executable(shell-thumbnail-panel-test
+    thumbnail_panel_test.cc
+)
+target_link_libraries(shell-thumbnail-panel-test PRIVATE
+    shell-panels
+    Qt6::Test
+    Qt6::Widgets
+)
+add_test(NAME shell.thumbnail_panel COMMAND shell-thumbnail-panel-test)
+set_tests_properties(shell.thumbnail_panel PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
+)

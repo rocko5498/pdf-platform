@@ -22,6 +22,7 @@
 namespace pdf_platform {
 
 class OutlinePanel;
+class ThumbnailPanel;
 class DiagnosticsPanel;
 class AnnotationToolBar;
 class FormsPanel;
@@ -149,6 +150,8 @@ private:
     bool renderCurrentPage();
     bool renderVisibleTiles();
     void refreshPanels();
+    /// Render one page thumbnail the panel asked for. [FR-THUMB-1]
+    void renderThumbnail(int page);
     void announceDocumentStatus();
     void clearDocumentUi();
     float docHeightPx() const;
@@ -158,6 +161,7 @@ private:
 
     CanvasWidget* canvas_ = nullptr;
     OutlinePanel* outline_ = nullptr;
+    ThumbnailPanel* thumbs_ = nullptr;
     DiagnosticsPanel* diagnostics_ = nullptr;
     AnnotationToolBar* annot_tools_ = nullptr;
     FormsPanel* forms_ = nullptr;
