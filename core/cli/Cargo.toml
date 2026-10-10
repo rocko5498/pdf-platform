@@ -14,6 +14,7 @@ jobs        = { path = "../jobs" }
 protocol    = { path = "../protocol" }
 diagnostics = { path = "../diagnostics" }
 sandbox     = { path = "../sandbox" }
+pdf-cos     = { path = "../pdf-cos" }
 pdf-model   = { path = "../pdf-model" }
 sign        = { path = "../sign" }
 ocr-bridge  = { path = "../ocr-bridge" }

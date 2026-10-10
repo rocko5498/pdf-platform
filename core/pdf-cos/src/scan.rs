@@ -223,7 +223,7 @@ pub fn find_startxref(data: &[u8]) -> Option<usize> {
 /// "not supported at M0", so every COS read on a modern PDF — page objects for
 /// stamping, AcroForm fields, optional content — failed on documents most
 /// producers have written since 2003. [FR-VIEW-2, SDS §3.1]
-fn parse_section(
+pub(crate) fn parse_section(
     data: &[u8],
     offset: usize,
     leniency: &mut Vec<LeniencyEvent>,
@@ -465,7 +465,7 @@ endobj
 
 /// Whether the file declares itself linearized: a `/Linearized` key in its first
 /// 1024 bytes, where Annex F requires the linearization dictionary to be.
-fn is_linearized(data: &[u8]) -> bool {
+pub(crate) fn is_linearized(data: &[u8]) -> bool {
     const KEY: &[u8] = b"/Linearized";
     data[..data.len().min(1024)].windows(KEY.len()).any(|w| w == KEY)
 }
@@ -558,33 +558,48 @@ pub fn parse_xref_chain(data: &[u8], start: usize, leniency: &mut Vec<LeniencyEv
             }
         }
 
-        offset = match section_dictionary(data, current)
-            .and_then(|dict| parse_int_after_key(&dict, b"/Prev"))
-            .and_then(|prev| usize::try_from(prev).ok())
-        {
-            None => None,
-            // A /Prev must point backwards, into the file. Anything else is
-            // damage or malice; either way it is reported, not followed.
-            //
-            // The one lawful exception is a linearized file (ISO 32000-1
-            // Annex F): its first-page section sits near the start and its
-            // `/Prev` points *forward* to the main section at the end. Refusing
-            // that left `Pages: 0` for documents PDFium rendered fine. The
-            // visited-set and section limit above still stop a loop.
-            // [FR-VIEW-2, GR-7, GR-8]
-            Some(prev) if prev < current && prev < data.len() => Some(prev),
-            Some(prev) if prev > current && prev < data.len() && is_linearized(data) => Some(prev),
-            Some(prev) => {
-                leniency.push(LeniencyEvent::new(
-                    "xref-prev-invalid",
-                    &format!("/Prev {prev} does not point backwards into the file"),
-                ));
-                None
-            }
-        };
+        offset = next_section(data, current, leniency).map(|(prev, _)| prev);
     }
 
     Ok(merged)
+}
+
+/// Where the cross-reference chain goes after the section at `current`, and
+/// whether that step runs *forward* through the file.
+///
+/// A `/Prev` must point backwards, into the file. Anything else is damage or
+/// malice; either way it is reported, not followed.
+///
+/// The one lawful exception is a linearized file (ISO 32000-1 Annex F): its
+/// first-page section sits near the start and its `/Prev` points *forward* to
+/// the main section at the end. Refusing that left `Pages: 0` for documents
+/// PDFium rendered fine. The visited set and section limit in the callers
+/// still stop a loop. [FR-VIEW-2, GR-7, GR-8]
+///
+/// One function for the walkers that need it, so the chain reader and the
+/// revision list cannot disagree about where a file's history goes.
+pub(crate) fn next_section(
+    data: &[u8],
+    current: usize,
+    leniency: &mut Vec<LeniencyEvent>,
+) -> Option<(usize, bool)> {
+    match section_dictionary(data, current)
+        .and_then(|dict| parse_int_after_key(&dict, b"/Prev"))
+        .and_then(|prev| usize::try_from(prev).ok())
+    {
+        None => None,
+        Some(prev) if prev < current && prev < data.len() => Some((prev, false)),
+        Some(prev) if prev > current && prev < data.len() && is_linearized(data) => {
+            Some((prev, true))
+        }
+        Some(prev) => {
+            leniency.push(LeniencyEvent::new(
+                "xref-prev-invalid",
+                &format!("/Prev {prev} does not point backwards into the file"),
+            ));
+            None
+        }
+    }
 }
 
 pub(crate) fn parse_xref_table(

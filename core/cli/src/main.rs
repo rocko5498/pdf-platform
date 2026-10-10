@@ -75,6 +75,8 @@ fn main() {
         "split",
         "optimize",
         "extract-pages",
+        "revisions",
+        "sanitize",
         "rotate",
         "delete-pages",
         "stamp",
@@ -137,6 +139,14 @@ fn main() {
     }
     if cmd == "extract-pages" {
         cmd_extract_pages(&path, &rest);
+        return;
+    }
+    if cmd == "revisions" {
+        cmd_revisions(&path);
+        return;
+    }
+    if cmd == "sanitize" {
+        cmd_sanitize(&path, &rest);
         return;
     }
     if cmd == "rotate" {
@@ -205,6 +215,8 @@ fn usage() {
          \x20 pdf-platform merge <file1> <file2> [...] -o <out.pdf>\n\
          \x20 pdf-platform split <file> -o <outdir>\n\
          \x20 pdf-platform extract-pages <file> <first> <last> -o <out.pdf>\n\
+         \x20 pdf-platform revisions <file>\n\
+         \x20 pdf-platform sanitize <file> -o <out.pdf> [--discard-signatures]\n\
          \x20 pdf-platform rotate <file> --pages 1,3-5 --degrees 90|180|270 -o <out.pdf>\n\
          \x20 pdf-platform delete-pages <file> --pages 2,4-6 -o <out.pdf>\n\
          \x20 pdf-platform optimize <file> -o <out.pdf> [screen|print|archive]\n\
@@ -943,6 +955,159 @@ fn cmd_optimize(path: &Path, rest: &[String]) {
         Ok(preflight) => {
             print!("{preflight}");
             println!("\nWrote {}", out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// List the revisions a file carries. [FR-VER-1]
+///
+/// Usage: pdf-platform revisions <file>
+fn cmd_revisions(path: &Path) {
+    let data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("error: cannot read {}: {e}", path.display());
+        process::exit(2);
+    });
+    match pdf_cos::revisions::list_revisions(&data) {
+        Ok(revisions) => {
+            println!("Revisions: {}", revisions.len());
+            for r in &revisions {
+                println!(
+                    "  {}: {} byte(s), {} object(s) written, cross-reference at {}",
+                    r.number, r.bytes, r.objects_written, r.xref_offset
+                );
+            }
+            if revisions.len() > 1 {
+                println!(
+                    "Earlier revisions stay readable in the file. `sanitize` writes a copy \
+                     with only the latest."
+                );
+            }
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: cannot read the revision history: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// Whether the newest trailer declares encryption.
+fn is_encrypted(data: &[u8]) -> bool {
+    pdf_cos::scan::find_startxref(data)
+        .and_then(|at| pdf_cos::scan::section_dictionary(data, at))
+        .is_some_and(|dict| dict.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"))
+}
+
+/// What a sanitize did, for the report.
+#[derive(Debug)]
+struct SanitizeReport {
+    revisions_before: usize,
+    bytes_before: usize,
+    bytes_after: usize,
+    signatures_discarded: u32,
+    has_js: bool,
+    has_acroform: bool,
+}
+
+/// Write a copy of `input` that carries only its latest revision. [FR-VER-2, FR-SAVE-2]
+///
+/// A full rewrite through the candidate, verify and publish path: only objects
+/// the latest revision reaches are written, so earlier revisions and the objects
+/// nothing references any more are gone. The result is then re-read and must
+/// report exactly one revision, or it is removed and the call fails: a clean
+/// copy that still holds history is the false success this command exists to
+/// avoid. [GR-8, PRIN-6]
+fn run_sanitize(input: &Path, output: &Path, discard_signatures: bool) -> Result<SanitizeReport, String> {
+    use pdf_model::assembly::OptimizeProfile;
+    use pdf_model::assembly_ops::optimize_pdf;
+
+    let data = std::fs::read(input).map_err(|e| format!("cannot read {}: {e}", input.display()))?;
+    if is_encrypted(&data) {
+        return Err(
+            "this document is encrypted; a clean copy of an encrypted document is not supported"
+                .into(),
+        );
+    }
+    let structure = pdf_cos::scan::scan_bytes(&data).map_err(|e| format!("cannot read the document: {e}"))?;
+    let before = pdf_cos::revisions::list_revisions(&data).map_err(|e| e.to_string())?;
+    // `sig_count` is a proxy (it counts `/FT /Sig` inside the AcroForm dictionary
+    // itself), so a signature in an indirect field would be missed. Every
+    // signature dictionary carries a `/ByteRange`; its presence anywhere in the
+    // file is treated as signed, the safe direction to be wrong in. [GR-8, PRIN-6]
+    let has_byte_range = data.windows(b"/ByteRange".len()).any(|w| w == b"/ByteRange");
+    let signatures = structure.sig_count.max(u32::from(has_byte_range));
+    if signatures > 0 && !discard_signatures {
+        return Err(format!(
+            "this document has {signatures} signature(s) or signature-like data, and a clean \
+             copy invalidates them. Run again with --discard-signatures to proceed"
+        ));
+    }
+
+    coordinator::broker::optimize_with_verification(output, |candidate| {
+        optimize_pdf(input, candidate, OptimizeProfile::ArchivePreserving).map_err(|e| e.to_string())
+    })?;
+
+    let written = std::fs::read(output).map_err(|e| format!("cannot read the result: {e}"))?;
+    let after = pdf_cos::revisions::list_revisions(&written).map_err(|e| e.to_string());
+    match after {
+        Ok(revisions) if revisions.len() == 1 => Ok(SanitizeReport {
+            revisions_before: before.len(),
+            bytes_before: data.len(),
+            bytes_after: written.len(),
+            signatures_discarded: signatures,
+            has_js: structure.has_js,
+            has_acroform: structure.has_acroform,
+        }),
+        other => {
+            let _ = std::fs::remove_file(output);
+            Err(match other {
+                Ok(revisions) => format!(
+                    "the result still has {} revisions, so it was removed rather than reported as clean",
+                    revisions.len()
+                ),
+                Err(e) => format!("the result could not be re-read ({e}), so it was removed"),
+            })
+        }
+    }
+}
+
+/// Write a clean copy without the revision history. [FR-VER-2]
+///
+/// Usage: pdf-platform sanitize <file> -o <out.pdf> [--discard-signatures]
+fn cmd_sanitize(path: &Path, rest: &[String]) {
+    let (extra, out) = parse_dash_o(rest).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+    let discard = extra.iter().any(|a| a == "--discard-signatures");
+    if let Some(unknown) = extra.iter().find(|a| *a != "--discard-signatures") {
+        eprintln!("error: unexpected argument: {unknown}");
+        process::exit(1);
+    }
+    match run_sanitize(path, &out, discard) {
+        Ok(r) => {
+            println!(
+                "Wrote {}: {} revision(s) before, 1 now; {} -> {} bytes.",
+                out.display(),
+                r.revisions_before,
+                r.bytes_before,
+                r.bytes_after
+            );
+            println!("Removed: earlier revisions, and objects nothing in the latest revision uses.");
+            if r.signatures_discarded > 0 {
+                println!("Signatures: {} discarded; they no longer validate.", r.signatures_discarded);
+            }
+            println!(
+                "Not removed: document information and XMP metadata, embedded files, annotations \
+                 and comments, form data{}{}, hidden text and layers.",
+                if r.has_acroform { " (this document has a form)" } else { "" },
+                if r.has_js { ", JavaScript (this document has some)" } else { ", JavaScript" },
+            );
             process::exit(0);
         }
         Err(e) => {
@@ -3340,8 +3505,14 @@ mod page_edit_tests {
 
     /// A document of `pages` pages, page n drawing `PAGEMARKn`, so a test can
     /// read the result back and check *which* pages survived.
-    fn numbered_pdf(pages: u32) -> Vec<u8> {
-        let mut objects: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()];
+    pub(super) fn numbered_pdf(pages: u32) -> Vec<u8> {
+        numbered_pdf_with(pages, "")
+    }
+
+    /// As `numbered_pdf`, with `catalog_extra` added to the catalog dictionary.
+    pub(super) fn numbered_pdf_with(pages: u32, catalog_extra: &str) -> Vec<u8> {
+        let mut objects: Vec<Vec<u8>> =
+            vec![format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>").into_bytes()];
         let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 4 + i * 2)).collect();
         objects.push(
             format!("<< /Type /Pages /Kids [{}] /Count {pages} >>", kids.join(" ")).into_bytes(),
@@ -3389,14 +3560,14 @@ mod page_edit_tests {
         bytes
     }
 
-    fn scratch(name: &str) -> PathBuf {
+    pub(super) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pdf-platform-page-edit-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn markers(path: &Path) -> Vec<String> {
+    pub(super) fn markers(path: &Path) -> Vec<String> {
         let worker = find_worker();
         let mut coord = DocumentCoordinator::open(&worker, path).expect("open result");
         let mut out = Vec::new();
@@ -3495,6 +3666,105 @@ mod page_edit_tests {
         assert_eq!((second.width, second.height), (792, 612), "a quarter turn swaps the sides");
         assert_eq!((third.width, third.height), (612, 792), "page 3 must be untouched");
         assert_eq!(markers(&output), ["PAGEMARK1", "PAGEMARK2", "PAGEMARK3"], "no page may be lost");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::page_edit_tests::{markers, numbered_pdf, numbered_pdf_with, scratch};
+    use super::*;
+
+    fn revision_count(path: &Path) -> usize {
+        pdf_cos::revisions::list_revisions(&std::fs::read(path).unwrap()).expect("list").len()
+    }
+
+    /// Objects the newest cross-reference chain still lists as in use.
+    fn live_objects(path: &Path) -> usize {
+        let data = std::fs::read(path).unwrap();
+        let start = pdf_cos::scan::find_startxref(&data).expect("startxref");
+        pdf_cos::scan::parse_xref_chain(&data, start, &mut Vec::new())
+            .expect("chain")
+            .iter()
+            .filter(|e| e.in_use && (e.offset != 0 || e.compressed.is_some()))
+            .count()
+    }
+
+    #[test]
+    fn every_save_is_one_more_revision() {
+        let dir = scratch("revisions");
+        let (a, b, c) = (dir.join("a.pdf"), dir.join("b.pdf"), dir.join("c.pdf"));
+        std::fs::write(&a, numbered_pdf(3)).unwrap();
+        assert_eq!(revision_count(&a), 1, "a document nobody has edited");
+
+        run_page_edit(&a, &b, "1", PageEdit::Delete).expect("delete");
+        assert_eq!(revision_count(&b), 2, "one incremental save");
+        run_page_edit(&b, &c, "1", PageEdit::Rotate(90)).expect("rotate");
+        assert_eq!(revision_count(&c), 3, "two incremental saves");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_drops_the_history_and_the_deleted_page_but_keeps_the_rest() {
+        let dir = scratch("sanitize");
+        let (original, edited, clean) = (dir.join("a.pdf"), dir.join("b.pdf"), dir.join("c.pdf"));
+        std::fs::write(&original, numbered_pdf(3)).unwrap();
+        run_page_edit(&original, &edited, "1", PageEdit::Delete).expect("delete page 1");
+
+        // The deleted page is out of the page tree but still in the file.
+        let edited_bytes = std::fs::read(&edited).unwrap();
+        assert!(
+            edited_bytes.windows(9).any(|w| w == b"PAGEMARK1"),
+            "the premise: page 1's content is still in the edited file's history"
+        );
+        assert_eq!(markers(&edited), ["PAGEMARK2", "PAGEMARK3"]);
+        assert_eq!(revision_count(&edited), 2);
+        let live_before = live_objects(&edited);
+
+        let report = run_sanitize(&edited, &clean, false).expect("sanitize");
+
+        assert_eq!(report.revisions_before, 2);
+        assert_eq!(revision_count(&clean), 1, "the history must be gone");
+        assert_eq!(markers(&clean), ["PAGEMARK2", "PAGEMARK3"], "the pages that remain must remain");
+        assert!(
+            live_objects(&clean) + 2 <= live_before,
+            "page 1's page and content objects should be gone: {} objects before, {} after",
+            live_before,
+            live_objects(&clean)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_refuses_a_signed_document_unless_told_to_discard_the_signature() {
+        let dir = scratch("sanitize-signed");
+        let (input, output) = (dir.join("signed.pdf"), dir.join("clean.pdf"));
+        std::fs::write(
+            &input,
+            numbered_pdf_with(1, "/AcroForm << /Fields [<< /FT /Sig /T (sig1) >>] >>"),
+        )
+        .unwrap();
+
+        let error = run_sanitize(&input, &output, false).unwrap_err();
+        assert!(error.contains("signature"), "{error}");
+        assert!(error.contains("--discard-signatures"), "the message must say how to proceed: {error}");
+        assert!(!output.exists(), "a refused sanitize left a file behind");
+
+        let report = run_sanitize(&input, &output, true).expect("with the flag it proceeds");
+        assert_eq!(report.signatures_discarded, 1);
+        assert!(output.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_does_not_overwrite_an_existing_file() {
+        let dir = scratch("sanitize-exists");
+        let (input, output) = (dir.join("a.pdf"), dir.join("exists.pdf"));
+        std::fs::write(&input, numbered_pdf(1)).unwrap();
+        std::fs::write(&output, b"precious").unwrap();
+
+        assert!(run_sanitize(&input, &output, false).is_err(), "an existing file must not be replaced");
+        assert_eq!(std::fs::read(&output).unwrap(), b"precious", "and its bytes must be untouched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
