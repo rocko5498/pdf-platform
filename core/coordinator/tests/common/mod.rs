@@ -178,3 +178,22 @@ pub fn inherited_rotation_pdf() -> Vec<u8> {
     ];
     assemble(&objects)
 }
+
+/// Whether `qpdf` is on PATH. With `PDF_PLATFORM_REQUIRE_QPDF=1` a missing qpdf is
+/// a failure, not a skip: a suite that quietly skips itself when its tool is
+/// absent reports success without having tested anything. [T-11, GR-8]
+pub fn qpdf_or_skip() -> bool {
+    let present = std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !present {
+        assert!(
+            std::env::var("PDF_PLATFORM_REQUIRE_QPDF").map_or(true, |v| v != "1"),
+            "qpdf is required (PDF_PLATFORM_REQUIRE_QPDF=1) but is not on PATH"
+        );
+        eprintln!("skip: qpdf not on PATH");
+    }
+    present
+}
