@@ -253,10 +253,14 @@ fn fault_inject_incremental_save_preserves_untouched() {
     overlay.bump_revision();
 
     let mut output = original_bytes.clone();
+    // An update chains to the section it supersedes, as the coordinator does;
+    // it lists only what it wrote, so a `/Prev` of 0 would leave the untouched
+    // objects unreachable. [SDS §3.3, FR-SAVE-1]
+    let prev = pdf_cos::scan::find_startxref(&original_bytes).expect("original startxref") as u32;
     let result = IncrementalWriter::write_incremental(
         &mut output,
         &overlay,
-        0,
+        prev,
         8,
         &original_offsets,
         original_bytes.len() as u32,
@@ -468,10 +472,11 @@ fn fault_inject_incremental_save_preserves_signatures() {
     overlay.bump_revision();
 
     let mut output = original_bytes.clone();
+    let prev = pdf_cos::scan::find_startxref(&original_bytes).expect("original startxref") as u32;
     IncrementalWriter::write_incremental(
         &mut output,
         &overlay,
-        0,
+        prev,
         5,
         &original_offsets,
         original_bytes.len() as u32,
