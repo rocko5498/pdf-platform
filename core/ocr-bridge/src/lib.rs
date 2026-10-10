@@ -1008,7 +1008,11 @@ fn parse_tesseract_tsv(tsv: &str, page_index: u32, raster_width: u32, raster_hei
 }
 
 /// Minimal RGBA-to-PNG writer. [FR-OCR-3]
-fn write_rgba_png(
+///
+/// Public so the CLI's image export shares it instead of carrying a second
+/// encoder. The IDAT is stored, not compressed: files are about as large as the
+/// raw raster. [FR-EXPORT-1]
+pub fn write_rgba_png(
     path: &std::path::Path,
     rgba: &[u8],
     width: u32,

@@ -68,6 +68,7 @@ fn main() {
         "diagnostics",
         "find",
         "export-text",
+        "export-images",
         "optimize-preflight",
         "merge",
         "split",
@@ -111,6 +112,10 @@ fn main() {
         return;
     }
 
+    if cmd == "export-images" {
+        cmd_export_images(&path, &rest);
+        return;
+    }
     if cmd == "merge" {
         cmd_merge(&path, &rest);
         return;
@@ -179,6 +184,7 @@ fn usage() {
          \x20 pdf-platform outline|layers|attachments|diagnostics <file>\n\
          \x20 pdf-platform find <file> <query>\n\
          \x20 pdf-platform export-text <file> [page]\n\
+         \x20 pdf-platform export-images <file> -o <outdir> [--dpi N]\n\
          \x20 pdf-platform optimize-preflight <file> [screen|print|archive]\n\
          \x20 pdf-platform merge <file1> <file2> [...] -o <out.pdf>\n\
          \x20 pdf-platform split <file> -o <outdir>\n\
@@ -512,6 +518,141 @@ fn parse_dash_o(rest: &[String]) -> Result<(Vec<String>, PathBuf), String> {
     }
     let out = out.ok_or_else(|| "missing -o <path>".to_string())?;
     Ok((inputs, out))
+}
+
+/// Resolution used when `--dpi` is not given.
+const DEFAULT_EXPORT_DPI: u32 = 150;
+
+/// Room left in a transport frame for everything that is not pixels.
+const FRAME_HEADROOM_BYTES: u64 = 64 * 1024;
+
+/// `--dpi N`, or nothing. Anything else is an error: a typo that fell back to
+/// the default would hand back images at a resolution nobody asked for.
+/// [GR-8, UX-ERR-3]
+fn parse_export_dpi(extra: &[String]) -> Result<u32, String> {
+    match extra {
+        [] => Ok(DEFAULT_EXPORT_DPI),
+        [flag, value] if flag == "--dpi" => match value.trim().parse::<u32>() {
+            Ok(dpi) if dpi > 0 => Ok(dpi),
+            _ => Err(format!("--dpi must be a whole number above 0, got '{value}'")),
+        },
+        other => Err(format!("unexpected argument(s): {}", other.join(" "))),
+    }
+}
+
+/// Render every page to `<out_dir>/page-NNN.png`. [FR-EXPORT-1, FR-EXPORT-3]
+///
+/// A page crosses the IPC as one RGBA frame, and a frame is capped at
+/// `MAX_FRAME` (SDS §4.6). Every page is checked against that cap before the
+/// first file is written, so a DPI that cannot be carried fails whole instead
+/// of leaving a partial export that looks complete. Tiled export for higher
+/// resolutions is not implemented.
+fn export_images(
+    coord: &mut coordinator::document::DocumentCoordinator,
+    out_dir: &Path,
+    dpi: u32,
+) -> Result<Vec<PathBuf>, String> {
+    let scale = dpi as f32 / 72.0;
+    // The raster travels base64-encoded, so three bytes of pixels cost four in
+    // the frame. Measured, not assumed: a 16.6 MB raster arrived as a
+    // 22,207,396-byte frame against the 16,777,216 cap.
+    let budget = (u64::from(protocol::transport::MAX_FRAME) - FRAME_HEADROOM_BYTES) / 4 * 3;
+
+    // Bytes of RGBA for one page; the renderer rounds each side up.
+    let raster_bytes = |width_pt: f32, height_pt: f32, dpi: u32| -> u64 {
+        let s = dpi as f32 / 72.0;
+        (width_pt * s).ceil() as u64 * (height_pt * s).ceil() as u64 * 4
+    };
+
+    for (index, (width_pt, height_pt, _)) in coord.summary().page_dimensions_f().into_iter().enumerate() {
+        let pixels = raster_bytes(width_pt, height_pt, dpi);
+        if pixels > budget {
+            // Start from the continuous answer and step down to one that the
+            // same rounding accepts, so the number named here really works.
+            let mut largest =
+                (72.0 * (budget as f64 / (4.0 * width_pt as f64 * height_pt as f64)).sqrt()) as u32;
+            while largest > 0 && raster_bytes(width_pt, height_pt, largest) > budget {
+                largest -= 1;
+            }
+            return Err(format!(
+                "page {} is {width_pt:.0}x{height_pt:.0} pt; at {dpi} DPI that is {pixels} bytes, \
+                 over the {budget}-byte limit for one rendered page. The largest DPI for this \
+                 page is {largest}.",
+                index + 1
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
+
+    let count = coord.page_count();
+    let digits = count.to_string().len().max(3);
+    let mut written = Vec::with_capacity(count as usize);
+    for page in 0..count {
+        let raster = coord
+            .render_page(page, scale)
+            .map_err(|e| format!("page {}: render failed: {e}", page + 1))?;
+        if raster.pixels.len() as u64 != u64::from(raster.width) * u64::from(raster.height) * 4 {
+            return Err(format!(
+                "page {}: the renderer returned {} bytes for a {}x{} raster",
+                page + 1,
+                raster.pixels.len(),
+                raster.width,
+                raster.height
+            ));
+        }
+        let file = out_dir.join(format!("page-{:0digits$}.png", page + 1));
+        ocr_bridge::write_rgba_png(&file, &raster.pixels, raster.width, raster.height)?;
+        written.push(file);
+    }
+    Ok(written)
+}
+
+/// Export pages as images. [FR-EXPORT-1, FR-EXPORT-3]
+///
+/// Usage: pdf-platform export-images <file> -o <outdir> [--dpi N]
+fn cmd_export_images(path: &Path, rest: &[String]) {
+    use coordinator::document::DocumentCoordinator;
+
+    let (extra, out_dir) = match parse_dash_o(rest) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+    let dpi = match parse_export_dpi(&extra) {
+        Ok(dpi) => dpi,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let worker = find_worker();
+    let mut coord = match DocumentCoordinator::open(&worker, path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: open failed: {e}");
+            process::exit(2);
+        }
+    };
+    let result = export_images(&mut coord, &out_dir, dpi);
+    let _ = coord.close();
+    match result {
+        Ok(files) => {
+            println!("exported {} page(s) at {dpi} DPI to {}", files.len(), out_dir.display());
+            for file in files {
+                println!("  {}", file.display());
+            }
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
 }
 
 fn cmd_merge(first: &Path, rest: &[String]) {
@@ -2738,6 +2879,169 @@ mod stamp_tests {
             "the difference is too faint to be drawn text: max channel delta {}",
             diff.max_channel_delta
         );
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use coordinator::document::DocumentCoordinator;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/corpus-diff/fixtures")
+            .join(name)
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pdf-platform-export-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Width, height and RGBA bytes of a PNG written by `write_rgba_png`
+    /// (stored deflate, filter 0). Reading the pixels back is the point: a
+    /// file with the right header can still be a blank page. [T-10]
+    fn read_png(path: &Path) -> (u32, u32, Vec<u8>) {
+        let bytes = std::fs::read(path).expect("read png");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
+        let (mut width, mut height, mut idat) = (0u32, 0u32, Vec::new());
+        let mut at = 8;
+        while at + 8 <= bytes.len() {
+            let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let kind = &bytes[at + 4..at + 8];
+            let body = &bytes[at + 8..at + 8 + len];
+            match kind {
+                b"IHDR" => {
+                    width = u32::from_be_bytes(body[0..4].try_into().unwrap());
+                    height = u32::from_be_bytes(body[4..8].try_into().unwrap());
+                }
+                b"IDAT" => idat.extend_from_slice(body),
+                _ => {}
+            }
+            at += 12 + len;
+        }
+        // zlib header (2 bytes), stored blocks, Adler-32 (4 bytes).
+        let mut raw = Vec::new();
+        let mut p = 2;
+        loop {
+            let last = idat[p] & 1 == 1;
+            let n = u16::from_le_bytes([idat[p + 1], idat[p + 2]]) as usize;
+            raw.extend_from_slice(&idat[p + 5..p + 5 + n]);
+            p += 5 + n;
+            if last {
+                break;
+            }
+        }
+        let stride = width as usize * 4 + 1;
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for row in raw.chunks(stride) {
+            assert_eq!(row[0], 0, "only filter 0 is written");
+            rgba.extend_from_slice(&row[1..]);
+        }
+        (width, height, rgba)
+    }
+
+    fn open(name: &str) -> DocumentCoordinator {
+        let worker = find_worker();
+        DocumentCoordinator::open(&worker, &fixture(name)).expect("open fixture")
+    }
+
+    #[test]
+    fn one_png_per_page_and_the_dpi_scales_the_pixels() {
+        let mut coord = open("valid-3page.pdf");
+        let low = scratch("low");
+        let high = scratch("high");
+
+        let at_72 = export_images(&mut coord, &low, 72).expect("export at 72");
+        let at_144 = export_images(&mut coord, &high, 144).expect("export at 144");
+        let _ = coord.close();
+
+        assert_eq!(at_72.len(), 3, "a 3-page document yields 3 files");
+        let names: Vec<_> = at_72.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["page-001.png", "page-002.png", "page-003.png"]);
+
+        for (a, b) in at_72.iter().zip(&at_144) {
+            let (w1, h1, _) = read_png(a);
+            let (w2, h2, _) = read_png(b);
+            // A point is 1/72 inch, so doubling the DPI doubles each side
+            // (to within the rounding of a non-integer page size).
+            assert!(w2.abs_diff(w1 * 2) <= 1, "width {w1} at 72 DPI but {w2} at 144");
+            assert!(h2.abs_diff(h1 * 2) <= 1, "height {h1} at 72 DPI but {h2} at 144");
+            assert!(w1 > 100 && h1 > 100, "implausibly small page {w1}x{h1}");
+        }
+        let _ = std::fs::remove_dir_all(low);
+        let _ = std::fs::remove_dir_all(high);
+    }
+
+    #[test]
+    fn a_text_page_has_ink_and_a_blank_page_does_not() {
+        // The blank fixture must come out all white and the text fixture must
+        // not: together they fail for a stub renderer (which paints a
+        // checkerboard), for an exporter that writes white regardless, and for
+        // one that writes the same thing for every page. [T-10, T-12]
+        let out = scratch("ink");
+        let mut blank = open("valid-1page.pdf");
+        let mut text = open("text-latin.pdf");
+        let blank_files = export_images(&mut blank, &out.join("blank"), 72).expect("blank");
+        let text_files = export_images(&mut text, &out.join("text"), 72).expect("text");
+        let _ = blank.close();
+        let _ = text.close();
+
+        let (_, _, blank_pixels) = read_png(&blank_files[0]);
+        let (_, _, text_pixels) = read_png(&text_files[0]);
+        assert!(
+            blank_pixels.iter().all(|&b| b == 255),
+            "the blank page did not export as white"
+        );
+        assert!(
+            text_pixels.chunks(4).any(|px| px[..3].iter().any(|&c| c < 128)),
+            "the page with text exported with no dark pixel"
+        );
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn a_dpi_the_frame_cannot_carry_is_refused_before_anything_is_written() {
+        let mut coord = open("valid-1page.pdf");
+        let out = scratch("too-big");
+        let error = export_images(&mut coord, &out, 1200).expect_err("1200 DPI cannot fit one frame");
+        let _ = coord.close();
+
+        assert!(error.contains("DPI"), "{error}");
+        assert!(error.contains("largest"), "the message must say what would work: {error}");
+        assert!(!out.exists(), "a refused export must not create the output directory");
+    }
+
+    #[test]
+    fn the_largest_dpi_the_message_names_actually_works() {
+        // The refusal claims a number; check it is true rather than a guess.
+        let mut coord = open("valid-1page.pdf");
+        let error = export_images(&mut coord, &scratch("probe"), 1200).expect_err("too big");
+        let largest: u32 = error
+            .rsplit("is ")
+            .next()
+            .and_then(|tail| tail.trim_end_matches('.').parse().ok())
+            .unwrap_or_else(|| panic!("could not read the largest DPI from: {error}"));
+
+        let out = scratch("largest");
+        let files = export_images(&mut coord, &out, largest)
+            .unwrap_or_else(|e| panic!("the DPI the message promised ({largest}) failed: {e}"));
+        assert_eq!(files.len(), 1);
+        let _ = coord.close();
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn the_dpi_flag_is_strict() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_export_dpi(&[]).unwrap(), DEFAULT_EXPORT_DPI);
+        assert_eq!(parse_export_dpi(&args(&["--dpi", "300"])).unwrap(), 300);
+        assert!(parse_export_dpi(&args(&["--dpi", "abc"])).is_err(), "not a number");
+        assert!(parse_export_dpi(&args(&["--dpi", "0"])).is_err(), "zero is not a resolution");
+        assert!(parse_export_dpi(&args(&["--dpi"])).is_err(), "a flag with no value");
+        assert!(parse_export_dpi(&args(&["--dpi=300"])).is_err(), "unknown spelling");
+        assert!(parse_export_dpi(&args(&["300"])).is_err(), "a stray argument");
     }
 }
 
