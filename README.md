@@ -30,16 +30,17 @@ Precedence on conflict: ADR → SDS → PRD → UI/UX Design System → Implemen
 | **M2** Text / search | **Mostly complete** | Text cache, geometry IPC, find/copy, UTF-8-safe ligature/CJK find, `extraction_correctness` suite. Multi-engine corpus still expands. |
 | **M3** Mutation core | **Gate passed** | CoW, journal, incremental save, autosave recovery, fault-injection suite. |
 | **M4** Annotations | **Mostly complete** | Appearance streams, QuadPoints, tools, XFDF + interop unit matrix, incremental save with `/Annots` patch + XFDF sidecar. External Acrobat/Foxit lab still open. |
-| **M5** Forms JS | **Subset + wire + AP + COS import** | `forms_js`, kill switch, `CMD:FORMS_CALC`, widget `/AP`, shell Forms panel, **AcroForm leaf import on open**. Flatten/FDF full product still open. |
+| **M5** Forms JS | **Subset + wire + AP + COS import** | `forms_js`, kill switch, `CMD:FORMS_CALC`, widget `/AP`, shell Forms panel, **AcroForm leaf import on open**, fill with save and reopen, XFDF round trip, flatten. Version 2 scope. |
 | **M6** Assembly | **CLI (qpdf)** | merge / split / extract-pages / optimize + preflight honesty. Pure-Rust assembly deferred. |
-| **M7** Redaction | **CLI complete** | `redact-by-term` command with text search, content removal, verification pass, signed report. |
-| **M8** Signatures | **CLI complete** | `validate-signatures` command with ByteRange validation, DocMDP analysis, plain-language reporting. |
-| **M9** OCR | **CLI + coordinator wired** | `ocr` command with Tesseract backend, text layer generation, coordinator `ocr_page` method, `RenderPageForOcr` protocol. |
-| **M10** Compliance | **CLI complete** | `validate-pdf-a` command with level selection (1a–4), errors/warnings reporting. |
-| **M11** Plugins | **CLI complete** | `plugin-list` + `plugin-validate` commands, plugin-host with Wasmtime runtime, capability grants, circuit breaker. |
-| **M12** Compare | **CLI complete** | `compare` command with text-based document comparison, line-by-line diff. |
+| **M7** Redaction | **Not implemented** | `redact-by-term` finds matches but never saves; it reports `NOT REDACTED` and exits 1. A false "verified" result was removed 2026-07-27. Version 2 scope. |
+| **M8** Signatures | **Partial** | `validate-signatures` checks ByteRange and DocMDP, but real xref extraction is unmerged (draft PR #42), so a hash-intact signature reports `Indeterminate`, never `Valid`. No signing. Version 2 scope. |
+| **M9** OCR | **CLI + batch step; works where Tesseract is installed** | `ocr` command and batch `type=ocr` run Tesseract (an environment dependency, not vendored) in the sandboxed utility worker and write a text layer. CI requires it on three OSes. Version 2 scope. |
+| **M10** Compliance | **Heuristic only** | `validate-pdf-a` uses byte-pattern checks and reports `NO VIOLATIONS DETECTED`, explicitly not a conformance determination. No ISO 19005 validator. Version 2 scope. |
+| **M11** Plugins | **Partial** | `plugin-validate` and `plugin-list` (runtime status only; no discovery). `PluginManager::load` runs a stub, not the plugin's module (draft PRs #63, #59 open). Version 3 scope. |
+| **M12** Compare | **Text and visual compare, CLI** | LCS line diff with move detection, plus a pixel-difference measurement. Not a perceptual comparison. Version 2 scope. |
 
 Criterion-level status: [docs/milestone-exit-tracker.md](docs/milestone-exit-tracker.md).  
+Plan to the first release: [docs/roadmap-to-stable.md](docs/roadmap-to-stable.md).  
 Release checklist: [docs/release-gates.md](docs/release-gates.md).
 
 ### M0 baseline measurements — indicative, not a budget claim
