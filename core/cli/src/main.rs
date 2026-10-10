@@ -69,6 +69,7 @@ fn main() {
         "find",
         "export-text",
         "export-images",
+        "export-html",
         "optimize-preflight",
         "merge",
         "split",
@@ -114,6 +115,10 @@ fn main() {
 
     if cmd == "export-images" {
         cmd_export_images(&path, &rest);
+        return;
+    }
+    if cmd == "export-html" {
+        cmd_export_html(&path, &rest);
         return;
     }
     if cmd == "merge" {
@@ -185,6 +190,7 @@ fn usage() {
          \x20 pdf-platform find <file> <query>\n\
          \x20 pdf-platform export-text <file> [page]\n\
          \x20 pdf-platform export-images <file> -o <outdir> [--dpi N]\n\
+         \x20 pdf-platform export-html <file> -o <out.html>\n\
          \x20 pdf-platform optimize-preflight <file> [screen|print|archive]\n\
          \x20 pdf-platform merge <file1> <file2> [...] -o <out.pdf>\n\
          \x20 pdf-platform split <file> -o <outdir>\n\
@@ -646,6 +652,143 @@ fn cmd_export_images(path: &Path, rest: &[String]) {
             for file in files {
                 println!("  {}", file.display());
             }
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// One page of extracted text, as the HTML export needs it.
+struct HtmlPage {
+    number: u32,
+    reliable: bool,
+    text: String,
+}
+
+/// Escape text for an HTML body or attribute. Document text is untrusted: a
+/// page that contains `<script>` must come out as words. [NFR-SEC, GR-8]
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Build the page: plain text in extraction order, one paragraph per line.
+///
+/// No styles, scripts or external references, so opening the file transmits
+/// nothing (GR-9). A page whose text layer is flagged unreliable says so where
+/// the text is, instead of presenting it as authoritative. [FR-SRCH-5, PRIN-6]
+fn render_html(title: &str, pages: &[HtmlPage]) -> String {
+    let mut out = String::new();
+    out.push_str("<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n");
+    out.push_str(&format!("<title>{}</title>\n</head>\n<body>\n", html_escape(title)));
+    out.push_str(&format!("<h1>{}</h1>\n", html_escape(title)));
+    out.push_str(
+        "<p>Plain text in extraction order. Layout, fonts, images and document \
+         structure are not included.</p>\n",
+    );
+    for page in pages {
+        let n = page.number;
+        out.push_str(&format!(
+            "<section id=\"page-{n}\" aria-labelledby=\"page-{n}-heading\">\n\
+             <h2 id=\"page-{n}-heading\">Page {n}</h2>\n"
+        ));
+        if !page.reliable {
+            out.push_str(
+                "<p role=\"note\">The text layer of this page is flagged unreliable. Do not \
+                 treat it as authoritative; the page may need OCR.</p>\n",
+            );
+        }
+        let mut any = false;
+        for line in page.text.lines().filter(|l| !l.trim().is_empty()) {
+            any = true;
+            out.push_str(&format!("<p>{}</p>\n", html_escape(line)));
+        }
+        if !any {
+            out.push_str("<p>No text on this page.</p>\n");
+        }
+        out.push_str("</section>\n");
+    }
+    out.push_str("</body>\n</html>\n");
+    out
+}
+
+/// Export the whole document's text to one HTML file. [FR-EXPORT-1, FR-EXPORT-3]
+///
+/// The file is built in memory and written once, so a page that fails to
+/// extract leaves no half-written export behind.
+fn export_html(
+    coord: &mut coordinator::document::DocumentCoordinator,
+    out: &Path,
+    title: &str,
+) -> Result<u32, String> {
+    let count = coord.page_count();
+    let mut pages = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let model = coord
+            .get_page_text(index)
+            .map_err(|e| format!("page {}: text extraction failed: {e}", index + 1))?;
+        pages.push(HtmlPage {
+            number: index + 1,
+            reliable: model.reliable,
+            text: model.full_text(),
+        });
+    }
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(out, render_html(title, &pages))
+        .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    Ok(count)
+}
+
+/// Export text as HTML. [FR-EXPORT-1, FR-EXPORT-3]
+///
+/// Usage: pdf-platform export-html <file> -o <out.html>
+fn cmd_export_html(path: &Path, rest: &[String]) {
+    use coordinator::document::DocumentCoordinator;
+
+    let (extra, out) = match parse_dash_o(rest) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+    if !extra.is_empty() {
+        eprintln!("error: unexpected argument(s): {}", extra.join(" "));
+        process::exit(1);
+    }
+    let worker = find_worker();
+    let mut coord = match DocumentCoordinator::open(&worker, path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: open failed: {e}");
+            process::exit(2);
+        }
+    };
+    let title = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".into());
+    let result = export_html(&mut coord, &out, &title);
+    let _ = coord.close();
+    match result {
+        Ok(pages) => {
+            println!("exported {pages} page(s) to {}", out.display());
             process::exit(0);
         }
         Err(e) => {
@@ -3042,6 +3185,79 @@ mod export_tests {
         assert!(parse_export_dpi(&args(&["--dpi"])).is_err(), "a flag with no value");
         assert!(parse_export_dpi(&args(&["--dpi=300"])).is_err(), "unknown spelling");
         assert!(parse_export_dpi(&args(&["300"])).is_err(), "a stray argument");
+    }
+}
+
+#[cfg(test)]
+mod html_export_tests {
+    use super::*;
+    use coordinator::document::DocumentCoordinator;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/corpus-diff/fixtures")
+            .join(name)
+    }
+
+    fn export(name: &str) -> String {
+        let worker = find_worker();
+        let mut coord = DocumentCoordinator::open(&worker, &fixture(name)).expect("open");
+        let out = std::env::temp_dir().join(format!("pdf-platform-html-{name}.html"));
+        let _ = std::fs::remove_file(&out);
+        export_html(&mut coord, &out, "doc").expect("export");
+        let _ = coord.close();
+        let html = std::fs::read_to_string(&out).expect("read export");
+        let _ = std::fs::remove_file(&out);
+        html
+    }
+
+    #[test]
+    fn the_words_of_the_page_come_out_in_reading_order() {
+        // text-latin.pdf draws "Hello extraction" and then "second line here".
+        let html = export("text-latin.pdf");
+        let first = html.find("<p>Hello extraction</p>").expect("first line missing");
+        let second = html.find("<p>second line here</p>").expect("second line missing");
+        assert!(first < second, "the lines came out in the wrong order");
+        assert_eq!(html.matches("<section").count(), 1, "one page, one section");
+    }
+
+    #[test]
+    fn an_unreliable_page_says_so_and_a_reliable_one_does_not() {
+        let unreliable = export("text-unreliable.pdf");
+        let reliable = export("text-latin.pdf");
+        assert!(
+            unreliable.contains("flagged unreliable"),
+            "the page with a private-use mapping was presented as authoritative"
+        );
+        assert!(
+            !reliable.contains("flagged unreliable"),
+            "a good page was flagged"
+        );
+    }
+
+    #[test]
+    fn every_page_gets_a_section_even_when_it_has_no_text() {
+        let html = export("valid-3page.pdf");
+        assert_eq!(html.matches("<section").count(), 3);
+        assert_eq!(html.matches("No text on this page.").count(), 3);
+        let p1 = html.find("id=\"page-1\"").unwrap();
+        let p2 = html.find("id=\"page-2\"").unwrap();
+        let p3 = html.find("id=\"page-3\"").unwrap();
+        assert!(p1 < p2 && p2 < p3, "pages are out of order");
+    }
+
+    #[test]
+    fn document_text_cannot_inject_markup() {
+        let pages = [HtmlPage {
+            number: 1,
+            reliable: true,
+            text: "<script>alert(1)</script> & \"quoted\"".into(),
+        }];
+        let html = render_html("a<b>&\"", &pages);
+        assert!(!html.contains("<script>"), "page text became live markup");
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quoted&quot;"));
+        assert!(html.contains("<title>a&lt;b&gt;&amp;&quot;</title>"), "the title was not escaped");
+        assert!(!html.contains("http://") && !html.contains("https://"), "no external references");
     }
 }
 
