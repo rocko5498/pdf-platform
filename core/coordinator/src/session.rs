@@ -122,12 +122,40 @@ pub struct PageRasterResult {
     pub pixels: Vec<u8>,
 }
 
-/// Minimal base64 decoder.
-fn base64_decode(input: &str) -> Vec<u8> {
+/// Decode the worker's padded base64.
+///
+/// This used to trim the `=` padding and then decode with the padded alphabet,
+/// which rejects the result, and `unwrap_or_default()` turned the rejection
+/// into an empty raster: any page whose pixel count was not a multiple of 3
+/// came back as zero bytes with plausible dimensions. A failure is now an
+/// error. [GR-8, PRIN-1]
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD
-        .decode(input.trim_end_matches('='))
-        .unwrap_or_default()
+        .decode(input)
+        .map_err(|e| format!("pixel data was not valid base64: {e}"))
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::base64_decode;
+
+    #[test]
+    fn what_the_worker_encodes_decodes_back_at_every_length() {
+        // The worker encodes pixels with the padded STANDARD alphabet. A raster
+        // is width*height*4 bytes, which is a multiple of 3 only when the pixel
+        // count is, so most real pages arrive padded. [FR-OCR-1, FR-CMP-1, GR-8]
+        use base64::Engine;
+        for len in 0..=12usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + 1) as u8).collect();
+            let wire = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            assert_eq!(
+                base64_decode(&wire).expect("valid base64"),
+                bytes,
+                "{len} bytes encoded as '{wire}' did not decode back"
+            );
+        }
+    }
 }
 
 fn parse_line_geom(g: &str) -> Option<engine_api::extract::TextLine> {
@@ -468,7 +496,7 @@ impl WorkerSession {
                 pixels_b64,
             }) if cid == correlation_id && pi == page_index => {
                 // Decode base64 pixels.
-                let pixels = base64_decode(&pixels_b64);
+                let pixels = base64_decode(&pixels_b64).map_err(SessionError::Protocol)?;
                 Ok(PageRasterResult {
                     page_index,
                     width,
