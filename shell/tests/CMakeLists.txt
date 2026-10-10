@@ -50,9 +50,53 @@ if(DEFINED WORKER_BIN AND EXISTS "${WORKER_BIN}")
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
         TIMEOUT 120
     )
+    # Printing reaches the output: print to a PDF, reopen it with the product's
+    # own engine, look at the pixels. Needs the worker for the same reason the
+    # tile test does. [FR-PRINT-1, FR-PRINT-3, T-10, T-12]
+    add_executable(shell-print-roundtrip-test
+        print_roundtrip_test.cc
+    )
+    target_link_libraries(shell-print-roundtrip-test PRIVATE
+        shell-print
+        shell-bridge
+        Qt6::Test
+        Qt6::Widgets
+        Qt6::PrintSupport
+    )
+    target_compile_definitions(shell-print-roundtrip-test PRIVATE
+        PDF_PLATFORM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/../tools/corpus-diff/fixtures"
+    )
+    add_custom_command(TARGET shell-print-roundtrip-test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${WORKER_BIN}"
+                "$<TARGET_FILE_DIR:shell-print-roundtrip-test>"
+        COMMENT "Staging worker binary beside the print round-trip test"
+    )
+    add_test(NAME shell.print_roundtrip COMMAND shell-print-roundtrip-test)
+    set_tests_properties(shell.print_roundtrip PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
+        TIMEOUT 180
+    )
 else()
     message(STATUS "shell.canvas_tile skipped: WORKER_BIN not set or missing")
 endif()
+
+# Pure layout geometry: no worker, so it runs on every build. [FR-PRINT-2, T-10]
+add_executable(shell-print-layout-test
+    print_layout_test.cc
+)
+target_link_libraries(shell-print-layout-test PRIVATE
+    shell-print
+    Qt6::Test
+    Qt6::Widgets
+    Qt6::PrintSupport
+)
+add_test(NAME shell.print_layout COMMAND shell-print-layout-test)
+set_tests_properties(shell.print_layout PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
+)
 
 # ADR-032: bindings live in ui-registry.toml, not in C++. The rebinding test is
 # the one that can tell the difference. [ADR-032, T-8]

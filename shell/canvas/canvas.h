@@ -135,6 +135,8 @@ private:
     void buildMenuBar();
     void openDocumentViaDialog();
     void closeCurrentDocument();
+    /// File ▸ Print: the native dialog, then the pages it names. [FR-PRINT-1, DS-FLOW-PRINT]
+    void printDocument();
     void quitApplication();
     void zoomIn();
     void zoomOut();

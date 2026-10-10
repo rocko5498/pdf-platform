@@ -1,7 +1,7 @@
 # Shortcut and menu registry. [ADR-032, ADR-030, PRIN-4]
 # CI will reject any PR that bumps schema_version without a corresponding migration.
 schema_version = 1
-profile_version = "0.2.0"
+profile_version = "0.3.0"
 
 # ---------------------------------------------------------------------------
 # Shortcuts — M1 chrome set. [UX-KEY-1, DS-PHIL-5]
@@ -36,6 +36,12 @@ export_xfdf     = { key = "Ctrl+E", action = "annot.export" }
 activate        = { key = "Return", action = "ui.activate", alternates = ["Enter"] }
 delete_selected = { key = "Delete", action = "annot.delete" }
 
+# Added at 0.3.0: File ▸ Print and its key, which DS-FLOW-PRINT and DS-QAT-2
+# name and nothing declared. A new binding and a new menu item change both
+# [shortcuts] and [[menus]], which ADR-032 says bumps the profile.
+# No existing key or item moved. [ADR-032, ADR-030, DS-FLOW-PRINT, FR-PRINT-1]
+print_document  = { key = "Ctrl+P", action = "document.print" }
+
 # ---------------------------------------------------------------------------
 # Menus — M1 taxonomy (Acrobat-familiar). [DS-MENU-*, PRIN-4]
 # ---------------------------------------------------------------------------
@@ -45,6 +51,7 @@ title = "&File"
 items = [
   { action = "document.open",  title = "&Open…",     shortcut = "Ctrl+O" },
   { action = "document.close", title = "&Close",     shortcut = "Ctrl+W" },
+  { action = "document.print", title = "&Print…",    shortcut = "Ctrl+P" },
   { separator = true },
   { action = "app.quit",       title = "E&xit",      shortcut = "Ctrl+Q" },
 ]

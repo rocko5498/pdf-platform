@@ -8,6 +8,7 @@
 #include "diagnostics_panel.h"
 #include "forms_panel.h"
 #include "outline_panel.h"
+#include "print_job.h"
 #include "search_panel.h"
 
 #include <QAccessible>
@@ -28,6 +29,8 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPrintDialog>
+#include <QPrinter>
 #include <QStatusBar>
 #include <QTextStream>
 #include <QWheelEvent>
@@ -832,6 +835,7 @@ const QHash<QString, MainWindow::ActionHandler>& MainWindow::actionTable() {
     static const QHash<QString, ActionHandler> handlers = {
         {QStringLiteral("document.open"), &MainWindow::openDocumentViaDialog},
         {QStringLiteral("document.close"), &MainWindow::closeCurrentDocument},
+        {QStringLiteral("document.print"), &MainWindow::printDocument},
         {QStringLiteral("app.quit"), &MainWindow::quitApplication},
         {QStringLiteral("view.zoom_in"), &MainWindow::zoomIn},
         {QStringLiteral("view.zoom_out"), &MainWindow::zoomOut},
@@ -858,6 +862,59 @@ void MainWindow::triggerAction(const QString& action) {
 void MainWindow::closeCurrentDocument() {
     clearDocumentUi();
     setWindowTitle(QStringLiteral("PDF Platform — no document"));
+}
+
+void MainWindow::printDocument() {
+    if (page_count_ == 0 || !shmem_mapping_) {
+        statusBar()->showMessage(QStringLiteral("Open a document to print it."), 4000);
+        return;
+    }
+
+    QPrinter printer(QPrinter::HighResolution);
+    QPrintDialog dialog(&printer, this);
+    dialog.setWindowTitle(QStringLiteral("Print"));
+    dialog.setOption(QAbstractPrintDialog::PrintPageRange);
+    dialog.setOption(QAbstractPrintDialog::PrintCurrentPage);
+    dialog.setMinMax(1, int(page_count_));
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    PrintOptions options;
+    switch (printer.printRange()) {
+        case QPrinter::PageRange:
+            options.first_page = uint32_t(qMax(1, printer.fromPage()) - 1);
+            options.last_page = uint32_t(qMax(1, printer.toPage()) - 1);
+            break;
+        case QPrinter::CurrentPage:
+            options.first_page = options.last_page = current_page_;
+            break;
+        default:
+            options.first_page = 0;
+            options.last_page = page_count_ - 1;
+            break;
+    }
+    // The native dialog has no fit/actual/custom control, so V1 fits the page
+    // to the sheet. The other modes are implemented and tested in print_job and
+    // are not yet reachable from here. [FR-PRINT-2, GR-8]
+    options.scale = PrintScale::FitPage;
+
+    PageSource source;
+    source.shared_region = shmem_mapping_;
+    source.page_count = page_count_;
+    source.page_width_pt = page_width_;
+    source.page_height_pt = page_height_;
+
+    QString error;
+    statusBar()->showMessage(QStringLiteral("Printing…"));
+    if (!printPages(printer, source, options, &generation_, &error)) {
+        // Surface the reason verbatim and let the user retry. [DS-FLOW-PRINT, GR-8]
+        QMessageBox::warning(this, QStringLiteral("Print failed"), error);
+        statusBar()->clearMessage();
+        return;
+    }
+    statusBar()->showMessage(QStringLiteral("Sent pages %1 to %2 to the printer.")
+                                 .arg(options.first_page + 1)
+                                 .arg(options.last_page + 1),
+                             5000);
 }
 
 void MainWindow::quitApplication() { close(); }
