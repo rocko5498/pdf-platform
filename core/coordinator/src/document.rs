@@ -14,7 +14,8 @@ use pdf_model::command::{CommandGroup, SetObjectCommand};
 use pdf_model::journal::UndoJournal;
 use pdf_model::overlay::CowOverlay;
 use pdf_model::organize::{
-    build_crop_pages_group, build_delete_pages_group, build_rotate_pages_group, effective_media_box,
+    build_crop_pages_group, build_delete_pages_group, build_duplicate_pages_group, build_insert_blank_group,
+    build_move_pages_group, build_rotate_pages_group, effective_media_box,
     effective_rotation, kid_references, leaf_pages, PageTreeNode,
 };
 use pdf_model::stamp::{Stamp, StampPosition};
@@ -543,6 +544,36 @@ impl DocumentCoordinator {
         self.apply_command_group(group)
     }
 
+    /// Move pages so the first lands at zero-based position `to` of the result.
+    /// One undoable edit. [FR-ORG-1]
+    pub fn move_pages(&mut self, page_indices: &[u32], to: u32) -> Result<(), SessionError> {
+        let nodes = self.page_tree()?;
+        let group = build_move_pages_group(&nodes, page_indices, to).map_err(SessionError::Protocol)?;
+        self.apply_command_group(group)
+    }
+
+    /// Duplicate pages, each copy right after its original. One undoable edit.
+    /// [FR-ORG-1]
+    pub fn duplicate_pages(&mut self, page_indices: &[u32]) -> Result<(), SessionError> {
+        let nodes = self.page_tree()?;
+        let (group, next) = build_duplicate_pages_group(&nodes, page_indices, self.next_obj_num)
+            .map_err(SessionError::Protocol)?;
+        self.apply_command_group(group)?;
+        self.next_obj_num = next;
+        Ok(())
+    }
+
+    /// Insert a blank page so it becomes zero-based page `at`; `size` is
+    /// (width, height) in points, else the neighbouring page's. One undoable
+    /// edit. [FR-ORG-1]
+    pub fn insert_blank_page(&mut self, at: u32, size: Option<[f64; 2]>) -> Result<(), SessionError> {
+        let nodes = self.page_tree()?;
+        let (group, next) = build_insert_blank_group(&nodes, at, size, self.next_obj_num)
+            .map_err(SessionError::Protocol)?;
+        self.apply_command_group(group)?;
+        self.next_obj_num = next;
+        Ok(())
+    }
     /// The page objects at the given zero-based indices, or an error naming the
     /// first index that is not in the document.
     fn pages_at(leaves: &[u32], page_indices: &[u32]) -> Result<Vec<u32>, SessionError> {

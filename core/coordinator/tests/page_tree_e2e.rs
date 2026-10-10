@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{inherited_box_pdf, inherited_rotation_pdf, nested_numbered_pdf, page_markers, scratch, worker_path};
+use common::{inherited_box_pdf, inherited_rotation_pdf, nested_numbered_pdf, numbered_pdf, page_markers, scratch, worker_path};
 use coordinator::document::DocumentCoordinator;
 
 fn write(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -214,5 +214,85 @@ fn a_crop_is_checked_against_the_media_box_the_page_inherits() {
     assert!(error.contains("media box"), "{error}");
     assert!(coord.crop_pages(&[0], [10.0, 10.0, 290.0, 390.0]).is_ok(), "a box inside the inherited one is fine");
     let _ = coord.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_page_moves_to_the_front_of_a_flat_document() {
+    let dir = scratch("tree-move-flat");
+    let input = write(&dir, "in.pdf", &numbered_pdf(3));
+    let output = dir.join("out.pdf");
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &input).expect("open");
+    coord.move_pages(&[2], 0).expect("move page 3 to the front");
+    coord.save_incremental(&output).expect("save");
+    let _ = coord.close();
+
+    assert_eq!(page_markers(&output), ["PAGEMARK3", "PAGEMARK1", "PAGEMARK2"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_move_inside_one_branch_works_and_a_move_across_branches_is_refused() {
+    let dir = scratch("tree-move-nested");
+    let input = write(&dir, "in.pdf", &nested_numbered_pdf());
+    let output = dir.join("out.pdf");
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &input).expect("open");
+    coord.move_pages(&[1], 0).expect("swap the two pages of branch A");
+    let error = coord.move_pages(&[0], 3).unwrap_err().to_string();
+    assert!(error.contains("branch"), "{error}");
+    coord.save_incremental(&output).expect("save");
+    let _ = coord.close();
+
+    assert_eq!(
+        page_markers(&output),
+        ["PAGEMARK2", "PAGEMARK1", "PAGEMARK3", "PAGEMARK4"],
+        "the refused move must have changed nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn duplicating_a_page_puts_a_copy_right_after_it() {
+    let dir = scratch("tree-duplicate");
+    let flat = write(&dir, "flat.pdf", &numbered_pdf(3));
+    let nested = write(&dir, "nested.pdf", &nested_numbered_pdf());
+    let (flat_out, nested_out) = (dir.join("flat-out.pdf"), dir.join("nested-out.pdf"));
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &flat).expect("open");
+    coord.duplicate_pages(&[2]).expect("duplicate page 3");
+    coord.save_incremental(&flat_out).expect("save");
+    let _ = coord.close();
+    assert_eq!(page_markers(&flat_out), ["PAGEMARK1", "PAGEMARK2", "PAGEMARK3", "PAGEMARK3"]);
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &nested).expect("open");
+    coord.duplicate_pages(&[2]).expect("duplicate page 3 of a nested document");
+    coord.save_incremental(&nested_out).expect("save");
+    let _ = coord.close();
+    assert_eq!(
+        page_markers(&nested_out),
+        ["PAGEMARK1", "PAGEMARK2", "PAGEMARK3", "PAGEMARK3", "PAGEMARK4"]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_blank_page_is_inserted_where_asked_and_is_actually_blank() {
+    let dir = scratch("tree-blank");
+    let input = write(&dir, "in.pdf", &numbered_pdf(3));
+    let output = dir.join("out.pdf");
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &input).expect("open");
+    coord.insert_blank_page(1, None).expect("insert a blank page as page 2");
+    coord.save_incremental(&output).expect("save");
+    let _ = coord.close();
+
+    assert_eq!(page_markers(&output), ["PAGEMARK1", "<none>", "PAGEMARK2", "PAGEMARK3"]);
+    let mut reopened = DocumentCoordinator::open(&worker_path(), &output).expect("reopen");
+    let blank = reopened.render_page(1, 1.0).expect("render the blank page");
+    let _ = reopened.close();
+    assert_eq!((blank.width, blank.height), (612, 792), "it takes its neighbour's size");
+    assert!(blank.pixels.chunks(4).all(|p| p[..3] == [255, 255, 255]), "the new page is not white");
     let _ = std::fs::remove_dir_all(&dir);
 }
