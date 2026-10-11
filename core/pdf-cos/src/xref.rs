@@ -368,7 +368,12 @@ pub fn reconstruct_xref(data: &[u8], leniency: &mut Vec<LeniencyEvent>) -> XrefT
             // Found " obj" — check if it's preceded by "N G" (object header).
             if i >= 3 {
                 // Walk backwards to find the start of the line.
-                let line_start = data[..i].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+                // A line starts after a LF or a lone CR: old Mac-style files use
+                // CR alone, and with only LF every object in them was invisible.
+                let line_start = data[..i]
+                    .iter()
+                    .rposition(|&b| b == b'\n' || b == b'\r')
+                    .map_or(0, |p| p + 1);
                 let header = &data[line_start..i];
 
                 // Parse "N G" from the header.
@@ -954,5 +959,21 @@ mod tests {
         let table = reconstruct_xref(data, &mut leniency);
         assert!(table.entries.len() < 70_000, "{} entries", table.entries.len());
         assert!(table.entries.get(1).is_some_and(|e| e.in_use), "the real object 1 is still found");
+    }
+
+    /// Old Mac-style files end every line with a lone CR. Reconstruction looked
+    /// only for LF, so it found a fraction of their objects and edits to them
+    /// were refused with "object N not found" (pdf.js corpus: ThuluthFeatures,
+    /// devicen). [FR-VIEW-2, SDS §10.4]
+    #[test]
+    fn reconstruction_finds_objects_in_a_file_with_cr_only_line_endings() {
+        let data = b"%PDF-1.3\r1 0 obj\r<< /Type /Catalog /Pages 2 0 R >>\rendobj\r\
+2 0 obj\r<< /Type /Pages /Kids [3 0 R] /Count 1 >>\rendobj\r\
+3 0 obj\r<< /Type /Page /Parent 2 0 R >>\rendobj\r";
+        let mut leniency = Vec::new();
+        let table = reconstruct_xref(data, &mut leniency);
+        for n in 1..=3 {
+            assert!(table.entries.get(n).is_some_and(|e| e.in_use), "object {n} not found");
+        }
     }
 }

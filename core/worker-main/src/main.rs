@@ -822,13 +822,6 @@ fn handle_get_object(
     };
 
     // Find startxref offset (scan last 1024 bytes).
-    let xref_offset = match find_startxref(&map) {
-        Some(off) => off,
-        None => {
-            send_error(transport, correlation_id, "no startxref found");
-            return;
-        }
-    };
 
     // Parse the xref table to get object offsets.
     // The whole /Prev chain. This used to be a private copy of the parser
@@ -836,7 +829,7 @@ fn handle_get_object(
     // incremental update — the shape of every third-party signed, commented
     // or filled PDF — could not be fetched. [FR-VIEW-2, SDS §3.1]
     let mut leniency = Vec::new();
-    let entries = match pdf_cos::scan::parse_xref_chain(&map, xref_offset, &mut leniency) {
+    let entries = match pdf_cos::scan::load_xref(&map, &mut leniency) {
         Ok(entries) => entries,
         Err(error) => {
             send_error(transport, correlation_id, &format!("failed to parse xref: {error:?}"));
@@ -851,7 +844,7 @@ fn handle_get_object(
     // former, and it terminated objects with a `windows(7)` scan for the
     // six-byte `endobj` — the match never fired, so every object ran to the
     // 4096-byte fallback or to end of file. [SDS §3.1, PRIN-1, GR-8]
-    let Some(data) = pdf_cos::scan::fetch_object_bytes(&map, &entries, obj_num) else {
+    let Some(data) = pdf_cos::scan::fetch_object_checked(&map, &entries, obj_num, &mut leniency) else {
         send_error(
             transport,
             correlation_id,
@@ -871,28 +864,6 @@ fn handle_get_object(
     }
 }
 
-/// Scan last 1024 bytes for `startxref\n<N>`, return N as a file offset.
-fn find_startxref(data: &[u8]) -> Option<usize> {
-    const NEEDLE: &[u8] = b"startxref";
-    let search_start = data.len().saturating_sub(1024);
-    let tail = &data[search_start..];
-    let mut last = None;
-    for i in 0..=tail.len().saturating_sub(NEEDLE.len()) {
-        if &tail[i..i + NEEDLE.len()] == NEEDLE {
-            last = Some(i);
-        }
-    }
-    let pos = last?;
-    let mut i = pos + NEEDLE.len();
-    while i < tail.len() && matches!(tail[i], b' ' | b'\r' | b'\n') {
-        i += 1;
-    }
-    let start = i;
-    while i < tail.len() && tail[i].is_ascii_digit() {
-        i += 1;
-    }
-    std::str::from_utf8(&tail[start..i]).ok()?.parse().ok()
-}
 
 
 
