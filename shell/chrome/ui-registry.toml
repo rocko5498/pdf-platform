@@ -1,7 +1,7 @@
 # Shortcut and menu registry. [ADR-032, ADR-030, PRIN-4]
 # CI will reject any PR that bumps schema_version without a corresponding migration.
 schema_version = 1
-profile_version = "0.3.0"
+profile_version = "0.4.0"
 
 # ---------------------------------------------------------------------------
 # Shortcuts — M1 chrome set. [UX-KEY-1, DS-PHIL-5]
@@ -42,6 +42,12 @@ delete_selected = { key = "Delete", action = "annot.delete" }
 # No existing key or item moved. [ADR-032, ADR-030, DS-FLOW-PRINT, FR-PRINT-1]
 print_document  = { key = "Ctrl+P", action = "document.print" }
 
+# Added at 0.4.0: Previous View / Next View, which FR-NAV-3 and DS-HIST-1 name
+# (Alt+Left / Alt+Right, Acrobat-classic) and nothing declared. No existing key
+# or item moved. [ADR-032, ADR-030, FR-NAV-3, DS-HIST-1, DS-PHIL-1]
+previous_view   = { key = "Alt+Left", action = "nav.prev_view" }
+next_view       = { key = "Alt+Right", action = "nav.next_view" }
+
 # ---------------------------------------------------------------------------
 # Menus — M1 taxonomy (Acrobat-familiar). [DS-MENU-*, PRIN-4]
 # ---------------------------------------------------------------------------
@@ -73,4 +79,7 @@ items = [
   { action = "nav.prev_page",  title = "&Previous Page", shortcut = "PageUp" },
   { action = "nav.first_page", title = "&First Page",    shortcut = "Home" },
   { action = "nav.last_page",  title = "&Last Page",     shortcut = "End" },
+  { separator = true },
+  { action = "nav.prev_view",  title = "Pre&vious View", shortcut = "Alt+Left" },
+  { action = "nav.next_view",  title = "Ne&xt View",     shortcut = "Alt+Right" },
 ]

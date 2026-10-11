@@ -487,6 +487,8 @@ bool MainWindow::openDocumentWithPassword(const QString& path, const QString& pa
         thumbs_->setDocument(int(page_count_), QSizeF(page_width_, page_height_));
         thumbs_->setCurrentPage(0);
     }
+    view_history_.clear();
+    view_history_.visit({0, scale_});
     announceDocumentStatus();
     canvas_->setFocus(Qt::OtherFocusReason);
     statusBar()->showMessage(
@@ -780,6 +782,7 @@ void MainWindow::clearDocumentUi() {
     if (thumbs_) {
         thumbs_->clear();
     }
+    view_history_.clear();
     if (diagnostics_) {
         diagnostics_->clear();
     }
@@ -825,13 +828,34 @@ void MainWindow::goToPage(int page) {
     canvas_->clearSelectionOverlay();
     renderCurrentPage();
     if (thumbs_) thumbs_->setCurrentPage(page);
+    if (!restoring_view_) view_history_.visit({page, scale_});
     announceDocumentStatus();
+}
+
+void MainWindow::goToPreviousView() {
+    if (const auto view = view_history_.back()) {
+        restoring_view_ = true;
+        goToPage(view->page);
+        applyScale(view->scale);
+        restoring_view_ = false;
+    }
+}
+
+void MainWindow::goToNextView() {
+    if (const auto view = view_history_.forward()) {
+        restoring_view_ = true;
+        goToPage(view->page);
+        applyScale(view->scale);
+        restoring_view_ = false;
+    }
 }
 
 void MainWindow::applyScale(float scale) {
     scale_ = scale;
     if (scale_ < 0.25f) scale_ = 0.25f;
     if (scale_ > 8.f) scale_ = 8.f;
+    // The zoom belongs to the entry for the page being read.
+    if (!restoring_view_ && page_count_ > 0) view_history_.visit({int(current_page_), scale_});
     clampScroll();
     renderVisibleTiles();
     // Live a11y announcement for zoom change. [DS-A11Y-SR-2, NFR-A11Y]
@@ -884,6 +908,8 @@ const QHash<QString, MainWindow::ActionHandler>& MainWindow::actionTable() {
         {QStringLiteral("nav.prev_page"), &MainWindow::goToPreviousPage},
         {QStringLiteral("nav.first_page"), &MainWindow::goToFirstPage},
         {QStringLiteral("nav.last_page"), &MainWindow::goToLastPage},
+        {QStringLiteral("nav.prev_view"), &MainWindow::goToPreviousView},
+        {QStringLiteral("nav.next_view"), &MainWindow::goToNextView},
     };
     return handlers;
 }

@@ -147,3 +147,18 @@ set_tests_properties(shell.thumbnail_panel PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
 )
+
+# Previous View / Next View. [FR-NAV-3, T-10]
+add_executable(shell-view-history-test
+    view_history_test.cc
+)
+target_link_libraries(shell-view-history-test PRIVATE
+    shell-canvas
+    Qt6::Test
+    Qt6::Widgets
+)
+add_test(NAME shell.view_history COMMAND shell-view-history-test)
+set_tests_properties(shell.view_history PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
+)

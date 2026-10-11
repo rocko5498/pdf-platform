@@ -11,6 +11,8 @@
 #include <QWidget>
 #include <optional>
 
+#include "view_history.h"
+
 #if defined(PDF_PLATFORM_USE_OPENGL) && PDF_PLATFORM_USE_OPENGL
 #  include <QOpenGLFunctions>
 #  include <QOpenGLWidget>
@@ -145,6 +147,9 @@ private:
     void goToPreviousPage();
     void goToFirstPage();
     void goToLastPage();
+    /// Previous View / Next View. [FR-NAV-3, DS-HIST-1]
+    void goToPreviousView();
+    void goToNextView();
     void applyScale(float scale);
     bool openDocumentWithPassword(const QString& path, const QString& password, bool* needs_password = nullptr);
     bool renderCurrentPage();
@@ -171,6 +176,8 @@ private:
     uint32_t page_count_ = 0;
     uint32_t current_page_ = 0;
     float scale_ = 1.0f;
+    ViewHistory view_history_;
+    bool restoring_view_ = false;
     float page_width_ = 595.f;
     float page_height_ = 842.f;
     float scroll_y_ = 0.f;
