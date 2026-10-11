@@ -88,6 +88,7 @@ cargo run -p cli --bin pdf-platform -- crop in.pdf --pages 1 --box 10,10,500,700
 cargo run -p cli --bin pdf-platform -- move-pages in.pdf --pages 3 --to 1 -o out.pdf
 cargo run -p cli --bin pdf-platform -- duplicate-pages in.pdf --pages 2 -o out.pdf
 cargo run -p cli --bin pdf-platform -- insert-blank in.pdf --at 2 -o out.pdf
+cargo run -p cli --bin pdf-platform -- insert-pages in.pdf --from other.pdf --range 1-2 --at 3 -o out.pdf   # via qpdf; rewritten copy
 cargo run -p cli --bin pdf-platform -- export-images in.pdf -o images/ --dpi 150
 cargo run -p cli --bin pdf-platform -- export-html in.pdf -o out.html
 cargo run -p cli --bin pdf-platform -- redact-by-term doc.pdf --term "SECRET"
