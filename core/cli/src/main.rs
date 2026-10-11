@@ -356,6 +356,13 @@ fn print_recovery_notice(path: &Path) {
     }
 }
 
+/// Whether the catalog marks the document tagged, from the same scan the
+/// summary uses. `false` when the file cannot be scanned: the summary reports
+/// that failure itself. [FR-A11Y-1]
+fn is_tagged(path: &Path) -> bool {
+    pdf_cos::scan::scan_structure(path).is_ok_and(|s| s.is_tagged)
+}
+
 fn cmd_summary(path: &Path) {
     match coordinator::inspect::inspect(path) {
         Ok(s) if json_mode() => {
@@ -367,6 +374,7 @@ fn cmd_summary(path: &Path) {
                     "xfa": s.has_xfa,
                     "javascript": s.has_js,
                     "signatures": s.sig_count,
+                    "tagged": is_tagged(path),
                     "leniency": s.leniency_events,
                 })
             );
@@ -378,6 +386,7 @@ fn cmd_summary(path: &Path) {
             println!("XFA:        {}", yn(s.has_xfa));
             println!("JavaScript: {}", yn(s.has_js));
             println!("Signatures: {}", s.sig_count);
+            println!("Tagged:     {}", yn(is_tagged(path)));
             if s.leniency_count == 0 {
                 println!("Leniency:   0 repairs");
             } else {

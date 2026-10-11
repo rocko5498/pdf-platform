@@ -199,3 +199,50 @@ fn the_reading_order_follows_the_tree_and_an_untagged_file_is_refused() {
     assert!(stderr.contains("not tagged"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_summary_says_whether_the_document_is_tagged() {
+    let dir = std::env::temp_dir().join(format!("pdfp-tagged-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A document with a structure tree and /MarkInfo << /Marked true >> is tagged.
+    let file = dir.join("t.pdf");
+    std::fs::write(&file, tagged_with_markinfo()).unwrap();
+    let (code, stdout, _) = run(&[file.to_str().unwrap(), "--json"]);
+    assert_eq!(code, 0);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["tagged"], true);
+
+    let plain = fixture("valid-3page.pdf");
+    let (_, stdout, _) = run(&[plain.to_str().unwrap(), "--json"]);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["tagged"], false);
+    let (_, prose, _) = run(&[plain.to_str().unwrap()]);
+    assert!(prose.contains("Tagged:     no"), "{prose}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A minimal tagged document: marked, with a structure tree.
+fn tagged_with_markinfo() -> Vec<u8> {
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 4 0 R /MarkInfo << /Marked true >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R >>",
+        "<< /Type /StructTreeRoot >>",
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend(format!("{} 0 obj\n{body}\nendobj\n", i + 1).bytes());
+    }
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+    for o in offsets {
+        out.extend(format!("{o:010} 00000 n \n").bytes());
+    }
+    out.extend(
+        format!("trailer\n<</Size {} /Root 1 0 R>>\nstartxref\n{xref}\n%%EOF", objects.len() + 1).bytes(),
+    );
+    out
+}
