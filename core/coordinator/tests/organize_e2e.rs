@@ -157,3 +157,62 @@ fn duplicating_a_page_with_links_copies_the_links() {
     assert_eq!(String::from_utf8_lossy(&pages.stdout).trim(), "2");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A source whose `startxref` points past the end of the file (a truncated
+/// download) is rebuilt on open. Saving must then write a complete table; an
+/// update chained to the bogus offset leaves a file that knows only the new
+/// objects. Found by the pdf.js corpus edit sweep. [FR-SAVE, SDS §10.4, T-12]
+#[test]
+fn saving_a_file_whose_startxref_is_bogus_keeps_every_object_reachable() {
+    if !common::qpdf_or_skip() {
+        return;
+    }
+    let dir = scratch("organize-bogus-startxref");
+    // A reduced test file as found in the pdf.js corpus: the cross-reference
+    // table is still there but describes a larger original (every offset is
+    // wrong for this file), and `startxref` points past the end.
+    let full = numbered_pdf(3);
+    // "\nxref\n", not "xref\n": the latter also matches inside "startxref\n".
+    let table = 1 + full.windows(6).rposition(|w| w == b"\nxref\n").expect("xref table");
+    let text = String::from_utf8_lossy(&full[table..]).into_owned();
+    let mut stale = String::new();
+    for line in text.lines() {
+        if line.ends_with(" 00000 n ") || line.ends_with(" 00000 n") {
+            let offset: u32 = line[..10].parse().expect("offset");
+            stale.push_str(&format!("{:010} 00000 n \n", offset + 1000));
+        } else if line.starts_with("startxref") {
+            stale.push_str("startxref\n9999999\n");
+            break;
+        } else {
+            stale.push_str(line);
+            stale.push('\n');
+        }
+    }
+    stale.push_str("%%EOF\n");
+    let mut bytes = full[..table].to_vec();
+    bytes.extend_from_slice(stale.as_bytes());
+    let source = dir.join("bogus.pdf");
+    std::fs::write(&source, &bytes).expect("write");
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &source).expect("open a file that needs repair");
+    coord.insert_blank_page(0, None).expect("insert");
+    let saved = dir.join("out.pdf");
+    coord.save_incremental(&saved).expect("save");
+    let _ = coord.close();
+
+    // The artefact: the update's own trailer must not chain to the bogus
+    // offset, and its table must list the source's objects as well as the new
+    // one, because there is no earlier section to inherit them from.
+    let out = String::from_utf8_lossy(&std::fs::read(&saved).unwrap()).into_owned();
+    let last_xref = out.rfind("\nxref\n").expect("an appended xref section");
+    let appended = &out[last_xref..];
+    assert!(!appended.contains("/Prev"), "chained to the damaged source's startxref: {appended}");
+    assert!(appended.matches(" 00000 n").count() >= 4, "the table is not complete: {appended}");
+
+    let pages = std::process::Command::new("qpdf").arg("--show-npages").arg(&saved).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&pages.stdout).trim(), "4", "qpdf does not see all four pages");
+    let mut reopened = DocumentCoordinator::open(&worker_path(), &saved).expect("reopen");
+    assert_eq!(reopened.page_count(), 4);
+    let _ = reopened.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
