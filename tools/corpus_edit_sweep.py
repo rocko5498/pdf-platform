@@ -42,7 +42,13 @@ OPS = {
     "duplicate": (["duplicate-pages", "{src}", "--pages", "1", "-o", "{out}"], lambda n: n + 1),
     "blank": (["insert-blank", "{src}", "--at", "1", "-o", "{out}"], lambda n: n + 1),
     "delete": (["delete-pages", "{src}", "--pages", "1", "-o", "{out}"], lambda n: n - 1),
+    "move": (["move-pages", "{src}", "--pages", "2", "--to", "1", "-o", "{out}"], lambda n: n),
+    "extract": (["extract-pages", "{src}", "1", "1", "-o", "{out}"], lambda n: 1),
+    "stamp": (["stamp", "{src}", "--text", "DRAFT", "-o", "{out}"], lambda n: n),
+    "sanitize": (["sanitize", "{src}", "-o", "{out}"], lambda n: n),
 }
+# Operations that need more than one page to mean anything.
+MIN_PAGES = {"delete": 2, "move": 2}
 
 
 def cli_binary() -> Path:
@@ -72,7 +78,7 @@ def attempt(exe, qpdf, src, op, workdir, timeout):
     n = npages(qpdf, src, timeout)
     # A page count in the billions is qpdf describing a fuzzed file, not a
     # document anyone could compare against.
-    if n is None or n < 1 or n > 100_000 or (op == "delete" and n < 2):
+    if n is None or n < 1 or n > 100_000 or n < MIN_PAGES.get(op, 1):
         return None
     out = workdir / f"{src.stem}-{op}.pdf"
     cmd = [exe] + [a.format(src=src, out=out) for a in args]

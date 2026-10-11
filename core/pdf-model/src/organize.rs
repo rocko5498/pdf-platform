@@ -99,6 +99,21 @@ fn entry_value(bytes: &[u8], key: &str) -> Option<String> {
 /// ancestor's. `/MediaBox`, `/CropBox`, `/Rotate` and `/Resources` are inherited
 /// through `/Pages` nodes, which is why producers put them there. [FR-ORG-1]
 fn inherited_value(nodes: &[PageTreeNode], leaf: u32, key: &str) -> Option<String> {
+    inherited_with(nodes, leaf, &|bytes| entry_value(bytes, key))
+}
+
+/// The `/Resources` a page actually has, as written: a dictionary or `N G R`.
+/// Inherited like `/MediaBox`. [FR-STAMP, FR-ORG-1]
+#[must_use]
+pub fn effective_resources(nodes: &[PageTreeNode], leaf: u32) -> Option<String> {
+    inherited_with(nodes, leaf, &crate::page_patch::resources_value)
+}
+
+fn inherited_with(
+    nodes: &[PageTreeNode],
+    leaf: u32,
+    read: &dyn Fn(&[u8]) -> Option<String>,
+) -> Option<String> {
     let by_number: std::collections::HashMap<u32, &PageTreeNode> =
         nodes.iter().map(|n| (n.obj_num, n)).collect();
     let mut parent_of = std::collections::HashMap::new();
@@ -110,7 +125,7 @@ fn inherited_value(nodes: &[PageTreeNode], leaf: u32, key: &str) -> Option<Strin
     let mut current = Some(leaf);
     let mut hops = 0;
     while let Some(number) = current {
-        if let Some(value) = by_number.get(&number).and_then(|n| entry_value(&n.bytes, key)) {
+        if let Some(value) = by_number.get(&number).and_then(|n| read(&n.bytes)) {
             return Some(value);
         }
         hops += 1;
