@@ -770,6 +770,50 @@ pub(crate) fn next_section(
     }
 }
 
+/// Fetch object `num` as a whole `N G obj ... endobj`, trusting nothing the
+/// cross-reference says until the bytes agree: the object found at the recorded
+/// offset must actually begin `num G obj`. A table written for a larger original
+/// (a truncated or "reduced" file) names offsets that land in the middle of
+/// other objects or past the end; those lookups fail here instead of returning
+/// the wrong object. When they do, the table is rebuilt from the file's own
+/// object headers and the lookup retried, as qpdf does. [FR-VIEW-2, SDS §10.4, PRIN-1]
+pub fn fetch_object_checked(
+    data: &[u8],
+    xref: &[XrefEntry],
+    num: u32,
+    leniency: &mut Vec<LeniencyEvent>,
+) -> Option<Vec<u8>> {
+    let right = |body: &Vec<u8>| object_header_is(body, num);
+    if let Some(body) = fetch_object_bytes(data, xref, num).filter(right) {
+        return Some(body);
+    }
+    let rebuilt = rebuilt_entries(data, leniency)?;
+    fetch_object_bytes(data, &rebuilt, num).filter(right)
+}
+
+/// Whether `body` begins `num G obj`.
+fn object_header_is(body: &[u8], num: u32) -> bool {
+    let text = String::from_utf8_lossy(&body[..body.len().min(40)]);
+    let mut tokens = text.split_whitespace();
+    tokens.next().and_then(|t| t.parse::<u32>().ok()) == Some(num)
+        && tokens.next().is_some_and(|g| g.chars().all(|c| c.is_ascii_digit()))
+        && tokens.next().is_some_and(|o| o.starts_with("obj"))
+}
+
+/// The cross-reference of `data` as a reader should use it: the `/Prev` chain
+/// from the last `startxref`, repaired by rebuilding when that chain is
+/// unusable, and rebuilt outright when the file has no `startxref` at all.
+///
+/// # Errors
+/// [`ScanError::NoStartxref`] when there is neither a chain nor anything to
+/// rebuild from.
+pub fn load_xref(data: &[u8], leniency: &mut Vec<LeniencyEvent>) -> Result<Vec<XrefEntry>, ScanError> {
+    match locate_startxref(data) {
+        Some((offset, _)) => parse_xref_chain(data, offset, leniency),
+        None => rebuilt_entries(data, leniency).ok_or(ScanError::NoStartxref),
+    }
+}
+
 /// The cross-reference as `reconstruct_xref` can recover it, in this module's
 /// entry shape. `None` when the scan finds no objects worth opening.
 fn rebuilt_entries(data: &[u8], leniency: &mut Vec<LeniencyEvent>) -> Option<Vec<XrefEntry>> {
@@ -816,6 +860,9 @@ pub(crate) fn parse_xref_table(
     let mut entries: Vec<XrefEntry> = Vec::new();
 
     loop {
+        // An entry no longer ends on a fixed stride, so whatever whitespace
+        // follows it is skipped here, before the next header or the trailer.
+        skip_ws(d, &mut pos);
         // Check for trailer keyword â€” marks end of xref sections.
         if d.get(pos..).map_or(false, |s| s.starts_with(b"trailer")) {
             break;
@@ -847,30 +894,55 @@ pub(crate) fn parse_xref_table(
         }
 
         for obj in first..first + count {
-            if pos + 20 > d.len() {
+            // The standard writes each entry as exactly 20 bytes, but readers
+            // see 19 (one-character line ending after `f`/`n`) and 21 in the
+            // wild; qpdf and PDFium accept them. Parsing the three tokens,
+            // `offset generation n|f`, takes all of them, where counting
+            // 20-byte strides misread every entry after the first in a
+            // 19-byte table and made the document look empty.
+            // [FR-VIEW-2, SDS §3.1, PRIN-1]
+            let Some((byte_offset, in_use)) = parse_entry(d, &mut pos) else {
                 leniency.push(LeniencyEvent::new(
                     "xref-truncated",
                     "xref table ends early",
                 ));
                 break;
-            }
-            let entry_bytes = &d[pos..pos + 20];
-            // Format: "OOOOOOOOOO GGGGG N/F \n" -- byte 17 is 'n' or 'f'
-            let offset_bytes = &entry_bytes[0..10];
-            let in_use = entry_bytes.get(17) == Some(&b'n');
-            let byte_offset = std::str::from_utf8(offset_bytes)
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0);
+            };
             entries[obj] = XrefEntry {
                 offset: byte_offset,
                 in_use,
                 compressed: None,
             };
-            pos += 20;
         }
     }
     Ok(entries)
+}
+
+/// One classic cross-reference entry: `offset generation n|f`, separated by
+/// whitespace of any width, consumed up to the next token.
+fn parse_entry(d: &[u8], pos: &mut usize) -> Option<(u64, bool)> {
+    skip_ws(d, pos);
+    let start = *pos;
+    while d.get(*pos).is_some_and(u8::is_ascii_digit) {
+        *pos += 1;
+    }
+    let offset: u64 = std::str::from_utf8(&d[start..*pos]).ok()?.parse().ok()?;
+    skip_ws(d, pos);
+    let gen_start = *pos;
+    while d.get(*pos).is_some_and(u8::is_ascii_digit) {
+        *pos += 1;
+    }
+    if *pos == gen_start {
+        return None;
+    }
+    skip_ws(d, pos);
+    let in_use = match d.get(*pos)? {
+        b'n' => true,
+        b'f' => false,
+        _ => return None,
+    };
+    *pos += 1;
+    Some((offset, in_use))
 }
 
 /// The trailer dictionary `<< ... >>` of the section at `xref_offset`, and
@@ -1625,5 +1697,74 @@ xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 6 /Root 1 0 R /Prev 391 >>\nst
         let mut leniency = Vec::new();
         assert_eq!(next_section(data, 0, &mut leniency), None);
         assert!(leniency.is_empty(), "{leniency:?}");
+    }
+
+    /// A table written for a larger original names offsets that land inside other
+    /// objects. The lookup must notice the bytes are not `N G obj`, rebuild, and
+    /// return the right object rather than the wrong one or nothing.
+    /// [FR-VIEW-2, SDS §10.4, PRIN-1]
+    #[test]
+    fn a_stale_table_entry_is_caught_and_the_object_is_found_by_rebuilding() {
+        let data = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n";
+        // A table whose offset for object 3 points into the middle of object 2.
+        let mid_object_2 = data.windows(5).position(|w| w == b"/Kids").unwrap();
+        let mut stale = vec![XrefEntry::default(); 4];
+        stale[1] = XrefEntry { offset: 9, in_use: true, compressed: None };
+        stale[2] = XrefEntry { offset: 60, in_use: true, compressed: None };
+        stale[3] = XrefEntry { offset: mid_object_2 as u64, in_use: true, compressed: None };
+        let mut leniency = Vec::new();
+        let body = fetch_object_checked(data, &stale, 3, &mut leniency).expect("found by rebuilding");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.starts_with("3 0 obj") && text.contains("/Type /Page"), "{text}");
+        // An object that is nowhere in the file is still not found.
+        assert!(fetch_object_checked(data, &stale, 9, &mut Vec::new()).is_none());
+    }
+
+    /// `load_xref` is the one place a reader gets its table: chain when there is
+    /// a `startxref`, rebuild when there is not. [SDS §10.4]
+    #[test]
+    fn load_xref_rebuilds_a_file_that_has_no_startxref() {
+        let data = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n2 0 obj\n<< >>\nendobj\n";
+        let entries = load_xref(data, &mut Vec::new()).expect("rebuilt");
+        assert!(entries.get(2).is_some_and(|e| e.in_use));
+        assert!(load_xref(b"not a pdf", &mut Vec::new()).is_err());
+    }
+
+    /// Entries written 19 bytes wide (no space before the line end) are read as
+    /// well as 20-byte ones. A fixed 20-byte stride misread all of them after the
+    /// first, so the document looked empty and an edit then reused object numbers
+    /// that were already taken (pdf.js corpus: issue15150, issue14847). [FR-VIEW-2]
+    #[test]
+    fn xref_entries_of_nineteen_or_twenty_one_bytes_are_read() {
+        // Enough objects that a fixed 20-byte stride drifts past the ten offset
+        // digits (leading zeros hide a drift of a few bytes).
+        let mut body = String::from("%PDF-1.4\n1 0 obj <</Type /Catalog /Pages 2 0 R>>\nendobj\n2 0 obj <</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n3 0 obj <</Type /Page /Parent 2 0 R>>\nendobj\n");
+        for n in 4..=16 {
+            body.push_str(&format!("{n} 0 obj\n<<>>\nendobj\n"));
+        }
+        let count = 17;
+        for (label, eol) in [("19", "\n"), ("20", " \n"), ("21", " \r\n")] {
+            let mut pdf = body.as_bytes().to_vec();
+            let xref = pdf.len();
+            let mut table = format!("xref\n0 {count}\n0000000000 65535 f{eol}");
+            let mut expected = Vec::new();
+            for n in 1..count {
+                let at = body.find(&format!("{n} 0 obj")).unwrap();
+                expected.push(at as u64);
+                table.push_str(&format!("{at:010} 00000 n{eol}"));
+            }
+            table.push_str(&format!("trailer <</Size {count}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n"));
+            pdf.extend(table.bytes());
+
+            let entries = parse_xref_table(&pdf, xref, &mut Vec::new()).expect(label);
+            let got: Vec<u64> = entries[1..].iter().map(|e| e.offset).collect();
+            assert_eq!(got, expected, "{label}-byte entries");
+            assert!(entries[1..].iter().all(|e| e.in_use), "{label}");
+            let structure = scan_bytes(&pdf).expect(label);
+            assert_eq!(structure.page_count, 1, "{label}-byte entries");
+            assert!(structure.leniency.is_empty(), "{label}: {:?}", structure.leniency);
+        }
     }
 }

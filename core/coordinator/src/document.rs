@@ -135,6 +135,7 @@ impl DocumentCoordinator {
             .copied()
             .max()
             .unwrap_or(0)
+            .max(trailer_size(doc_path).saturating_sub(1))
             + 1;
         let sidecar = Self::compute_sidecar_path(doc_path);
 
@@ -1999,4 +2000,46 @@ fn sync_parent_dir(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+/// The last `/Size` in the file's final 64 KiB, or 0. A damaged table can list
+/// fewer objects than the file holds; `/Size` bounds the numbers already taken,
+/// so a new object never reuses one. [FR-ORG-1, PRIN-1]
+fn trailer_size(path: &Path) -> u32 {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return 0 };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut tail = Vec::new();
+    if f.seek(SeekFrom::Start(len.saturating_sub(65_536))).is_err()
+        || f.read_to_end(&mut tail).is_err()
+    {
+        return 0;
+    }
+    let Some(at) = tail.windows(5).rposition(|w| w == b"/Size") else { return 0 };
+    let digits: Vec<u8> = tail[at + 5..]
+        .iter()
+        .copied()
+        .skip_while(u8::is_ascii_whitespace)
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    std::str::from_utf8(&digits).ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod trailer_size_tests {
+    use super::trailer_size;
+
+    /// A table that under-lists objects must not let new objects reuse numbers
+    /// the trailer says are taken. [FR-ORG-1]
+    #[test]
+    fn trailer_size_reads_the_last_size_in_the_tail() {
+        let dir = std::env::temp_dir().join("pdfp-trailer-size-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.pdf");
+        std::fs::write(&p, b"%PDF-1.4\ntrailer <</Size 3>>\n%%EOF\ntrailer <</Root 1 0 R/Size  42>>\nstartxref\n0\n%%EOF\n").unwrap();
+        assert_eq!(trailer_size(&p), 42);
+        std::fs::write(&p, b"%PDF-1.4\n%%EOF\n").unwrap();
+        assert_eq!(trailer_size(&p), 0);
+        assert_eq!(trailer_size(&dir.join("missing.pdf")), 0);
+    }
 }
