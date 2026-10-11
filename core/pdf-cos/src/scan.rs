@@ -365,7 +365,7 @@ fn section_start(data: &[u8], offset: usize) -> usize {
 /// The bytes of the object beginning at `offset`, up to and including `endobj`
 /// (or up to where the next object begins, if `endobj` is missing).
 fn object_body_at(data: &[u8], offset: usize) -> Option<&[u8]> {
-    let rest = data.get(offset..)?;
+    let rest = data.get(section_start(data, offset)..)?;
     const END: &[u8] = b"endobj";
     let end = rest
         .windows(END.len())
@@ -1837,5 +1837,24 @@ startxref
             "{:?}",
             structure.leniency
         );
+    }
+
+    /// An object offset one byte early, on the newline before `N G obj`, still
+    /// finds the object (pdf.js corpus: bug1770750 -- every offset was off by one
+    /// and edits failed with "object 16 not found"). [FR-VIEW-2]
+    #[test]
+    fn an_object_offset_on_the_preceding_newline_still_fetches_the_object() {
+        let pdf = b"%PDF-1.4
+1 0 obj
+<< /A 1 >>
+endobj
+";
+        let at = pdf.windows(7).position(|w| w == b"1 0 obj").unwrap();
+        let xref = vec![
+            XrefEntry::default(),
+            XrefEntry { offset: (at - 1) as u64, in_use: true, compressed: None },
+        ];
+        let body = fetch_object_bytes(pdf, &xref, 1).expect("object 1");
+        assert!(body.starts_with(b"1 0 obj"), "{:?}", String::from_utf8_lossy(&body));
     }
 }

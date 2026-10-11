@@ -202,6 +202,13 @@ pub fn kid_references(node_bytes: &[u8]) -> Result<Option<Vec<u32>>, String> {
         return Ok(None);
     };
     let text = String::from_utf8_lossy(&node_bytes[open..close]);
+    // A `%` comment runs to the end of the line; some producers pad the array
+    // with them (pdf.js corpus: calgray). An array of references holds no strings.
+    let text: String = text
+        .split(['\r', '\n'])
+        .map(|line| line.split('%').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(" ");
     let tokens: Vec<&str> = text.split_whitespace().collect();
     if tokens.len() % 3 != 0 {
         return Err("the /Kids array holds something other than references".to_string());
@@ -1330,4 +1337,12 @@ mod tests {
         assert!(build_insert_blank_group(&nodes, 5, None, 9).unwrap_err().contains("past the end"));
         assert!(build_insert_blank_group(&nodes, 0, Some([0.0, 100.0]), 9).is_err());
         assert!(build_insert_blank_group(&nodes, 0, Some([f64::NAN, 100.0]), 9).is_err());
-    }}
+    }
+
+    /// Comments between kids are skipped, not mistaken for tokens. [FR-ORG-1]
+    #[test]
+    fn kid_references_skip_comments_in_the_array() {
+        let node = b"<< /Type /Pages /Count 2 /Kids [ 3 0 R   %c\n 8 0 R %c\r\n ] >>";
+        assert_eq!(kid_references(node).unwrap(), Some(vec![3, 8]));
+    }
+}
