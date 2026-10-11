@@ -1498,7 +1498,8 @@ fn is_encrypted(data: &[u8]) -> bool {
 /// What a sanitize did, for the report.
 #[derive(Debug)]
 struct SanitizeReport {
-    revisions_before: usize,
+    /// `None` when the cross-reference is too damaged to list the history.
+    revisions_before: Option<usize>,
     bytes_before: usize,
     bytes_after: usize,
     signatures_discarded: u32,
@@ -1526,7 +1527,10 @@ fn run_sanitize(input: &Path, output: &Path, discard_signatures: bool) -> Result
         );
     }
     let structure = pdf_cos::scan::scan_bytes(&data).map_err(|e| format!("cannot read the document: {e}"))?;
-    let before = pdf_cos::revisions::list_revisions(&data).map_err(|e| e.to_string())?;
+    // A damaged cross-reference cannot be walked revision by revision, but the
+    // clean copy is rewritten from the repaired objects either way; the report
+    // says the count is unknown instead of refusing. [GR-8]
+    let before = pdf_cos::revisions::list_revisions(&data).ok();
     // `sig_count` is a proxy (it counts `/FT /Sig` inside the AcroForm dictionary
     // itself), so a signature in an indirect field would be missed. Every
     // signature dictionary carries a `/ByteRange`; its presence anywhere in the
@@ -1548,7 +1552,7 @@ fn run_sanitize(input: &Path, output: &Path, discard_signatures: bool) -> Result
     let after = pdf_cos::revisions::list_revisions(&written).map_err(|e| e.to_string());
     match after {
         Ok(revisions) if revisions.len() == 1 => Ok(SanitizeReport {
-            revisions_before: before.len(),
+            revisions_before: before.map(|b| b.len()),
             bytes_before: data.len(),
             bytes_after: written.len(),
             signatures_discarded: signatures,
@@ -1583,10 +1587,11 @@ fn cmd_sanitize(path: &Path, rest: &[String]) {
     }
     match run_sanitize(path, &out, discard) {
         Ok(r) => {
+            let before = r.revisions_before.map_or("an unknown number of".to_string(), |n| n.to_string());
             println!(
                 "Wrote {}: {} revision(s) before, 1 now; {} -> {} bytes.",
                 out.display(),
-                r.revisions_before,
+                before,
                 r.bytes_before,
                 r.bytes_after
             );
@@ -4499,6 +4504,26 @@ mod history_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A file with no `startxref` has no history to list, but a clean copy is still
+    /// possible: it is rewritten from the repaired objects and the report says the
+    /// count is unknown (pdf.js corpus: 18 such files were refused). [FR-VER-2, GR-8]
+    #[test]
+    fn sanitize_copies_a_file_whose_history_cannot_be_listed() {
+        let dir = scratch("sanitize-damaged");
+        let (damaged, clean) = (dir.join("a.pdf"), dir.join("c.pdf"));
+        let whole = numbered_pdf(3);
+        let cut = whole.windows(9).rposition(|w| w == b"startxref").expect("startxref");
+        std::fs::write(&damaged, &whole[..cut]).unwrap();
+        assert!(pdf_cos::revisions::list_revisions(&std::fs::read(&damaged).unwrap()).is_err(), "the premise");
+
+        let report = run_sanitize(&damaged, &clean, false).expect("sanitize");
+
+        assert_eq!(report.revisions_before, None);
+        assert_eq!(revision_count(&clean), 1);
+        assert_eq!(markers(&clean), markers(&damaged));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sanitize_drops_the_history_and_the_deleted_page_but_keeps_the_rest() {
         let dir = scratch("sanitize");
@@ -4518,7 +4543,7 @@ mod history_tests {
 
         let report = run_sanitize(&edited, &clean, false).expect("sanitize");
 
-        assert_eq!(report.revisions_before, 2);
+        assert_eq!(report.revisions_before, Some(2));
         assert_eq!(revision_count(&clean), 1, "the history must be gone");
         assert_eq!(markers(&clean), ["PAGEMARK2", "PAGEMARK3"], "the pages that remain must remain");
         assert!(
