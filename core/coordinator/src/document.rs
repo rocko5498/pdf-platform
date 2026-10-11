@@ -452,12 +452,21 @@ impl DocumentCoordinator {
             ));
         }
 
-        let mut file = std::fs::File::create(output_path)
+        // Everything is written to a sibling temp file and renamed over the
+        // destination, so a crash or a write error leaves the previous file
+        // intact instead of a truncated one. Saving in place used to truncate
+        // the user's document before any replacement existed. [SDS §3.4, §10.5,
+        // ADR-012, FR-REC-2, NFR-REL-4, MET-REL-2]
+        let temp_path = save_temp_path(output_path);
+        let mut file = std::fs::File::create(&temp_path)
             .map_err(|e| SessionError::Io(e))?;
 
         // Write original bytes first.
-        file.write_all(&original_bytes)
-            .map_err(|e| SessionError::Io(e))?;
+        if let Err(e) = file.write_all(&original_bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(SessionError::Io(e));
+        }
 
         // The previous xref offset comes from the original file's own
         // `startxref`. This used to pass a literal 0 with a comment claiming
@@ -468,7 +477,7 @@ impl DocumentCoordinator {
 
 
 
-        let result = IncrementalWriter::write_incremental(
+        let written = IncrementalWriter::write_incremental(
             &mut file,
             &self.overlay,
             prev_xref_offset,
@@ -476,7 +485,27 @@ impl DocumentCoordinator {
             &self.summary.original_offsets,
             original_len,
             &trailer,
-        ).map_err(|e| SessionError::Io(e))?;
+        );
+        let result = match written {
+            Ok(result) => result,
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(SessionError::Io(e));
+            }
+        };
+
+        // The bytes must be on disk before the name points at them, and the
+        // name must be durable before the recovery journal is dropped.
+        let durable = file.sync_all().and_then(|()| {
+            drop(file);
+            std::fs::rename(&temp_path, output_path)
+        });
+        if let Err(e) = durable {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(SessionError::Io(e));
+        }
+        sync_parent_dir(output_path);
 
         self.saved_revision = self.overlay.revision();
 
@@ -1905,4 +1934,31 @@ mod tests {
 
         fs::remove_file(&fake_sidecar).ok();
     }
+}
+
+/// The sibling file a save is staged in. Same directory as the destination so
+/// the final rename never crosses a filesystem.
+fn save_temp_path(destination: &Path) -> std::path::PathBuf {
+    let mut name = destination
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".pdfplatform-saving");
+    destination.with_file_name(name)
+}
+
+/// Make the rename itself durable. POSIX needs the directory flushed;
+/// Windows cannot open a directory as a file, so there the rename's own
+/// journaling is what is relied on.
+/// shortcut: best effort, a failure here does not fail the save, since the
+/// file is already complete and renamed; upgrade if a platform proves it needs it.
+fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
