@@ -99,6 +99,8 @@ cargo run -p cli --bin pdf-platform -- plugin-list
 cargo run -p cli --bin pdf-platform -- plugin-validate plugin.json
 cargo run -p cli --bin pdf-platform -- forms-calc-demo
 cargo run -p cli --bin pdf-platform -- confinement
+cargo run -p cli --bin pdf-platform -- in.pdf --json          # also: revisions, extract-attachments
+cargo run -p cli --bin pdf-platform -- extract-attachments in.pdf -o attachments/
 cargo test --workspace
 cargo run -p corpus-diff   # needs qpdf; exit 0 = gate pass
 cargo bench -p benchmarks --bench startup
@@ -107,6 +109,19 @@ python tools/a11y_audit.py
 python tools/bench/check_p95_gates.py
 ```
 
+
+### CLI output and exit codes [FR-CLI-3]
+
+`--json` prints one JSON document on stdout for the plain summary (`pdf-platform <file>`), `revisions` and `extract-attachments`. Any other command given `--json` exits 1 with a message and prints nothing to stdout, rather than answering in prose.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | The command did what was asked |
+| 1 | Usage error, missing file, or a refusal that is the answer (for example `redact-by-term`, which finds matches but never saves, and `--json` on a command with no JSON form) |
+| 2 | The operation was attempted and failed (unreadable or damaged file, write error, tool failure) |
+| 3 | The worker binary was not found; build `worker-main` first |
+
+These are the codes the commands use today; no command is documented to return any other. Per-command exit codes beyond this table are not yet specified.
 
 The Qt shell requires Qt 6 (Widgets + OpenGLWidgets) and CMake. The Rust core builds and tests independently.
 

@@ -13,11 +13,50 @@
 use std::path::{Path, PathBuf};
 use std::process;
 
+/// Whether `--json` was given. Set once in `main`; commands that can speak JSON
+/// read it, and every other command is refused before it runs. [FR-CLI-3]
+static JSON_OUTPUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn json_mode() -> bool {
+    JSON_OUTPUT.get().copied().unwrap_or(false)
+}
+
+/// The commands whose output has a machine-readable form.
+const JSON_COMMANDS: [&str; 3] = ["summary", "revisions", "extract-attachments"];
+
+/// The command a given argument list will run: the named command, or the
+/// summary when the first argument is a file. Mirrors `main`'s dispatch.
+fn command_name<'a>(args: &'a [String], file_cmds: &[&str]) -> &'a str {
+    match args.get(1).map(String::as_str) {
+        Some("compare") => "compare",
+        Some(c) if file_cmds.contains(&c) => c,
+        Some(c @ ("forms-calc-demo" | "confinement" | "batch" | "plugin-list" | "index"
+        | "plugin-validate" | "help" | "-h" | "--help")) => c,
+        _ => "summary",
+    }
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let json_requested = args.iter().skip(1).any(|a| a == "--json");
+    args.retain(|a| a != "--json");
+    let _ = JSON_OUTPUT.set(json_requested);
     if args.len() < 2 {
         usage();
         process::exit(1);
+    }
+
+    // `--json` is refused, not ignored, where there is no JSON form: a script
+    // that asked for it must not be handed prose. [FR-CLI-3, GR-8]
+    if json_requested {
+        let name = command_name(&args, &FILE_COMMANDS);
+        if !JSON_COMMANDS.contains(&name) {
+            eprintln!(
+                "error: --json is not supported by `{name}`; it is supported by: {}",
+                JSON_COMMANDS.join(", ")
+            );
+            process::exit(1);
+        }
     }
 
     // No-file commands
@@ -61,7 +100,7 @@ fn main() {
         _ => {}
     }
 
-    let file_cmds = [
+    static FILE_COMMANDS: &[&str] = &[
         "outline",
         "layers",
         "attachments",
@@ -90,6 +129,7 @@ fn main() {
         "validate-pdf-a",
         "ocr",
     ];
+    let file_cmds = FILE_COMMANDS;
 
     let (cmd, path, rest) = if args[1] == "compare" {
         // compare takes two files, not one.
@@ -297,6 +337,20 @@ fn print_recovery_notice(path: &Path) {
 
 fn cmd_summary(path: &Path) {
     match coordinator::inspect::inspect(path) {
+        Ok(s) if json_mode() => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "pages": s.page_count,
+                    "acroform": s.has_acroform,
+                    "xfa": s.has_xfa,
+                    "javascript": s.has_js,
+                    "signatures": s.sig_count,
+                    "leniency": s.leniency_events,
+                })
+            );
+            process::exit(0);
+        }
         Ok(s) => {
             println!("Pages:      {}", s.page_count);
             println!("AcroForm:   {}", yn(s.has_acroform));
@@ -930,6 +984,16 @@ fn cmd_extract_attachments(path: &Path, rest: &[String]) {
         }
     };
     match extract_attachments(&data, &out) {
+        Ok(files) if json_mode() => {
+            let list: Vec<_> = files
+                .iter()
+                .map(|(name, size)| serde_json::json!({ "name": name, "bytes": size }))
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({ "directory": out.display().to_string(), "extracted": list })
+            );
+        }
         Ok(files) if files.is_empty() => {
             println!("no embedded files");
         }
@@ -1097,6 +1161,21 @@ fn cmd_revisions(path: &Path) {
         process::exit(2);
     });
     match pdf_cos::revisions::list_revisions(&data) {
+        Ok(revisions) if json_mode() => {
+            let list: Vec<_> = revisions
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "number": r.number,
+                        "bytes": r.bytes,
+                        "objects_written": r.objects_written,
+                        "xref_offset": r.xref_offset,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::json!({ "revisions": list }));
+            process::exit(0);
+        }
         Ok(revisions) => {
             println!("Revisions: {}", revisions.len());
             for r in &revisions {
