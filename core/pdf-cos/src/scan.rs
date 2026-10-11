@@ -348,7 +348,8 @@ pub fn section_dictionary(data: &[u8], offset: usize) -> Option<Vec<u8>> {
     object_body_at(data, offset).map(<[u8]>::to_vec)
 }
 
-/// The bytes of the object beginning at `offset`, up to and including `endobj`.
+/// The bytes of the object beginning at `offset`, up to and including `endobj`
+/// (or up to where the next object begins, if `endobj` is missing).
 fn object_body_at(data: &[u8], offset: usize) -> Option<&[u8]> {
     let rest = data.get(offset..)?;
     const END: &[u8] = b"endobj";
@@ -357,7 +358,51 @@ fn object_body_at(data: &[u8], offset: usize) -> Option<&[u8]> {
         .position(|window| window == END)
         .map(|at| at + END.len())
         .unwrap_or(rest.len());
+    let end = match unterminated_object_end(&rest[..end]) {
+        Some(cut) => cut,
+        None => end,
+    };
     Some(&rest[..end])
+}
+
+/// Where an object that never wrote `endobj` really ends: at the start of the
+/// next `N G obj` header, which begins a line. Without this the object's body
+/// ran on to the *next* object's `endobj`, so a producer that omits it made the
+/// scanner see the following object's keys inside the previous one: in
+/// `issue10438_reduced.pdf` the Info dictionary appeared to be the catalog, and
+/// the incremental update that followed named it `/Root`. An object that
+/// contains a stream is never cut, because binary data (an embedded PDF, say)
+/// can contain header-shaped lines. [FR-VIEW-2, FR-SAVE, PRIN-1]
+fn unterminated_object_end(body: &[u8]) -> Option<usize> {
+    let mut line_start = 0;
+    while let Some(newline) = body[line_start..].iter().position(|&b| b == b'\n' || b == b'\r') {
+        line_start += newline + 1;
+        if line_start >= body.len() {
+            return None;
+        }
+        let line = &body[line_start..];
+        let digits = |s: &[u8]| s.iter().take_while(|b| b.is_ascii_digit()).count();
+        let blank = |s: &[u8]| s.iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
+        let n = digits(line);
+        if n == 0 {
+            continue;
+        }
+        let a = n + blank(&line[n..]);
+        let g = digits(&line[a..]);
+        if a == n || g == 0 {
+            continue;
+        }
+        let rest = a + g;
+        let b = rest + blank(&line[rest..]);
+        if b > rest && line[b..].starts_with(b"obj") {
+            let before = &body[..line_start];
+            if before.windows(6).any(|w| w == b"stream") {
+                return None;
+            }
+            return Some(line_start);
+        }
+    }
+    None
 }
 
 /// The last `trailer` dictionary in the file, wherever it is.
@@ -828,13 +873,41 @@ pub(crate) fn parse_xref_table(
     Ok(entries)
 }
 
-/// Return the slice starting at the trailer dictionary <<...
+/// The trailer dictionary `<< ... >>` of the section at `xref_offset`, and
+/// nothing after it.
+///
+/// This used to return everything from the dictionary to the end of the file.
+/// Looking for `/Prev` in that slice found the *next* section's `/Prev`, so in
+/// a file saved twice the original section appeared to chain to itself and
+/// reported `xref-prev-invalid` on perfectly good files. The event was
+/// harmless until something (rightly) started believing it. [SDS §3.3, PRIN-1]
 fn find_trailer<'a>(data: &'a [u8], xref_offset: usize) -> Option<&'a [u8]> {
     let region = data.get(xref_offset..)?;
     let tpos = region.windows(7).position(|w| w == b"trailer")?;
     let after = tpos + 7;
     let dict_start = after + region[after..].iter().position(|&b| b == b'<')?;
-    Some(&region[dict_start..])
+    let body = &region[dict_start..];
+    // Balanced `<<` / `>>`, so a nested dictionary (`/Info << ... >>`) does not
+    // end it early. An unbalanced dictionary runs to the end, as before.
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i + 1 < body.len() {
+        match &body[i..i + 2] {
+            b"<<" => {
+                depth += 1;
+                i += 2;
+            }
+            b">>" => {
+                depth = depth.saturating_sub(1);
+                i += 2;
+                if depth == 0 {
+                    return Some(&body[..i]);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Some(body)
 }
 
 /// Fetch the body of an indirect object by number (between obj/endobj).
@@ -866,6 +939,7 @@ pub(crate) fn fetch_object<'a>(
         .windows(6)
         .position(|w| w == b"endobj")
         .unwrap_or(body.len());
+    let end = unterminated_object_end(&body[..end]).unwrap_or(end);
     Some(&body[..end])
 }
 
@@ -1511,5 +1585,45 @@ endobj
         assert!(events.iter().any(|e| e.contains("startxref-missing")), "{events:?}");
         // Nothing to recover from is still an error, not an empty success.
         assert!(scan_bytes(b"not a pdf at all").is_err());
+    }
+
+    /// An object with no `endobj` ends where the next object begins. Found by the
+    /// corpus edit sweep: the Info dictionary (no `endobj`) swallowed the next
+    /// object's `/Type /Catalog`, was taken for the catalog, and the incremental
+    /// update then named it `/Root`, leaving a file qpdf could not recover.
+    /// [FR-VIEW-2, FR-SAVE, PRIN-1]
+    #[test]
+    fn an_object_without_endobj_does_not_swallow_the_next_one() {
+        let pdf = b"%PDF-1.7\n1 0 obj\n<< /Title (t) >>\n2 0 obj<<\n/Pages 3 0 R\n/Type /Catalog\n>>\nendobj\n\
+3 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n\
+4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 10 10] >>\nendobj\n";
+        let structure = scan_bytes(pdf).expect("recoverable");
+        assert_eq!(structure.root_obj_num, 2, "the catalog is object 2, not the unterminated object 1");
+        assert_eq!(structure.page_count, 1);
+    }
+
+    /// A stream can hold header-shaped lines (an embedded PDF); the object must
+    /// not be cut inside it. [PRIN-1]
+    #[test]
+    fn a_stream_containing_an_object_header_is_not_cut() {
+        let body = b"<< /Length 20 >>\nstream\n1 0 obj\n<< >>\nendstream";
+        assert_eq!(unterminated_object_end(body), None);
+        assert_eq!(unterminated_object_end(b"<< /A 1 >>\n2 0 obj\n<< >>"), Some(11));
+    }
+
+    /// A file saved twice has two trailers; the first section's `/Prev` is its
+    /// own, not the later one's. Reading it from "here to end of file" made the
+    /// original look like it chained to itself. [SDS §3.3, PRIN-1]
+    #[test]
+    fn a_sections_trailer_stops_at_its_own_closing_brackets() {
+        let data = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 6 /Info << /A 1 >> /Root 1 0 R >>\nstartxref\n0\n%%EOF\n\
+xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 6 /Root 1 0 R /Prev 391 >>\nstartxref\n99\n%%EOF\n";
+        let first = find_trailer(data, 0).expect("trailer");
+        assert!(first.starts_with(b"<<") && first.ends_with(b">>"), "{:?}", String::from_utf8_lossy(first));
+        assert!(first.windows(5).any(|w| w == b"/Info"));
+        assert!(!first.windows(5).any(|w| w == b"/Prev"), "borrowed the later trailer's /Prev");
+        let mut leniency = Vec::new();
+        assert_eq!(next_section(data, 0, &mut leniency), None);
+        assert!(leniency.is_empty(), "{leniency:?}");
     }
 }

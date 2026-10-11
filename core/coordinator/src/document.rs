@@ -473,7 +473,22 @@ impl DocumentCoordinator {
         // the writer derived it; the writer only printed it, so every
         // incremental save emitted `/Prev 0` and chained to nothing.
         // [SDS §3.3, FR-SAVE, PRIN-1]
-        let prev_xref_offset = pdf_cos::scan::find_startxref(&original_bytes).unwrap_or(0) as u32;
+        //
+        // When the source's own cross-reference was unusable and had to be
+        // rebuilt, there is no section to chain to: chaining to its `startxref`
+        // pointed at garbage (often past the end of a truncated file) and left
+        // the saved file knowing only the objects this save wrote. Then `0`
+        // means "no /Prev, write a complete table". [FR-SAVE, SDS §10.4]
+        let chain_unusable = self.summary.leniency_events.iter().any(|event| {
+            ["[xref-reconstructed]", "[startxref-missing]", "[xref-prev-invalid]", "[xref-prev-unreadable]"]
+                .iter()
+                .any(|kind| event.starts_with(kind))
+        });
+        let prev_xref_offset = if chain_unusable {
+            0
+        } else {
+            pdf_cos::scan::find_startxref(&original_bytes).unwrap_or(0) as u32
+        };
 
 
 

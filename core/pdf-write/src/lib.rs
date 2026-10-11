@@ -129,12 +129,27 @@ impl IncrementalWriter {
             ) + 1
         );
 
+        // With nothing to chain to (`prev_xref_offset == 0`: the source had no
+        // usable cross-reference, so it was rebuilt by scanning), a table that
+        // lists only this save's objects would leave every other object
+        // unknown to the next reader. Then the table is complete: it also lists
+        // the source's objects at the offsets the rebuild found. Only entries
+        // with a real offset are written; an object living in an object stream
+        // has none, and a rebuilt source has no such objects. [FR-SAVE, SDS §10.4]
+        let mut table: std::collections::BTreeMap<u32, u32> = dirty_offsets.clone().into_iter().collect();
+        if prev_xref_offset == 0 {
+            for (number, offset) in original_offsets {
+                if *offset > 0 {
+                    table.entry(*number).or_insert(*offset);
+                }
+            }
+        }
+
         let mut section = String::from("xref\n");
         // The free-list head, which an update section carries by convention.
         section.push_str("0 1\n0000000000 65535 f \n");
         // One subsection per run of consecutive object numbers.
-        let mut numbers: Vec<u32> = dirty_offsets.keys().copied().collect();
-        numbers.sort_unstable();
+        let numbers: Vec<u32> = table.keys().copied().collect();
         let mut at = 0;
         while at < numbers.len() {
             let mut end = at + 1;
@@ -143,7 +158,7 @@ impl IncrementalWriter {
             }
             section.push_str(&format!("{} {}\n", numbers[at], end - at));
             for number in &numbers[at..end] {
-                section.push_str(&format!("{:010} 00000 n \n", dirty_offsets[number]));
+                section.push_str(&format!("{:010} 00000 n \n", table[number]));
             }
             at = end;
         }
@@ -407,5 +422,30 @@ endobj
             !text.contains("/Prev"),
             "`/Prev 0` points at the file header, not at an xref section: {text}"
         );
+    }
+
+    /// With no previous section to chain to, the table must be complete: it
+    /// also lists the source's objects, or the saved file knows only this save's
+    /// objects. Found by the corpus edit sweep on truncated files whose
+    /// `startxref` pointed past the end. [FR-SAVE, SDS §10.4]
+    #[test]
+    fn with_no_previous_section_the_table_lists_the_source_objects_too() {
+        let mut overlay = CowOverlay::new();
+        overlay.set_object(5, b"5 0 obj\n<< /Type /Pages >>\nendobj\n".to_vec());
+        let offsets: HashMap<u32, u32> = [(1, 9), (2, 60), (3, 120)].into_iter().collect();
+
+        let mut chained = Vec::new();
+        IncrementalWriter::write_incremental(&mut chained, &overlay, 77, 6, &offsets, 400, &TrailerInfo { root_obj_num: 1, ..Default::default() }).unwrap();
+        let section = xref_section(&chained);
+        assert!(section.contains("5 1\n"), "{section}");
+        assert!(!section.contains("0000000060"), "a chained update lists only what it wrote: {section}");
+
+        let mut complete = Vec::new();
+        IncrementalWriter::write_incremental(&mut complete, &overlay, 0, 6, &offsets, 400, &TrailerInfo { root_obj_num: 1, ..Default::default() }).unwrap();
+        let section = xref_section(&complete);
+        for offset in ["0000000009", "0000000060", "0000000120"] {
+            assert!(section.contains(offset), "{offset} missing: {section}");
+        }
+        assert!(!String::from_utf8_lossy(&complete).contains("/Prev"));
     }
 }
