@@ -735,7 +735,7 @@ impl DocumentCoordinator {
         Ok(())
     }
 
-    fn stamp_page_objects(&mut self) -> Result<Vec<(u32, Vec<u8>)>, SessionError> {
+    fn stamp_page_objects(&mut self) -> Result<Vec<StampTarget>, SessionError> {
         let nodes = self.page_tree()?;
         let leaves = leaf_pages(&nodes).map_err(SessionError::Protocol)?;
         if leaves.len() != self.summary.page_count as usize {
@@ -745,16 +745,36 @@ impl DocumentCoordinator {
                 self.summary.page_count
             )));
         }
-        leaves
-            .into_iter()
-            .map(|obj_num| {
-                nodes
-                    .iter()
-                    .find(|n| n.obj_num == obj_num)
-                    .map(|n| (obj_num, n.bytes.clone()))
-                    .ok_or_else(|| SessionError::Protocol(format!("page object {obj_num} was not read")))
-            })
-            .collect()
+        // Shared resources are read once, whichever page names them.
+        let mut flattened: std::collections::HashMap<Option<String>, String> = std::collections::HashMap::new();
+        let mut targets = Vec::with_capacity(leaves.len());
+        for obj_num in leaves {
+            let node = nodes
+                .iter()
+                .find(|n| n.obj_num == obj_num)
+                .ok_or_else(|| SessionError::Protocol(format!("page object {obj_num} was not read")))?;
+            // /MediaBox and /Resources are inherited; a page that leaves them to
+            // its /Pages node is the usual shape, not an exception.
+            let [llx, lly, urx, ury] =
+                pdf_model::organize::effective_media_box(&nodes, obj_num).map_err(SessionError::Protocol)?;
+            let raw = pdf_model::organize::effective_resources(&nodes, obj_num);
+            if !flattened.contains_key(&raw) {
+                let direct = pdf_model::page_patch::direct_resources(raw.as_deref(), &mut |n| {
+                    self.session.get_object(n).ok()
+                })
+                .map_err(SessionError::Protocol)?;
+                flattened.insert(raw.clone(), direct);
+            }
+            let prepared = pdf_model::page_patch::set_direct_resources(&node.bytes, &flattened[&raw])
+                .map_err(SessionError::Protocol)?;
+            targets.push(StampTarget {
+                obj_num,
+                original: node.bytes.clone(),
+                prepared,
+                size: ((urx - llx) as f32, (ury - lly) as f32),
+            });
+        }
+        Ok(targets)
     }
     /// Find the Pages parent object number by reading the catalog. [SDS §3.1]
     fn find_pages_object(&mut self) -> Result<u32, SessionError> {
@@ -1381,8 +1401,17 @@ fn source_trailer(bytes: &[u8], root_obj_num: u32) -> pdf_write::TrailerInfo {
     }
 }
 
+/// A page to stamp: its object as read (kept for undo) and the same object with
+/// a direct `/Resources`, which is what the stamp is written into.
+struct StampTarget {
+    obj_num: u32,
+    original: Vec<u8>,
+    prepared: Vec<u8>,
+    size: (f32, f32),
+}
+
 fn build_stamp_group(
-    pages: &[(u32, Vec<u8>)],
+    pages: &[StampTarget],
     stamps: &[Stamp],
     next_obj_num: u32,
 ) -> Result<(CommandGroup, u32), SessionError> {
@@ -1401,9 +1430,9 @@ fn build_stamp_group(
         old_bytes: None,
     }));
 
-    for (index, ((page_obj_num, page_bytes), stamp)) in pages.iter().zip(stamps).enumerate() {
+    for (index, (target, stamp)) in pages.iter().zip(stamps).enumerate() {
         let content_obj_num = font_obj_num + 1 + index as u32;
-        let (width, height) = parse_media_box(page_bytes)?;
+        let (width, height) = target.size;
         let stream = pdf_model::stamp::generate_stamp_stream(stamp, width, height);
         let stream_obj = format!(
             "{content_obj_num} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
@@ -1412,7 +1441,7 @@ fn build_stamp_group(
         )
         .into_bytes();
         let patched_page = pdf_model::page_patch::inject_content_ref_and_font(
-            page_bytes,
+            &target.prepared,
             content_obj_num,
             font_obj_num,
             // The stamp's own resource name, so the page's /Resources entry and
@@ -1426,9 +1455,9 @@ fn build_stamp_group(
         .map_err(SessionError::Protocol)?;
 
         group.push(Box::new(SetObjectCommand {
-            obj_num: *page_obj_num,
+            obj_num: target.obj_num,
             new_bytes: patched_page,
-            old_bytes: Some(page_bytes.clone()),
+            old_bytes: Some(target.original.clone()),
         }));
         group.push(Box::new(SetObjectCommand {
             obj_num: content_obj_num,
@@ -1438,30 +1467,6 @@ fn build_stamp_group(
     }
 
     Ok((group, font_obj_num + 1 + pages.len() as u32))
-}
-
-fn parse_media_box(page_bytes: &[u8]) -> Result<(f32, f32), SessionError> {
-    let text = String::from_utf8_lossy(page_bytes);
-    let start = text
-        .find("/MediaBox")
-        .ok_or_else(|| SessionError::Protocol("page has no explicit /MediaBox".into()))?;
-    let open = start
-        + text[start..]
-            .find('[')
-            .ok_or_else(|| SessionError::Protocol("malformed /MediaBox".into()))?;
-    let close = open
-        + text[open..]
-            .find(']')
-            .ok_or_else(|| SessionError::Protocol("malformed /MediaBox".into()))?;
-    let values = text[open + 1..close]
-        .split_whitespace()
-        .map(str::parse::<f32>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| SessionError::Protocol("malformed /MediaBox".into()))?;
-    if values.len() != 4 || values[2] <= values[0] || values[3] <= values[1] {
-        return Err(SessionError::Protocol("malformed /MediaBox".into()));
-    }
-    Ok((values[2] - values[0], values[3] - values[1]))
 }
 
 #[cfg(test)]
@@ -1591,7 +1596,11 @@ mod tests {
             ..pdf_model::stamp::Stamp::default()
         }];
 
-        let (group, next) = build_stamp_group(&[(3, page)], &stamps, 20).unwrap();
+        let (group, next) = build_stamp_group(
+            &[StampTarget { obj_num: 3, original: page.clone(), prepared: page, size: (612.0, 792.0) }],
+            &stamps,
+            20,
+        ).unwrap();
         let mut overlay = CowOverlay::new();
         group.apply(&mut overlay).unwrap();
 

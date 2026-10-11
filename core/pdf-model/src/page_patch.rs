@@ -171,12 +171,12 @@ pub fn inject_content_ref_and_font(
                     .ok_or_else(|| "unclosed /Contents array".to_string())?;
             text.insert_str(end, &format!(" {content_ref}"));
         } else {
-            let tokens: Vec<&str> = text[start..].split_whitespace().take(3).collect();
-            if tokens.len() != 3 || tokens[2] != "R" {
+            // `4 0 R/Group <<` is a reference too: the name needs no space before it.
+            let Some((_, len)) = parse_ref(&text[start..]) else {
                 return Err("unsupported /Contents value".into());
-            }
-            let old_ref = tokens.join(" ");
-            text.replace_range(start..start + old_ref.len(), &format!("[{old_ref} {content_ref}]"));
+            };
+            let old_ref = text[start..start + len].to_string();
+            text.replace_range(start..start + len, &format!("[{old_ref} {content_ref}]"));
         }
     } else {
         let insert_at = text
@@ -186,6 +186,162 @@ pub fn inject_content_ref_and_font(
     }
 
     Ok(text.into_bytes())
+}
+
+/// The raw `/Resources` value of a page or `/Pages` node: the dictionary as
+/// written, or the reference `N G R`. `None` when the object has no usable one.
+#[must_use]
+pub fn resources_value(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let after = find_name(&text, "/Resources", 0)?;
+    let rest = &text[after..];
+    let start = after + (rest.len() - rest.trim_start().len());
+    if text[start..].starts_with("<<") {
+        let end = matching_dict_end(&text, start)?;
+        return Some(text[start..end].to_string());
+    }
+    let (_, len) = parse_ref(&text[start..])?;
+    Some(text[start..start + len].to_string())
+}
+
+/// A `/Resources` as one self-contained dictionary: a reference is read and
+/// inlined, and so are an indirect `/Font` and `/ExtGState` inside it, which the
+/// stamp has to extend. Everything else stays as written. `None` means the page
+/// has no resources, which is an empty dictionary. Writing this onto the page
+/// leaves the shared object alone, so other pages are unaffected. [FR-STAMP, ADR-013]
+///
+/// # Errors
+/// When a referenced object is missing or is not a dictionary.
+pub fn direct_resources(
+    value: Option<&str>,
+    fetch: &mut dyn FnMut(u32) -> Option<Vec<u8>>,
+) -> Result<String, String> {
+    let mut dict = match value {
+        None => "<< >>".to_string(),
+        Some(v) => resolve_dict(v, fetch)?,
+    };
+    for key in ["/Font", "/ExtGState"] {
+        let Some(after) = top_level_key_end(&dict, key) else { continue };
+        let rest = &dict[after..];
+        let start = after + (rest.len() - rest.trim_start().len());
+        if let Some((_, len)) = parse_ref(&dict[start..]) {
+            let inner = resolve_dict(&dict[start..start + len], fetch)?;
+            dict.replace_range(start..start + len, &inner);
+        }
+    }
+    Ok(dict)
+}
+
+/// Replace (or add) the page's own `/Resources` with `direct`.
+///
+/// # Errors
+/// When the page is not text-like or its `/Resources` is neither a dictionary
+/// nor a reference.
+pub fn set_direct_resources(page_obj_bytes: &[u8], direct: &str) -> Result<Vec<u8>, String> {
+    let mut text = String::from_utf8(page_obj_bytes.to_vec())
+        .map_err(|_| "page object is not UTF-8-compatible PDF syntax".to_string())?;
+    if let Some(after) = find_name(&text, "/Resources", 0) {
+        let rest = &text[after..];
+        let start = after + (rest.len() - rest.trim_start().len());
+        let end = if text[start..].starts_with("<<") {
+            matching_dict_end(&text, start).ok_or_else(|| "unclosed /Resources dictionary".to_string())?
+        } else {
+            let (_, len) = parse_ref(&text[start..])
+                .ok_or_else(|| "/Resources is neither a dictionary nor a reference".to_string())?;
+            start + len
+        };
+        text.replace_range(start..end, direct);
+    } else {
+        let at = text.rfind(">>").ok_or_else(|| "page object missing closing >>".to_string())?;
+        text.insert_str(at, &format!("/Resources {direct} "));
+    }
+    Ok(text.into_bytes())
+}
+
+/// `value` as a dictionary: itself if written inline, else the dictionary the
+/// reference names.
+fn resolve_dict(value: &str, fetch: &mut dyn FnMut(u32) -> Option<Vec<u8>>) -> Result<String, String> {
+    let value = value.trim_start();
+    if value.starts_with("<<") {
+        let end = matching_dict_end(value, 0).ok_or_else(|| "unclosed resources dictionary".to_string())?;
+        return Ok(value[..end].to_string());
+    }
+    let (number, _) = parse_ref(value).ok_or_else(|| "resources value is neither a dictionary nor a reference".to_string())?;
+    let bytes = fetch(number).ok_or_else(|| format!("resources object {number} not found"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let body = text
+        .find("obj")
+        .map(|at| text[at + 3..].trim_start())
+        .filter(|body| body.starts_with("<<"))
+        .ok_or_else(|| format!("resources object {number} is not a dictionary"))?;
+    let end = matching_dict_end(body, 0).ok_or_else(|| format!("resources object {number} is not closed"))?;
+    Ok(body[..end].to_string())
+}
+
+/// `N G R` at the start of `text`: the object number and the bytes it spans.
+/// The reference may be followed directly by a name (`4 0 R/Group`).
+fn parse_ref(text: &str) -> Option<(u32, usize)> {
+    let bytes = text.as_bytes();
+    let digits = |at: usize| bytes[at..].iter().take_while(|b| b.is_ascii_digit()).count();
+    let skip_ws = |at: usize| at + bytes[at..].iter().take_while(|b| b.is_ascii_whitespace()).count();
+    let n = digits(0);
+    if n == 0 {
+        return None;
+    }
+    let number = text[..n].parse().ok()?;
+    let g_start = skip_ws(n);
+    let g = digits(g_start);
+    if g == 0 || g_start == n {
+        return None;
+    }
+    let r_at = skip_ws(g_start + g);
+    (bytes.get(r_at) == Some(&b'R')).then_some((number, r_at + 1))
+}
+
+/// The index just after the first whole-name occurrence of `key` at or after `from`.
+fn find_name(text: &str, key: &str, from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(found) = text[at..].find(key) {
+        let after = at + found + key.len();
+        let whole = text
+            .as_bytes()
+            .get(after)
+            .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'[' | b']' | b'(' | b'/'));
+        if whole {
+            return Some(after);
+        }
+        at = after;
+    }
+    None
+}
+
+/// Like [`find_name`], but only for a key directly inside the outer dictionary,
+/// not one nested in a value.
+fn top_level_key_end(dict: &str, key: &str) -> Option<usize> {
+    let bytes = dict.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"<<") {
+            depth += 1;
+            i += 2;
+        } else if bytes[i..].starts_with(b">>") {
+            depth = depth.saturating_sub(1);
+            i += 2;
+        } else if depth == 1 && bytes[i..].starts_with(key.as_bytes()) {
+            let after = i + key.len();
+            let whole = bytes
+                .get(after)
+                .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'[' | b'(' | b'/'));
+            if whole {
+                return Some(after);
+            }
+            i = after;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 fn matching_dict_end(text: &str, start: usize) -> Option<usize> {
@@ -310,5 +466,53 @@ endobj
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("50 0 R"));
         assert!(s.contains("10 0 R"));
+    }
+
+    fn objects(n: u32) -> Option<Vec<u8>> {
+        match n {
+            7 => Some(b"7 0 obj\n<< /Font 8 0 R /XObject << /Im 9 0 R >> /ProcSet [/PDF] >>\nendobj\n".to_vec()),
+            8 => Some(b"8 0 obj\n<< /F1 5 0 R >>\nendobj\n".to_vec()),
+            _ => None,
+        }
+    }
+
+    /// A page whose `/Resources` and `/Font` are shared objects is stamped without
+    /// touching either: the page gets its own copy, the stamp's font beside the
+    /// page's, and the other entries survive. Compact `4 0 R/Group` contents are
+    /// read too. (pdf.js corpus: ~370 of 956 files were refused for these.) [FR-STAMP]
+    #[test]
+    fn a_page_with_shared_resources_gets_its_own_copy_with_the_stamp_font_added() {
+        let page = b"3 0 obj\n<< /Type /Page /Resources 7 0 R /Contents 4 0 R/Group << /S /Transparency >> >>\nendobj\n";
+        let direct = direct_resources(Some("7 0 R"), &mut objects).unwrap();
+        let prepared = set_direct_resources(page, &direct).unwrap();
+        let out = inject_content_ref_and_font(&prepared, 20, 21, "FStamp", None).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("/F1 5 0 R") && text.contains("/FStamp 21 0 R"), "{text}");
+        assert!(text.contains("/XObject << /Im 9 0 R >>") && text.contains("/ProcSet [/PDF]"), "{text}");
+        assert!(text.contains("/Contents [4 0 R 20 0 R]/Group"), "{text}");
+        assert!(!text.contains("/Resources 7 0 R"), "{text}");
+        assert_eq!(text.matches("/Font").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_page_with_no_resources_anywhere_gets_an_empty_dictionary_to_extend() {
+        let page = b"3 0 obj\n<< /Type /Page /Contents 4 0 R >>\nendobj\n";
+        let direct = direct_resources(None, &mut objects).unwrap();
+        assert_eq!(direct, "<< >>");
+        let out = set_direct_resources(page, &direct).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("/Resources << >>"));
+    }
+
+    #[test]
+    fn a_missing_resources_object_is_an_error_not_an_empty_page() {
+        let error = direct_resources(Some("99 0 R"), &mut objects).unwrap_err();
+        assert!(error.contains("99"), "{error}");
+    }
+
+    #[test]
+    fn resources_value_reads_a_dictionary_or_a_reference_and_not_a_longer_name() {
+        assert_eq!(resources_value(b"<< /Resources 7 0 R/Rotate 0 >>").as_deref(), Some("7 0 R"));
+        assert_eq!(resources_value(b"<< /Resources << /A 1 0 R >> >>").as_deref(), Some("<< /A 1 0 R >>"));
+        assert_eq!(resources_value(b"<< /ResourcesX << /A 1 0 R >> /Resources 8 0 R >>").as_deref(), Some("8 0 R"));
     }
 }
