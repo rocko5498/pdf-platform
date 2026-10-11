@@ -90,15 +90,30 @@ pub fn scan_bytes(data: &[u8]) -> Result<DocumentStructure, ScanError> {
         ));
     }
 
-    let (xref_offset, in_tail) = locate_startxref(data).ok_or(ScanError::NoStartxref)?;
-    if !in_tail {
-        leniency.push(LeniencyEvent::new(
-            "startxref-before-tail",
-            "no startxref in the final 1024 bytes; used the last one earlier in the file",
-        ));
-    }
-    // The whole chain, not just the newest section: see `parse_xref_chain`.
-    let xref = parse_xref_chain(data, xref_offset, &mut leniency)?;
+    let (xref_offset, xref) = match locate_startxref(data) {
+        Some((xref_offset, in_tail)) => {
+            if !in_tail {
+                leniency.push(LeniencyEvent::new(
+                    "startxref-before-tail",
+                    "no startxref in the final 1024 bytes; used the last one earlier in the file",
+                ));
+            }
+            // The whole chain, not just the newest section: see `parse_xref_chain`.
+            (xref_offset, parse_xref_chain(data, xref_offset, &mut leniency)?)
+        }
+        // A file with no `startxref` at all (truncated, or cut off before the
+        // end) is rebuilt from its object definitions, as for a damaged table,
+        // rather than refused: PDFium and qpdf both open such files. The offset
+        // is past the end so no section is read from it. [SDS §10.4, FR-VIEW-2]
+        None => {
+            let rebuilt = rebuilt_entries(data, &mut leniency).ok_or(ScanError::NoStartxref)?;
+            leniency.push(LeniencyEvent::new(
+                "startxref-missing",
+                "no startxref anywhere in the file; rebuilt the cross-reference from its objects",
+            ));
+            (data.len(), rebuilt)
+        }
+    };
     // Objects a PDF 1.5+ producer stored inside object streams: on such a
     // document the catalog and the page tree are among them, so without this
     // the summary reports a document with no pages. [FR-VIEW-2]
@@ -710,6 +725,36 @@ pub(crate) fn next_section(
     }
 }
 
+/// The cross-reference as `reconstruct_xref` can recover it, in this module's
+/// entry shape. `None` when the scan finds no objects worth opening.
+fn rebuilt_entries(data: &[u8], leniency: &mut Vec<LeniencyEvent>) -> Option<Vec<XrefEntry>> {
+    let rebuilt = crate::xref::reconstruct_xref(data, leniency);
+    (rebuilt.entries.len() > 1).then(|| {
+        rebuilt
+            .entries
+            .iter()
+            .map(|entry| XrefEntry {
+                offset: entry.offset,
+                in_use: entry.in_use,
+                compressed: None,
+            })
+            .collect()
+    })
+}
+
+/// ISO 32000-1 Annex C: an implementation may assume no more than this many
+/// indirect objects, so no object number above it is believable.
+const MAX_OBJECT_NUMBER: usize = 8_388_607;
+
+/// The highest object count worth allocating for a file of `data_len` bytes. A
+/// cross-reference subsection header such as `0 4294967296` is attacker text:
+/// obeying it asked for 103 GB and aborted the process on a 627-byte file. Real
+/// files give every object at least a byte, so the file's own size bounds the
+/// count, with a floor for tiny documents. [GR-7, GR-8, T-4]
+pub(crate) fn plausible_object_limit(data_len: usize) -> usize {
+    MAX_OBJECT_NUMBER.min(data_len.max(1 << 16))
+}
+
 pub(crate) fn parse_xref_table(
     data: &[u8],
     offset: usize,
@@ -742,7 +787,16 @@ pub(crate) fn parse_xref_table(
         };
         skip_eol(d, &mut pos);
 
-        let needed = first + count;
+        let Some(needed) = first
+            .checked_add(count)
+            .filter(|n| *n <= plausible_object_limit(data.len()))
+        else {
+            leniency.push(LeniencyEvent::new(
+                "xref-subsection-out-of-range",
+                &format!("xref subsection \"{first} {count}\" names more objects than the file can hold; treating the table as damaged"),
+            ));
+            return Err(ScanError::MalformedXref);
+        };
         if entries.len() < needed {
             entries.resize(needed, XrefEntry::default());
         }
@@ -1145,13 +1199,16 @@ startxref
     }
 
     #[test]
-    fn a_file_with_no_startxref_anywhere_is_still_an_error() {
+    fn a_file_with_no_startxref_and_no_catalog_is_still_an_error() {
         let mut data = b"%PDF-1.4\n1 0 obj\n<< >>\nendobj\n".to_vec();
         data.extend(std::iter::repeat(b' ').take(5000));
         assert_eq!(find_startxref(&data), None);
+        // Rebuilding finds object 1 but no catalog in it, so there is still
+        // nothing to open: an error, never an empty document. (A file whose
+        // rebuild *does* find a catalog opens: see the next test.)
         assert!(
-            matches!(scan_bytes(&data), Err(ScanError::NoStartxref)),
-            "a file with no startxref must say so, not report an empty document"
+            matches!(scan_bytes(&data), Err(ScanError::NoRoot) | Err(ScanError::NoTrailer) | Err(ScanError::NoStartxref)),
+            "a file with no startxref and no catalog must be an error, not an empty document"
         );
     }
 
@@ -1396,5 +1453,63 @@ startxref
 
         let structure = scan_bytes(&out).expect("scan");
         assert_eq!(structure.page_count, 1, "the page tree in the object stream was not found");
+    }
+
+    /// A cross-reference subsection header is attacker text. `4294967296 3` in a
+    /// 627-byte fuzzed file (pdf.js corpus, GHOSTSCRIPT-698804-1) made the
+    /// scanner ask for 103 GB and abort the process. The table is now treated as
+    /// damaged, recorded, and the document is recovered by reconstruction.
+    /// [GR-7, GR-8, T-4]
+    #[test]
+    fn an_impossible_xref_subsection_is_damage_not_an_allocation() {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (num, body) in [
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
+        ] {
+            offsets.push(pdf.len());
+            pdf.extend(format!("{num} 0 obj\n{body}\nendobj\n").bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend(b"xref\n0 2\n0000000000 65536 f \n");
+        pdf.extend(format!("{:010} 00000 n \n", offsets[0]).bytes());
+        pdf.extend(b"4294967296 3\n");
+        for o in &offsets[1..] {
+            pdf.extend(format!("{o:010} 00000 n \n").bytes());
+        }
+        pdf.extend(format!("trailer\n<</Size 4 /Root 1 0 R>>\nstartxref\n{xref}\n%%EOF").bytes());
+
+        let structure = scan_bytes(&pdf).expect("the document is recoverable");
+        assert_eq!(structure.page_count, 1);
+        let events: Vec<String> = structure.leniency.iter().map(|e| e.to_string()).collect();
+        assert!(events.iter().any(|e| e.contains("xref-subsection-out-of-range")), "{events:?}");
+        assert!(events.iter().any(|e| e.contains("xref-reconstructed")), "{events:?}");
+    }
+
+    /// A file with no `startxref` at all (cut off, or never finished) is opened
+    /// by rebuilding the cross-reference from its objects, and says so. PDFium
+    /// and qpdf open these; refusing them was a hole in the corpus sweep.
+    /// [SDS §10.4, FR-VIEW-2, GR-8]
+    #[test]
+    fn a_file_with_no_startxref_is_rebuilt_not_refused() {
+        let pdf = b"%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>
+endobj
+";
+        let structure = scan_bytes(pdf).expect("recoverable");
+        assert_eq!(structure.page_count, 1);
+        let events: Vec<String> = structure.leniency.iter().map(|e| e.to_string()).collect();
+        assert!(events.iter().any(|e| e.contains("startxref-missing")), "{events:?}");
+        // Nothing to recover from is still an error, not an empty success.
+        assert!(scan_bytes(b"not a pdf at all").is_err());
     }
 }

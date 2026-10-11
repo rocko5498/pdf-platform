@@ -123,7 +123,16 @@ pub fn parse_classic_xref(
         };
         skip_eol(d, &mut pos);
 
-        let needed = first + count;
+        let Some(needed) = first
+            .checked_add(count)
+            .filter(|n| *n <= crate::scan::plausible_object_limit(data.len()))
+        else {
+            leniency.push(LeniencyEvent::new(
+                "xref-subsection-out-of-range",
+                &format!("xref subsection \"{first} {count}\" names more objects than the file can hold; stopped reading this table"),
+            ));
+            break;
+        };
         if table.entries.len() < needed {
             table.entries.resize(needed, XrefEntry::default());
         }
@@ -223,7 +232,15 @@ pub fn parse_xref_stream(
 
     let mut decoded_pos = 0;
     for &(start, count) in &ranges {
-        let needed = (start + count) as usize;
+        let limit = crate::scan::plausible_object_limit(decoded.len());
+        let needed = match (start as usize).checked_add(count as usize) {
+            Some(n) if n <= limit => n,
+            _ => {
+                return Err(format!(
+                    "xref stream range {start} {count} names more objects than the file can hold"
+                ))
+            }
+        };
         if table.entries.len() < needed {
             table.entries.resize(needed, XrefEntry::default());
         }
@@ -358,7 +375,12 @@ pub fn reconstruct_xref(data: &[u8], leniency: &mut Vec<LeniencyEvent>) -> XrefT
                 if let Some((obj_num, gen_num)) = parse_obj_header(header) {
                     let offset = line_start as u64;
 
-                    let needed = (obj_num + 1) as usize;
+                    let needed = (obj_num as usize).saturating_add(1);
+                    if needed > crate::scan::plausible_object_limit(data.len()) {
+                        // "99999999 0 obj" in a small file is text, not an object.
+                        i += 1;
+                        continue;
+                    }
                     if table.entries.len() < needed {
                         table.entries.resize(needed, XrefEntry::default());
                     }
@@ -921,5 +943,16 @@ mod tests {
         let body = b"<< /Length 10 >>\nstream\n0123456789\nendstream";
         let content = super::find_stream_content(body).unwrap();
         assert_eq!(content, b"0123456789\n");
+    }
+
+    /// An object header such as `99999999 0 obj` inside a small file is text; it
+    /// must not size the table. [GR-7, T-4]
+    #[test]
+    fn reconstruction_ignores_an_object_number_the_file_cannot_hold() {
+        let data = b"%PDF-1.4\n99999999 0 obj\n<< >>\nendobj\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let mut leniency = Vec::new();
+        let table = reconstruct_xref(data, &mut leniency);
+        assert!(table.entries.len() < 70_000, "{} entries", table.entries.len());
+        assert!(table.entries.get(1).is_some_and(|e| e.in_use), "the real object 1 is still found");
     }
 }
