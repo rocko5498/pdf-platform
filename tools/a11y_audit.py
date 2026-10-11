@@ -72,6 +72,35 @@ ANTI = [
 ]
 
 
+# Controls a screen reader cannot name unless something names them. A button,
+# check box or radio button with a text literal is named by its text; the rest
+# need an accessible name on the variable that holds them. [AQA-1, DS-A11Y-SR-1]
+INTERACTIVE = (
+    "QLineEdit|QComboBox|QListWidget|QTreeWidget|QTableWidget|QPlainTextEdit|QTextEdit"
+    "|QSpinBox|QDoubleSpinBox|QSlider|QToolButton|QPushButton|QCheckBox|QRadioButton"
+)
+TEXT_NAMED = {"QPushButton", "QCheckBox", "QRadioButton", "QToolButton"}
+_CONSTRUCT = re.compile(rf"(\w+)\s*=\s*new\s+({INTERACTIVE})\s*\(")
+
+
+def unnamed_controls(source: str) -> list[tuple[str, str]]:
+    """(class, variable) of each interactive control built in `source` that has
+    neither an accessible name nor a text literal. A presence check by variable
+    name within one file: it does not follow a control passed to another
+    function, and it cannot judge whether a name is a good one."""
+    found = []
+    for m in _CONSTRUCT.finditer(source):
+        var, cls = m.groups()
+        end = source.find(";", m.end())
+        args = source[m.end() : end if end != -1 else m.end()]
+        if re.search(rf"\b{var}->setAccessibleName\b", source):
+            continue
+        if cls in TEXT_NAMED and '"' in args:
+            continue
+        found.append((cls, var))
+    return found
+
+
 def main() -> int:
     failures: list[str] = []
     passes = 0
@@ -95,6 +124,18 @@ def main() -> int:
         for pattern, desc in ANTI:
             if re.search(pattern, text):
                 failures.append(f"ANTI  {desc} in {f.relative_to(ROOT)}")
+
+    controls = 0
+    for f in SHELL.rglob("*.cc"):
+        if f.relative_to(SHELL).parts[0].startswith("build"):
+            continue
+        text = f.read_text(encoding="utf-8", errors="replace")
+        controls += len(_CONSTRUCT.findall(text))
+        for cls, var in unnamed_controls(text):
+            failures.append(f"UNNAMED {cls} `{var}` in {f.relative_to(ROOT)} has no accessible name")
+    if controls:
+        passes += 1
+        print(f"  OK  every interactive control built in shell/ is named ({controls} checked)")
 
     print()
     print(f"a11y static audit: {passes} gates ok, {len(failures)} failures")
@@ -122,7 +163,12 @@ def self_check() -> int:
         assert rx.search(s), f"anti-pattern missed an empty name: {s}"
     for s in must_not_match:
         assert not rx.search(s), f"anti-pattern falsely flagged: {s}"
-    print(f"self-check ok: {len(must_match)} caught, {len(must_not_match)} correctly ignored")
+    # The unnamed-control gate must catch a bare control and spare a named one.
+    assert unnamed_controls("auto* e = new QLineEdit(this);") == [("QLineEdit", "e")]
+    assert unnamed_controls('e = new QLineEdit(this);\ne->setAccessibleName(tr("Query"));') == []
+    assert unnamed_controls('b = new QPushButton(QStringLiteral("Apply"), this);') == []
+    assert unnamed_controls("b = new QPushButton(this);") == [("QPushButton", "b")]
+    print(f"self-check ok: {len(must_match)} caught, {len(must_not_match)} correctly ignored, unnamed-control gate verified")
     return 0
 
 
