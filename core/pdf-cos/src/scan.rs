@@ -307,6 +307,7 @@ pub(crate) fn parse_section(
     offset: usize,
     leniency: &mut Vec<LeniencyEvent>,
 ) -> Result<Vec<XrefEntry>, ScanError> {
+    let offset = section_start(data, offset);
     if data.get(offset..).is_some_and(|d| d.starts_with(b"xref")) {
         return parse_xref_table(data, offset, leniency);
     }
@@ -342,10 +343,23 @@ pub(crate) fn parse_section(
 /// all** — `/Root` lives in the stream dictionary — so a reader that insists on
 /// finding one rejects every modern PDF. [FR-VIEW-2, SDS §3.1]
 pub fn section_dictionary(data: &[u8], offset: usize) -> Option<Vec<u8>> {
+    let offset = section_start(data, offset);
     if data.get(offset..).is_some_and(|d| d.starts_with(b"xref")) {
         return find_trailer(data, offset).map(<[u8]>::to_vec);
     }
     object_body_at(data, offset).map(<[u8]>::to_vec)
+}
+
+/// `offset` moved past white space. Some producers write a `/Prev` or
+/// `startxref` that lands on the blank padding just before the section
+/// (pdf.js corpus: bug1851498, 25 bytes early); qpdf and PDFium read it, and
+/// refusing it hid every page. [FR-VIEW-2, SDS §10.4]
+fn section_start(data: &[u8], offset: usize) -> usize {
+    let mut at = offset;
+    while data.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    at
 }
 
 /// The bytes of the object beginning at `offset`, up to and including `endobj`
@@ -1766,5 +1780,62 @@ xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 6 /Root 1 0 R /Prev 391 >>\nst
             assert_eq!(structure.page_count, 1, "{label}-byte entries");
             assert!(structure.leniency.is_empty(), "{label}: {:?}", structure.leniency);
         }
+    }
+
+    /// A `/Prev` that lands on the blank padding before the section is read as the
+    /// section that follows; qpdf does the same. Without it the older section was
+    /// "unreadable" and the file showed no pages (pdf.js corpus: bug1851498).
+    /// An uncompressed xref stream also no longer reports an unknown filter.
+    /// [FR-VIEW-2]
+    #[test]
+    fn a_prev_offset_pointing_at_padding_still_finds_the_section() {
+        let mut pdf = b"%PDF-1.5
+1 0 obj <</Type /Catalog /Pages 2 0 R>>
+endobj
+2 0 obj <</Type /Pages /Kids [3 0 R] /Count 1>>
+endobj
+3 0 obj <</Type /Page /Parent 2 0 R>>
+endobj
+".to_vec();
+        let at = |pdf: &[u8], n: &str| pdf.windows(n.len()).position(|w| w == n.as_bytes()).unwrap();
+        let o1 = at(&pdf, "1 0 obj");
+        let o2 = at(&pdf, "2 0 obj");
+        let o3 = at(&pdf, "3 0 obj");
+        pdf.extend(b"          
+");
+        let old = pdf.len();
+        let mut old_xref = format!("4 0 obj
+<</Type /XRef /Size 4 /W [1 2 0] /Index [0 4] /Length 12>>
+stream
+").into_bytes();
+        for off in [0usize, o1, o2, o3] {
+            old_xref.push(u8::from(off != 0));
+            old_xref.extend((off as u16).to_be_bytes());
+        }
+        old_xref.extend(b"
+endstream
+endobj
+");
+        pdf.extend(&old_xref);
+        let new = pdf.len();
+        pdf.extend(format!("5 0 obj
+<</Type /XRef /Size 6 /W [1 2 0] /Index [5 1] /Prev {} /Root 1 0 R /Length 3>>
+stream
+", old - 6).bytes());
+        pdf.extend([1u8, (new >> 8) as u8, new as u8]);
+        pdf.extend(format!("
+endstream
+endobj
+startxref
+{new}
+%%EOF
+").bytes());
+        let structure = scan_bytes(&pdf).unwrap();
+        assert_eq!(structure.page_count, 1);
+        assert!(
+            !structure.leniency.iter().any(|e| e.kind.contains("prev") || e.kind.contains("filter") || e.kind.contains("reconstructed")),
+            "{:?}",
+            structure.leniency
+        );
     }
 }

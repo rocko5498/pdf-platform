@@ -596,7 +596,7 @@ fn decompress_stream(
             format!("FlateDecode failed: {e}")
         })?;
         apply_predictor(dict, inflated, leniency)
-    } else if contains(dict, b"/None") {
+    } else if contains(dict, b"/None") || !contains(dict, b"/Filter") {
         // No compression.
         Ok(content.to_vec())
     } else {
