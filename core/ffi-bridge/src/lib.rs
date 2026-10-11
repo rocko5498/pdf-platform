@@ -749,6 +749,28 @@ fn get_object_bytes(session: &mut DocSession, obj_num: u32) -> Result<Vec<u8>, S
 }
 
 /// Persist annotations into an incremental PDF update. [FR-ANNOT-4, ADR-012]
+/// Replace `path` with `bytes` without ever leaving it truncated: stage in a
+/// sibling file, flush it to disk, then rename over the destination. The old
+/// `std::fs::write` truncated the user's document first, so an error or a crash
+/// mid-write destroyed it. [SDS §3.4, §10.5, FR-REC-2, MET-REL-2]
+fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".pdfplatform-saving");
+    let staging = path.with_file_name(name);
+    let result = (|| {
+        let mut file = std::fs::File::create(&staging)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&staging, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result
+}
+
 fn save_document_impl(out_path: &str) -> Result<String, String> {
     with_session_mut(|session| {
         let original = std::fs::read(&session.path).map_err(|e| format!("read source: {e}"))?;
@@ -759,7 +781,8 @@ fn save_document_impl(out_path: &str) -> Result<String, String> {
 
         if session.annotations.all_annotations().is_empty() && session.form.field_count() == 0 {
             if out_path != session.path {
-                std::fs::write(out_path, &original).map_err(|e| format!("copy: {e}"))?;
+                write_file_atomically(std::path::Path::new(out_path), &original)
+                    .map_err(|e| format!("copy: {e}"))?;
             }
             return Ok(format!(
                 "saved without annots/forms; xfdf={}",
@@ -936,7 +959,8 @@ fn save_document_impl(out_path: &str) -> Result<String, String> {
         )
         .map_err(|e| format!("incremental write: {e}"))?;
 
-        std::fs::write(out_path, &out).map_err(|e| format!("write out: {e}"))?;
+        write_file_atomically(std::path::Path::new(out_path), &out)
+            .map_err(|e| format!("write out: {e}"))?;
         Ok(format!(
             "saved {} annots, {} form widgets, {} objects, xfdf={}",
             session.annotations.all_annotations().len(),
@@ -1585,5 +1609,30 @@ mod bridge_lifecycle_tests {
 
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(out.with_extension("xfdf"));
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::write_file_atomically;
+
+    #[test]
+    fn a_failed_write_leaves_the_destination_untouched_and_a_good_one_replaces_it() {
+        let dir = std::env::temp_dir().join(format!("pdfp-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("doc.pdf");
+        std::fs::write(&dest, b"ORIGINAL").unwrap();
+
+        // Block the staging path: the write must fail without touching `doc.pdf`.
+        std::fs::create_dir(dir.join("doc.pdf.pdfplatform-saving")).unwrap();
+        assert!(write_file_atomically(&dest, b"REPLACEMENT").is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ORIGINAL");
+
+        std::fs::remove_dir(dir.join("doc.pdf.pdfplatform-saving")).unwrap();
+        write_file_atomically(&dest, b"REPLACEMENT").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"REPLACEMENT");
+        assert!(!dir.join("doc.pdf.pdfplatform-saving").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
