@@ -31,6 +31,8 @@ fn structured(name: &str, bytes: &[u8]) -> bool {
     std::fs::write(&path, bytes).expect("write");
     let mut coord = DocumentCoordinator::open(&worker_path(), &path).expect("open");
     let flag = coord.get_page_text(0).expect("extract").has_structure;
+    // The open-time summary the shell reads must say the same thing.
+    assert_eq!(coord.summary().is_tagged, flag, "summary and page text disagree");
     let _ = coord.close();
     let _ = std::fs::remove_dir_all(&dir);
     flag

@@ -14,6 +14,9 @@ pub struct StructuralSummary {
     pub has_xfa: bool,
     /// Document has JavaScript (catalog/names).
     pub has_js: bool,
+    /// The catalog marks the document tagged (`/MarkInfo` and a structure
+    /// tree). Absent from older frames, which decode as `false`. [FR-A11Y-1]
+    pub is_tagged: bool,
     /// Signature field count.
     pub sig_count: u32,
     /// Number of leniency events.
@@ -82,6 +85,7 @@ pub fn encode_summary(s: &StructuralSummary) -> Vec<u8> {
     out.push_str(&format!("has_acroform={}\n", u8::from(s.has_acroform)));
     out.push_str(&format!("has_xfa={}\n", u8::from(s.has_xfa)));
     out.push_str(&format!("has_js={}\n", u8::from(s.has_js)));
+    out.push_str(&format!("is_tagged={}\n", u8::from(s.is_tagged)));
     out.push_str(&format!("sig_count={}\n", s.sig_count));
     out.push_str(&format!("leniency_count={}\n", s.leniency_count));
     for e in &s.leniency_events {
@@ -120,6 +124,7 @@ pub fn decode_summary(body: &[u8]) -> Result<StructuralSummary, SummaryDecodeErr
     let mut has_acroform = None;
     let mut has_xfa = None;
     let mut has_js = None;
+    let mut is_tagged = false;
     let mut sig_count = None;
     let mut leniency_count = None;
     let mut leniency_events = Vec::new();
@@ -149,6 +154,9 @@ pub fn decode_summary(body: &[u8]) -> Result<StructuralSummary, SummaryDecodeErr
             }
             "has_js" => {
                 has_js = Some(parse_bool01(v).ok_or(SummaryDecodeError::BadField("has_js"))?);
+            }
+            "is_tagged" => {
+                is_tagged = parse_bool01(v).ok_or(SummaryDecodeError::BadField("is_tagged"))?;
             }
             "sig_count" => {
                 sig_count = Some(
@@ -194,6 +202,7 @@ pub fn decode_summary(body: &[u8]) -> Result<StructuralSummary, SummaryDecodeErr
         has_acroform: has_acroform.ok_or(SummaryDecodeError::BadField("has_acroform"))?,
         has_xfa: has_xfa.ok_or(SummaryDecodeError::BadField("has_xfa"))?,
         has_js: has_js.ok_or(SummaryDecodeError::BadField("has_js"))?,
+        is_tagged,
         sig_count: sig_count.ok_or(SummaryDecodeError::BadField("sig_count"))?,
         leniency_count: leniency_count.ok_or(SummaryDecodeError::BadField("leniency_count"))?,
         leniency_events,
@@ -225,6 +234,7 @@ mod tests {
             has_acroform: true,
             has_xfa: false,
             has_js: true,
+            is_tagged: true,
             sig_count: 2,
             leniency_count: 1,
             leniency_events: vec!["missing-pdf-header: no %PDF-".into()],
@@ -237,5 +247,34 @@ mod tests {
         // Verify decode helper works.
         let dims = back.page_dimensions_f();
         assert_eq!(dims, vec![(595.0, 842.0, 0), (612.0, 792.0, 90)]);
+    }
+
+    /// The tagged flag survives the wire, and a frame from before the field
+    /// existed decodes as untagged instead of failing. [FR-A11Y-1]
+    #[test]
+    fn is_tagged_round_trips_and_an_older_frame_without_it_decodes_untagged() {
+        let sample_summary = || StructuralSummary {
+            root_obj_num: 1,
+            page_count: 1,
+            has_acroform: false,
+            has_xfa: false,
+            has_js: false,
+            is_tagged: true,
+            sig_count: 0,
+            leniency_count: 0,
+            leniency_events: vec![],
+            page_dimensions: vec![],
+            original_offsets: std::collections::HashMap::new(),
+        };
+        let s = decode_summary(&encode_summary(&sample_summary())).expect("decode");
+        assert!(s.is_tagged);
+        let older: String = String::from_utf8(encode_summary(&sample_summary()))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with("is_tagged="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(!decode_summary(older.as_bytes()).expect("older frame").is_tagged);
     }
 }
