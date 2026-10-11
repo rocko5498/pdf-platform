@@ -103,6 +103,7 @@ cargo run -p cli --bin pdf-platform -- confinement
 cargo run -p cli --bin pdf-platform -- in.pdf --json          # also: revisions, extract-attachments
 cargo run -p cli --bin pdf-platform -- extract-attachments in.pdf -o attachments/
 cargo run -p cli --bin pdf-platform -- comments in.pdf [--author A] [--type Highlight] [--page N] [--no-replies] [--json]
+cargo run -p cli --bin pdf-platform -- export-reading-order tagged.pdf [--json]   # tagged PDFs only; text in structure-tree order
 cargo test --workspace
 cargo run -p corpus-diff   # needs qpdf; exit 0 = gate pass
 cargo bench -p benchmarks --bench startup
@@ -114,7 +115,7 @@ python tools/bench/check_p95_gates.py
 
 ### CLI output and exit codes [FR-CLI-3]
 
-`--json` prints one JSON document on stdout for the plain summary (`pdf-platform <file>`), `revisions`, `extract-attachments` and `comments`. Any other command given `--json` exits 1 with a message and prints nothing to stdout, rather than answering in prose.
+`--json` prints one JSON document on stdout for the plain summary (`pdf-platform <file>`), `revisions`, `extract-attachments`, `comments` and `export-reading-order`. Any other command given `--json` exits 1 with a message and prints nothing to stdout, rather than answering in prose.
 
 | Exit code | Meaning |
 |---|---|

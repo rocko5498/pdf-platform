@@ -575,7 +575,9 @@ pub fn parse_xref_chain(data: &[u8], start: usize, leniency: &mut Vec<LeniencyEv
         }
         visited.push(current);
 
-        let section = match parse_section(data, current, leniency) {
+        let section = match parse_section(data, current, leniency).map(|section| {
+            overlay_xref_stream(data, current, section, leniency)
+        }) {
             Ok(section) => section,
             Err(error) => {
                 // The newest section failing is fatal; an older one failing
@@ -626,6 +628,48 @@ pub fn parse_xref_chain(data: &[u8], start: usize, leniency: &mut Vec<LeniencyEv
     }
 
     Ok(merged)
+}
+
+/// A hybrid-reference file's classic table lists every object that lives in an
+/// object stream as *free*, so a reader that predates xref streams skips them,
+/// and the real entries sit in the stream the trailer names with `/XRefStm`
+/// (ISO 32000-1 7.5.8.4). A reader that ignores `/XRefStm` sees those objects as
+/// deleted: the page tree, the structure tree, whatever the producer packed
+/// into an object stream. Word's "Save as PDF" writes this shape.
+///
+/// Entries the table marks free (or leaves out) are replaced by the stream's
+/// in-use entries; an in-use table entry always wins. [FR-VIEW-2, SDS §3.1]
+fn overlay_xref_stream(
+    data: &[u8],
+    section_offset: usize,
+    mut section: Vec<XrefEntry>,
+    leniency: &mut Vec<LeniencyEvent>,
+) -> Vec<XrefEntry> {
+    let Some(stream_offset) = section_dictionary(data, section_offset)
+        .and_then(|dict| parse_int_after_key(&dict, b"/XRefStm"))
+        .and_then(|at| usize::try_from(at).ok())
+        .filter(|at| *at < data.len() && *at != section_offset)
+    else {
+        return section;
+    };
+    match parse_section(data, stream_offset, leniency) {
+        Ok(stream) => {
+            if section.len() < stream.len() {
+                section.resize(stream.len(), XrefEntry::default());
+            }
+            for (index, entry) in stream.iter().enumerate() {
+                let table_has_it = section[index].in_use;
+                if !table_has_it && entry.in_use {
+                    section[index] = *entry;
+                }
+            }
+        }
+        Err(_) => leniency.push(LeniencyEvent::new(
+            "xref-stm-unreadable",
+            "the /XRefStm named by the trailer could not be parsed; objects it describes may be missing",
+        )),
+    }
+    section
 }
 
 /// Where the cross-reference chain goes after the section at `current`, and
@@ -731,7 +775,7 @@ pub(crate) fn parse_xref_table(
 }
 
 /// Return the slice starting at the trailer dictionary <<...
-pub(crate) fn find_trailer<'a>(data: &'a [u8], xref_offset: usize) -> Option<&'a [u8]> {
+fn find_trailer<'a>(data: &'a [u8], xref_offset: usize) -> Option<&'a [u8]> {
     let region = data.get(xref_offset..)?;
     let tpos = region.windows(7).position(|w| w == b"trailer")?;
     let after = tpos + 7;
@@ -1285,5 +1329,72 @@ startxref
         let no_tree = pdf_with_catalog("/MarkInfo << /Marked true >>");
         assert!(!scan_bytes(&no_tree).unwrap().is_tagged);
         assert!(!scan_bytes(MINIMAL_PDF).unwrap().is_tagged);
+    }
+
+    /// A hybrid-reference file: a classic table that lists the object-stream
+    /// objects as free, plus an `/XRefStm` that says where they really are.
+    /// Without the stream the page tree is "deleted" and the file reports no
+    /// pages. [FR-VIEW-2, SDS §3.1]
+    #[test]
+    fn a_hybrid_reference_files_object_stream_objects_are_found_through_xrefstm() {
+        let mut out: Vec<u8> = b"%PDF-1.5
+".to_vec();
+        let mut offsets = std::collections::BTreeMap::new();
+        let mut push = |out: &mut Vec<u8>, num: u32, body: &[u8]| {
+            offsets.insert(num, out.len());
+            out.extend(format!("{num} 0 obj
+").bytes());
+            out.extend_from_slice(body);
+            out.extend(b"
+endobj
+");
+        };
+        push(&mut out, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        push(&mut out, 3, b"<< /Type /Page /Parent 2 0 R >>");
+        // Object stream 5 holds object 2, the page tree.
+        let pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+        let header = b"2 0 ";
+        let mut objstm = format!("<< /Type /ObjStm /N 1 /First {} /Length {} >>
+stream
+", header.len(), header.len() + pages.len()).into_bytes();
+        objstm.extend_from_slice(header);
+        objstm.extend_from_slice(pages);
+        objstm.extend(b"
+endstream");
+        push(&mut out, 5, &objstm);
+        // The xref stream says: object 2 is entry 0 of object stream 5.
+        let mut xrefstm = b"<< /Type /XRef /W [1 2 1] /Index [2 1] /Length 4 >>
+stream
+".to_vec();
+        xrefstm.extend_from_slice(&[2, 0, 5, 0]);
+        xrefstm.extend(b"
+endstream");
+        push(&mut out, 6, &xrefstm);
+
+        let xref = out.len();
+        out.extend(b"xref
+0 7
+0000000000 65535 f 
+");
+        for num in 1..=6u32 {
+            match offsets.get(&num) {
+                Some(at) => out.extend(format!("{at:010} 00000 n 
+").bytes()),
+                // Object 2 and 4 are not in the table: object 2 is the one that
+                // matters, listed free exactly as a hybrid writer does.
+                None => out.extend(b"0000000000 00000 f 
+"),
+            }
+        }
+        out.extend(
+            format!("trailer
+<</Size 7 /Root 1 0 R /XRefStm {}>>
+startxref
+{xref}
+%%EOF", offsets[&6]).bytes(),
+        );
+
+        let structure = scan_bytes(&out).expect("scan");
+        assert_eq!(structure.page_count, 1, "the page tree in the object stream was not found");
     }
 }

@@ -22,7 +22,13 @@ fn json_mode() -> bool {
 }
 
 /// The commands whose output has a machine-readable form.
-const JSON_COMMANDS: [&str; 4] = ["summary", "revisions", "extract-attachments", "comments"];
+const JSON_COMMANDS: [&str; 5] = [
+    "summary",
+    "revisions",
+    "extract-attachments",
+    "comments",
+    "export-reading-order",
+];
 
 /// The command a given argument list will run: the named command, or the
 /// summary when the first argument is a file. Mirrors `main`'s dispatch.
@@ -125,6 +131,7 @@ fn main() {
         "insert-blank",
         "insert-pages",
         "comments",
+        "export-reading-order",
         "stamp",
         "redact-by-term",
         "validate-signatures",
@@ -170,6 +177,10 @@ fn main() {
     }
     if cmd == "export-html" {
         cmd_export_html(&path, &rest);
+        return;
+    }
+    if cmd == "export-reading-order" {
+        cmd_export_reading_order(&path);
         return;
     }
     if cmd == "comments" {
@@ -1130,6 +1141,61 @@ fn cmd_insert_pages(path: &Path, rest: &[String]) {
         }
         Err(e) => fail(2, e.to_string()),
     }
+}
+
+/// Text of a tagged document in its logical reading order.
+/// [FR-A11Y-1, FR-A11Y-3, FR-EXPORT-1, US-AXS-2]
+///
+/// Usage: pdf-platform export-reading-order <file> [--json]
+fn cmd_export_reading_order(path: &Path) {
+    let data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("error: cannot read {}: {e}", path.display());
+        process::exit(2);
+    });
+    let result: Result<pdf_cos::reading_order::ReadingOrder, pdf_cos::reading_order::ReadingOrderError> =
+        pdf_cos::reading_order::read_in_order(&data);
+    let order = match result {
+        Ok(order) => order,
+        Err(e) => {
+            // An untagged file has no reading order to report: say so rather
+            // than falling back to drawing order under the same name.
+            eprintln!("error: {e}; `export-text` gives the text in drawing order");
+            process::exit(2);
+        }
+    };
+    if json_mode() {
+        let blocks: Vec<_> = order
+            .blocks
+            .iter()
+            .map(|b| serde_json::json!({ "page": b.page, "element": b.element, "text": b.text }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "blocks": blocks,
+                "missing_content": order.missing_content,
+                "unreliable": order.unreliable,
+            })
+        );
+        process::exit(0);
+    }
+    for block in &order.blocks {
+        let block: &pdf_cos::reading_order::ReadingBlock = block;
+        println!("[p.{} {}] {}", block.page, block.element, block.text);
+    }
+    if order.unreliable {
+        eprintln!(
+            "warning: some text was decoded without a Unicode map and may be wrong \
+             (marked U+FFFD or guessed as Latin-1)"
+        );
+    }
+    if order.missing_content > 0 {
+        eprintln!(
+            "warning: {} content reference(s) in the structure tree were not found on their page",
+            order.missing_content
+        );
+    }
+    process::exit(0);
 }
 
 /// Which comments `comments` keeps. A field left `None` keeps everything.
