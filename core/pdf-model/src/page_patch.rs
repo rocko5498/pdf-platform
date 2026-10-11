@@ -261,6 +261,7 @@ pub fn set_direct_resources(page_obj_bytes: &[u8], direct: &str) -> Result<Vec<u
 /// `value` as a dictionary: itself if written inline, else the dictionary the
 /// reference names.
 fn resolve_dict(value: &str, fetch: &mut dyn FnMut(u32) -> Option<Vec<u8>>) -> Result<String, String> {
+    let value = strip_comments(value);
     let value = value.trim_start();
     if value.starts_with("<<") {
         let end = matching_dict_end(value, 0).ok_or_else(|| "unclosed resources dictionary".to_string())?;
@@ -268,7 +269,9 @@ fn resolve_dict(value: &str, fetch: &mut dyn FnMut(u32) -> Option<Vec<u8>>) -> R
     }
     let (number, _) = parse_ref(value).ok_or_else(|| "resources value is neither a dictionary nor a reference".to_string())?;
     let bytes = fetch(number).ok_or_else(|| format!("resources object {number} not found"))?;
-    let text = String::from_utf8_lossy(&bytes);
+    // A comment may sit between `obj` and the dictionary, or inside it; the
+    // copy written onto the page has none, so none can swallow what follows.
+    let text = strip_comments(&String::from_utf8_lossy(&bytes));
     let body = text
         .find("obj")
         .map(|at| text[at + 3..].trim_start())
@@ -276,6 +279,40 @@ fn resolve_dict(value: &str, fetch: &mut dyn FnMut(u32) -> Option<Vec<u8>>) -> R
         .ok_or_else(|| format!("resources object {number} is not a dictionary"))?;
     let end = matching_dict_end(body, 0).ok_or_else(|| format!("resources object {number} is not closed"))?;
     Ok(body[..end].to_string())
+}
+
+/// `text` without `%` comments (each runs to the end of its line). A `%` inside a
+/// literal string is not a comment.
+fn strip_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if depth > 0 => {
+                out.push(c);
+                out.extend(chars.next());
+            }
+            '(' => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' if depth > 0 => {
+                depth -= 1;
+                out.push(c);
+            }
+            '%' if depth == 0 => {
+                for n in chars.by_ref() {
+                    if n == '\n' || n == '\r' {
+                        out.push(n);
+                        break;
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// `N G R` at the start of `text`: the object number and the bytes it spans.
@@ -514,5 +551,21 @@ endobj
         assert_eq!(resources_value(b"<< /Resources 7 0 R/Rotate 0 >>").as_deref(), Some("7 0 R"));
         assert_eq!(resources_value(b"<< /Resources << /A 1 0 R >> >>").as_deref(), Some("<< /A 1 0 R >>"));
         assert_eq!(resources_value(b"<< /ResourcesX << /A 1 0 R >> /Resources 8 0 R >>").as_deref(), Some("8 0 R"));
+    }
+
+    /// Comments after `obj` and inside the dictionary (pdf.js corpus: calgray,
+    /// calrgb) neither hide the dictionary nor swallow what is added after them.
+    #[test]
+    fn comments_in_a_resources_object_are_dropped_from_the_copy() {
+        let mut fetch = |n: u32| {
+            (n == 4).then(|| b"4 0 obj % Resources <<\n<<  %\n  /Font << /F1 5 0 R >> % (not a string\n  /Text (100% sure) >> %\nendobj\n".to_vec())
+        };
+        let direct = direct_resources(Some("4 0 R"), &mut fetch).unwrap();
+        assert!(!direct.contains("Resources <<") && !direct.contains("not a string"), "{direct}");
+        assert!(direct.contains("(100% sure)"), "{direct}");
+        let page = set_direct_resources(b"3 0 obj\n<< /Type /Page /Resources 4 0 R /Contents 6 0 R >>\nendobj\n", &direct).unwrap();
+        let out = inject_content_ref_and_font(&page, 20, 21, "FStamp", None).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("/F1 5 0 R") && text.contains("/FStamp 21 0 R"), "{text}");
     }
 }
