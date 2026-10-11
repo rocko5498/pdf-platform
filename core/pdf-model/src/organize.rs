@@ -551,6 +551,100 @@ pub fn build_move_pages_group(
     Ok(group)
 }
 
+/// Where a page's `/Annots` lives, so the caller can fetch what
+/// [`build_duplicate_pages_group`] needs.
+pub enum AnnotsSource {
+    /// `/Annots [ 5 0 R 6 0 R ]` written into the page.
+    Inline(Vec<u32>),
+    /// `/Annots 9 0 R`: the array is its own object.
+    Indirect(u32),
+}
+
+/// The `/Annots` entry of a page, if it has one.
+pub fn annotations_to_fetch(page: &[u8]) -> Option<AnnotsSource> {
+    let at = find_annots(page)?;
+    let rest = &page[at.1..];
+    let text = String::from_utf8_lossy(rest);
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('[') {
+        let end = trimmed.find(']').unwrap_or(trimmed.len());
+        Some(AnnotsSource::Inline(refs_in_text(&trimmed[1..end])))
+    } else {
+        refs_in_text(trimmed.split(['/', '>']).next().unwrap_or("")).first().map(|n| AnnotsSource::Indirect(*n))
+    }
+}
+
+/// The annotation object numbers a page lists, resolving an indirect array
+/// through `fetched`. `None` when the page has no `/Annots`.
+pub fn annotation_refs(
+    page: &[u8],
+    fetched: &std::collections::HashMap<u32, Vec<u8>>,
+) -> Result<Option<Vec<u32>>, String> {
+    Ok(match annotations_to_fetch(page) {
+        None => None,
+        Some(AnnotsSource::Inline(refs)) => Some(refs),
+        Some(AnnotsSource::Indirect(n)) => {
+            let body = fetched.get(&n).ok_or_else(|| format!("annotation array {n} was not read"))?;
+            let text = String::from_utf8_lossy(body);
+            let open = text.find('[').ok_or("annotation array is not an array")?;
+            let close = text.rfind(']').ok_or("annotation array is not closed")?;
+            Some(refs_in_text(&text[open + 1..close]))
+        }
+    })
+}
+
+/// `7 0 R`, `8 0 R/Next` and `9 0 R]` all hold references: split on delimiters.
+fn refs_in_text(text: &str) -> Vec<u32> {
+    let spaced = text.replace(['/', '[', ']', '<', '>'], " ");
+    let tokens: Vec<&str> = spaced.split_whitespace().collect();
+    tokens
+        .windows(3)
+        .filter(|w| w[2] == "R")
+        .filter_map(|w| w[0].parse().ok())
+        .collect()
+}
+
+/// The span of the `/Annots` key and value in a page dictionary: (start, end of
+/// the value). Handles `[..]` and `N G R`.
+fn find_annots(page: &[u8]) -> Option<(usize, usize)> {
+    let key = page.windows(b"/Annots".len()).position(|w| w == b"/Annots")?;
+    let after_key = key + b"/Annots".len();
+    let mut i = after_key;
+    while page.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    Some((key, i))
+}
+
+fn is_link_annotation(body: &[u8]) -> bool {
+    // A name ends at whitespace or a delimiter: `/Subtype/Link>>` has no space.
+    let text = String::from_utf8_lossy(body).replace('/', " /").replace(['<', '>', '(', ')', '[', ']'], " ");
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    tokens.windows(2).any(|w| w[0] == "/Subtype" && w[1] == "/Link")
+}
+
+/// An annotation's `/P` points at its page; point the copy at the copy.
+fn repoint_page(body: &[u8], original_page: u32, copy_page: u32) -> Vec<u8> {
+    let text = String::from_utf8_lossy(body).into_owned();
+    text.replace(&format!("/P {original_page} 0 R"), &format!("/P {copy_page} 0 R")).into_bytes()
+}
+
+/// The page dictionary with its `/Annots` entry (either form) replaced.
+fn replace_annots(page: &[u8], replacement: &str) -> Result<Vec<u8>, String> {
+    let (key, value_start) = find_annots(page).ok_or("the page has no /Annots")?;
+    let end = if page.get(value_start) == Some(&b'[') {
+        value_start + page[value_start..].iter().position(|&b| b == b']').ok_or("unterminated /Annots array")? + 1
+    } else {
+        // `N G R`
+        let tail = &page[value_start..];
+        value_start + tail.iter().position(|&b| b == b'R').ok_or("malformed /Annots reference")? + 1
+    };
+    let mut out = page[..key].to_vec();
+    out.extend_from_slice(replacement.as_bytes());
+    out.extend_from_slice(&page[end..]);
+    Ok(out)
+}
+
 /// The same object with a new number: `N G obj ...` becomes `M 0 obj ...`.
 fn renumbered(bytes: &[u8], new_number: u32) -> Result<Vec<u8>, String> {
     let at = bytes
@@ -565,13 +659,18 @@ fn renumbered(bytes: &[u8], new_number: u32) -> Result<Vec<u8>, String> {
 /// Duplicate pages: each copy is a new page object right after its original, in
 /// the same parent, sharing the original's content and resources by reference.
 ///
-/// A page that has annotations is refused: the copy would share the original's
-/// annotation objects, and a form field or note cannot belong to two pages.
+/// A page's hyperlinks are copied: each `Link` annotation becomes a new object
+/// on the copy, so the two pages do not share one. Any other annotation (a form
+/// field, a note, a highlight) refuses the duplication, because that object has
+/// state and cannot belong to two pages. `annotations` holds the bodies of the
+/// chosen pages' annotation objects (and their `/Annots` array object when it
+/// is indirect), keyed by object number; see [`annotations_to_fetch`].
 /// Returns the group and the next free object number. [FR-ORG-1, PRIN-1, GR-8]
 pub fn build_duplicate_pages_group(
     nodes: &[PageTreeNode],
     page_indices: &[u32],
     next_obj_num: u32,
+    annotations: &std::collections::HashMap<u32, Vec<u8>>,
 ) -> Result<(CommandGroup, u32), String> {
     let leaves = leaf_pages(nodes)?;
     let chosen = chosen_pages(&leaves, page_indices)?;
@@ -583,19 +682,39 @@ pub fn build_duplicate_pages_group(
     let mut next = next_obj_num;
     for &leaf in &chosen {
         let node = index.by_number[&leaf];
-        if node.bytes.windows(b"/Annots".len()).any(|w| w == b"/Annots") {
-            return Err(format!(
-                "page object {leaf} has annotations; duplicating a page that has annotations \
-                 is not supported, because the copy would share them"
-            ));
+        let copy_number = next;
+        next += 1;
+        let mut page_bytes = node.bytes.clone();
+        if let Some(refs) = annotation_refs(&node.bytes, annotations)? {
+            let mut new_refs = Vec::new();
+            for annotation in refs {
+                let body = annotations
+                    .get(&annotation)
+                    .ok_or_else(|| format!("annotation object {annotation} was not read"))?;
+                if !is_link_annotation(body) {
+                    return Err(format!(
+                        "page object {leaf} has an annotation that is not a link (object {annotation}); \
+                         duplicating it is not supported, because the copy would share its state"
+                    ));
+                }
+                let copy = next;
+                next += 1;
+                group.push(Box::new(crate::command::SetObjectCommand {
+                    obj_num: copy,
+                    new_bytes: repoint_page(&renumbered(body, copy)?, leaf, copy_number),
+                    old_bytes: None,
+                }));
+                new_refs.push(copy);
+            }
+            let list: Vec<String> = new_refs.iter().map(|n| format!("{n} 0 R")).collect();
+            page_bytes = replace_annots(&node.bytes, &format!("/Annots [{}]", list.join(" ")))?;
         }
-        copies.insert(leaf, next);
+        copies.insert(leaf, copy_number);
         group.push(Box::new(crate::command::SetObjectCommand {
-            obj_num: next,
-            new_bytes: renumbered(&node.bytes, next)?,
+            obj_num: copy_number,
+            new_bytes: renumbered(&page_bytes, copy_number)?,
             old_bytes: None,
         }));
-        next += 1;
         for ancestor in index.ancestors(leaf) {
             *edits.delta.entry(ancestor).or_insert(0) += 1;
         }
@@ -1092,7 +1211,7 @@ mod tests {
 
     #[test]
     fn duplicating_inserts_a_copy_right_after_each_original_and_counts_it() {
-        let (group, next) = build_duplicate_pages_group(&flat3(), &[0, 1], 10).unwrap();
+        let (group, next) = build_duplicate_pages_group(&flat3(), &[0, 1], 10, &Default::default()).unwrap();
         assert_eq!(next, 12, "two objects were allocated");
         let mut overlay = CowOverlay::new();
         group.apply(&mut overlay).unwrap();
@@ -1104,7 +1223,7 @@ mod tests {
 
     #[test]
     fn duplicating_in_a_nested_tree_counts_every_ancestor() {
-        let (group, _) = build_duplicate_pages_group(&nested(), &[0], 20).unwrap();
+        let (group, _) = build_duplicate_pages_group(&nested(), &[0], 20, &Default::default()).unwrap();
         let mut overlay = CowOverlay::new();
         group.apply(&mut overlay).unwrap();
         assert_eq!(kids_of(&overlay, 3), [5, 20, 6]);
@@ -1113,12 +1232,64 @@ mod tests {
         assert!(overlay.get_object(4).is_none(), "branch B is untouched");
     }
 
+    fn annotation(num: u32, subtype: &str) -> (u32, Vec<u8>) {
+        (num, format!("{num} 0 obj\n<< /Type /Annot /Subtype /{subtype} /P 4 0 R /Rect [0 0 10 10] >>\nendobj\n").into_bytes())
+    }
+
     #[test]
-    fn a_page_with_annotations_is_not_duplicated() {
+    fn a_pages_links_are_copied_so_the_two_pages_do_not_share_them() {
+        let mut nodes = flat3();
+        nodes[2] = node(4, "<< /Type /Page /Parent 2 0 R /Annots [9 0 R 8 0 R] >>");
+        let annotations = [annotation(9, "Link"), annotation(8, "Link")].into_iter().collect();
+        let (group, next) = build_duplicate_pages_group(&nodes, &[1], 10, &annotations).unwrap();
+        assert_eq!(next, 13, "the copy page and two link copies");
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        // The copy page lists new link objects, in the same order.
+        assert!(text(&overlay, 10).contains("/Annots [11 0 R 12 0 R]"), "{}", text(&overlay, 10));
+        // Each copy is a new object that points back at the copy page.
+        for link in [11, 12] {
+            let body = text(&overlay, link);
+            assert!(body.starts_with(&format!("{link} 0 obj")), "{body}");
+            assert!(body.contains("/P 10 0 R") && !body.contains("/P 4 0 R"), "{body}");
+        }
+        // The original page and its links are not touched.
+        assert!(overlay.get_object(4).is_none() && overlay.get_object(9).is_none());
+    }
+
+    #[test]
+    fn an_indirect_annots_array_is_followed() {
+        let mut nodes = flat3();
+        nodes[2] = node(4, "<< /Type /Page /Parent 2 0 R /Annots 7 0 R /Rotate 90 >>");
+        let annotations = [(7, b"7 0 obj\n[ 9 0 R ]\nendobj\n".to_vec()), annotation(9, "Link")]
+            .into_iter()
+            .collect();
+        let (group, _) = build_duplicate_pages_group(&nodes, &[1], 10, &annotations).unwrap();
+        let mut overlay = CowOverlay::new();
+        group.apply(&mut overlay).unwrap();
+        let page = text(&overlay, 10);
+        assert!(page.contains("/Annots [11 0 R]") && page.contains("/Rotate 90"), "{page}");
+        assert!(!page.contains("7 0 R"), "{page}");
+    }
+
+    /// Word writes `/Subtype/Link` last, with no space and the dictionary closing
+    /// straight after: `.../Subtype/Link>>`. Real resumes were refused for it.
+    #[test]
+    fn a_link_written_compactly_is_still_a_link() {
         let mut nodes = flat3();
         nodes[2] = node(4, "<< /Type /Page /Parent 2 0 R /Annots [9 0 R] >>");
-        let err = build_duplicate_pages_group(&nodes, &[1], 10).unwrap_err();
-        assert!(err.contains("annotations"), "{err}");
+        let compact = b"9 0 obj\n<</A<</S/URI/URI(mailto:a@b.c)>>/Border[0 0 0]/Rect[0 0 5 5]/Subtype/Link>>\nendobj\n".to_vec();
+        let annotations = [(9, compact)].into_iter().collect();
+        assert!(build_duplicate_pages_group(&nodes, &[1], 10, &annotations).is_ok());
+    }
+
+    #[test]
+    fn a_page_with_an_annotation_that_is_not_a_link_is_not_duplicated() {
+        let mut nodes = flat3();
+        nodes[2] = node(4, "<< /Type /Page /Parent 2 0 R /Annots [9 0 R] >>");
+        let annotations = [annotation(9, "Widget")].into_iter().collect();
+        let err = build_duplicate_pages_group(&nodes, &[1], 10, &annotations).unwrap_err();
+        assert!(err.contains("not a link"), "{err}");
     }
 
     #[test]

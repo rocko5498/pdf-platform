@@ -585,8 +585,31 @@ impl DocumentCoordinator {
     /// [FR-ORG-1]
     pub fn duplicate_pages(&mut self, page_indices: &[u32]) -> Result<(), SessionError> {
         let nodes = self.page_tree()?;
-        let (group, next) = build_duplicate_pages_group(&nodes, page_indices, self.next_obj_num)
-            .map_err(SessionError::Protocol)?;
+        // The annotation objects of the pages being copied, so hyperlinks can be
+        // copied instead of shared.
+        let leaves = leaf_pages(&nodes).map_err(SessionError::Protocol)?;
+        let mut annotations = std::collections::HashMap::new();
+        for leaf in Self::pages_at(&leaves, page_indices)? {
+            let page = Self::node_bytes(&nodes, leaf)?;
+            let refs = match pdf_model::organize::annotations_to_fetch(&page) {
+                None => continue,
+                Some(pdf_model::organize::AnnotsSource::Inline(refs)) => refs,
+                Some(pdf_model::organize::AnnotsSource::Indirect(array)) => {
+                    let body = self.session.get_object(array)?;
+                    annotations.insert(array, body);
+                    pdf_model::organize::annotation_refs(&page, &annotations)
+                        .map_err(SessionError::Protocol)?
+                        .unwrap_or_default()
+                }
+            };
+            for annotation in refs {
+                let body = self.session.get_object(annotation)?;
+                annotations.insert(annotation, body);
+            }
+        }
+        let (group, next) =
+            build_duplicate_pages_group(&nodes, page_indices, self.next_obj_num, &annotations)
+                .map_err(SessionError::Protocol)?;
         self.apply_command_group(group)?;
         self.next_obj_num = next;
         Ok(())
