@@ -111,3 +111,49 @@ fn rotating_a_page_is_visible_in_the_rendered_output() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A page with hyperlinks can be duplicated, and the copy gets links of its own
+/// instead of sharing the original's. Found on real resumes, which are full of
+/// links and could not be duplicated at all. [FR-ORG-1, T-12]
+#[test]
+fn duplicating_a_page_with_links_copies_the_links() {
+    if !common::qpdf_or_skip() {
+        return;
+    }
+    let dir = scratch("organize-duplicate-links");
+    let source = dir.join("links.pdf");
+    let link = |n: u32| format!("<< /Type /Annot /Subtype /Link /Rect [0 0 {n} {n}] /Border [0 0 0] /A << /S /URI /URI (https://example.com/{n}) >> >>");
+    std::fs::write(
+        &source,
+        common::assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Annots [4 0 R 5 0 R] >>".to_vec(),
+            link(10).into_bytes(),
+            link(20).into_bytes(),
+        ]),
+    )
+    .expect("write");
+
+    let mut coord = DocumentCoordinator::open(&worker_path(), &source).expect("open");
+    coord.duplicate_pages(&[0]).expect("duplicate a page that has links");
+    let saved = dir.join("out.pdf");
+    coord.save_incremental(&saved).expect("save");
+    let _ = coord.close();
+
+    let check = std::process::Command::new("qpdf").arg("--check").arg(&saved).output().expect("qpdf");
+    assert!(matches!(check.status.code(), Some(0) | Some(3)), "{}", String::from_utf8_lossy(&check.stderr));
+    let qdf = dir.join("out.qdf");
+    let status = std::process::Command::new("qpdf")
+        .args(["--qdf", "--object-streams=disable"])
+        .arg(&saved)
+        .arg(&qdf)
+        .status()
+        .expect("qpdf --qdf");
+    assert!(matches!(status.code(), Some(0) | Some(3)));
+    let text = String::from_utf8_lossy(&std::fs::read(&qdf).unwrap()).into_owned();
+    assert_eq!(text.matches("/Subtype /Link").count(), 4, "two pages with two links each, none shared");
+    let pages = std::process::Command::new("qpdf").arg("--show-npages").arg(&saved).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&pages.stdout).trim(), "2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
