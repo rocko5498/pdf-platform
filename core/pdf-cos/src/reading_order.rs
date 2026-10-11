@@ -394,9 +394,40 @@ fn decode_page(page: &PageInfo, fetch: Fetch) -> PageText {
             }
         }
     }
-    let fonts = FontTable::load(page.resources.as_deref(), fetch);
-    let properties = load_properties(page.resources.as_deref(), fetch);
-    interpret(&stream, &fonts, &properties)
+    let mut out = PageText::default();
+    let mut stack: Vec<Option<u32>> = Vec::new();
+    run(&stream, page.resources.as_deref(), fetch, &mut out, &mut stack, 0);
+    // Tidy: collapse runs of blank lines.
+    for text in out.by_mcid.values_mut() {
+        let cleaned: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+        *text = cleaned.join("\n");
+    }
+    out
+}
+
+/// How deep `Do` may nest Form XObjects. A form that draws itself, or a chain
+/// of them, ends here instead of looping. [GR-7]
+const MAX_FORM_DEPTH: usize = 8;
+
+/// The Form XObject a `Do` names: its decoded content and its own resources
+/// (or the caller's, when it declares none).
+fn load_form(
+    name: &str,
+    resources: Option<&[u8]>,
+    fetch: Fetch,
+) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let xobjects = spaced(&dict_value(resources?, b"/XObject", fetch)?);
+    let tokens: Vec<&str> = xobjects.split_whitespace().collect();
+    let num = tokens.windows(4).find_map(|w| {
+        (w[0].strip_prefix('/') == Some(name) && w[3] == "R").then(|| w[1].parse::<u32>().ok())?
+    })?;
+    let object = fetch(num)?;
+    if name_after(&object, b"/Subtype").as_deref() != Some("Form") {
+        return None;
+    }
+    let content = decode_stream_limited(&object, MAX_PAGE_STREAM).ok()?;
+    let own = dict_value(&object, b"/Resources", fetch).or_else(|| resources.map(<[u8]>::to_vec));
+    Some((content, own))
 }
 
 /// `/Properties` resource entries that carry an MCID, by name: a content stream
@@ -434,12 +465,21 @@ enum Operand {
     Dict(Vec<(String, Operand)>),
 }
 
-fn interpret(stream: &[u8], fonts: &FontTable, properties: &BTreeMap<String, u32>) -> PageText {
-    let mut out = PageText::default();
+/// Interpret one content stream (a page's, or a Form XObject's) against its
+/// own resources. Marked content opened outside a form keeps applying inside
+/// it, because `stack` and `out` are shared with the caller.
+fn run(
+    stream: &[u8],
+    resources: Option<&[u8]>,
+    fetch: Fetch,
+    out: &mut PageText,
+    stack: &mut Vec<Option<u32>>,
+    depth: usize,
+) {
+    let fonts = FontTable::load(resources, fetch);
+    let properties = load_properties(resources, fetch);
     let mut i = 0;
     let mut operands: Vec<Operand> = Vec::new();
-    // One entry per open marked-content sequence: its MCID, if it has one.
-    let mut stack: Vec<Option<u32>> = Vec::new();
     let mut font: Option<String> = None;
 
     while i < stream.len() {
@@ -479,18 +519,18 @@ fn interpret(stream: &[u8], fonts: &FontTable, properties: &BTreeMap<String, u32
                     }
                     "Tj" | "'" | "\"" => {
                         if op != "Tj" {
-                            push_text(&mut out, &stack, "\n");
+                            push_text(out, stack, "\n");
                         }
                         if let Some(Operand::Str(s)) = operands.last() {
-                            show(&mut out, &stack, fonts, font.as_deref(), s);
+                            show(out, stack, &fonts, font.as_deref(), s);
                         }
                     }
                     "TJ" => {
                         if let Some(Operand::Array(items)) = operands.last() {
                             for item in items {
                                 match item {
-                                    Operand::Str(s) => show(&mut out, &stack, fonts, font.as_deref(), s),
-                                    Operand::Num(n) if *n < -200.0 => push_text(&mut out, &stack, " "),
+                                    Operand::Str(s) => show(out, stack, &fonts, font.as_deref(), s),
+                                    Operand::Num(n) if *n < -200.0 => push_text(out, stack, " "),
                                     _ => {}
                                 }
                             }
@@ -499,23 +539,24 @@ fn interpret(stream: &[u8], fonts: &FontTable, properties: &BTreeMap<String, u32
                     "Td" | "TD" => {
                         if let Some(Operand::Num(ty)) = operands.last() {
                             if ty.abs() > 0.5 {
-                                push_text(&mut out, &stack, "\n");
+                                push_text(out, stack, "\n");
                             }
                         }
                     }
-                    "T*" | "Tm" => push_text(&mut out, &stack, "\n"),
+                    "T*" | "Tm" => push_text(out, stack, "\n"),
+                    "Do" => {
+                        if let (Some(Operand::Name(name)), true) = (operands.last(), depth < MAX_FORM_DEPTH) {
+                            if let Some((content, own)) = load_form(name, resources, fetch) {
+                                run(&content, own.as_deref(), fetch, out, stack, depth + 1);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 operands.clear();
             }
         }
     }
-    // Tidy: collapse runs of blank lines.
-    for text in out.by_mcid.values_mut() {
-        let cleaned: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
-        *text = cleaned.join("\n");
-    }
-    out
 }
 
 fn push_text(out: &mut PageText, stack: &[Option<u32>], text: &str) {
@@ -1119,5 +1160,33 @@ mod tests {
         assert_eq!(texts, ["ZY"], "{order:?}");
         assert_eq!(order.missing_content, 0, "a rule with no text is not missing content");
         assert!(!order.unreliable);
+    }
+
+    /// Text drawn by a Form XObject belongs to the marked content that invokes
+    /// it, and the form brings its own fonts. A form that invokes itself must
+    /// end, not loop.
+    #[test]
+    fn text_inside_a_form_xobject_is_read_and_a_self_referencing_form_ends() {
+        let page = "/P << /MCID 0 >> BDC /Fm0 Do EMC\n/P << /MCID 1 >> BDC /Loop Do EMC";
+        let form = "BT /F1 12 Tf (Inside the form) Tj ET";
+        let looping = "BT /F1 12 Tf (Once) Tj ET /Loop Do";
+        let doc = pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /Fm0 6 0 R /Loop 8 0 R >> >> >>".to_string(),
+            stream("", page),
+            "<< /Type /StructTreeRoot /K [9 0 R 10 0 R] >>".to_string(),
+            stream("/Type /XObject /Subtype /Form /Resources << /Font << /F1 7 0 R >> >>", form),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            stream("/Type /XObject /Subtype /Form /Resources << /Font << /F1 7 0 R >> /XObject << /Loop 8 0 R >> >>", looping),
+            "<< /Type /StructElem /S /P /P 5 0 R /Pg 3 0 R /K 0 >>".to_string(),
+            "<< /Type /StructElem /S /P /P 5 0 R /Pg 3 0 R /K 1 >>".to_string(),
+        ]);
+        let order = read_in_order(&doc).expect("tagged");
+        let texts: Vec<&str> = order.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts[0], "Inside the form");
+        // The looping form is read down to the depth limit and then stops.
+        assert!(texts[1].starts_with("Once"), "{texts:?}");
+        assert!(texts[1].matches("Once").count() <= MAX_FORM_DEPTH + 1, "{texts:?}");
     }
 }
