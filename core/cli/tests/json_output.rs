@@ -141,3 +141,61 @@ fn comment_filters_narrow_the_listing_through_the_real_binary() {
     assert!(stderr.contains("--page must be a page number"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Two paragraphs drawn in the opposite order to the one the structure tree
+/// lists them in.
+fn tagged_document_drawn_out_of_order() -> Vec<u8> {
+    let content = "/P << /MCID 1 >> BDC BT /F1 12 Tf (Second) Tj ET EMC\n/P << /MCID 0 >> BDC BT /F1 12 Tf (First) Tj ET EMC\n";
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 6 0 R >> >> >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /StructTreeRoot /K [7 0 R 8 0 R] >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        "<< /Type /StructElem /S /P /P 5 0 R /Pg 3 0 R /K 0 >>".to_string(),
+        "<< /Type /StructElem /S /P /P 5 0 R /Pg 3 0 R /K 1 >>".to_string(),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend(format!("{} 0 obj\n{body}\nendobj\n", i + 1).bytes());
+    }
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+    for o in offsets {
+        out.extend(format!("{o:010} 00000 n \n").bytes());
+    }
+    out.extend(
+        format!("trailer\n<</Size {} /Root 1 0 R>>\nstartxref\n{xref}\n%%EOF", objects.len() + 1).bytes(),
+    );
+    out
+}
+
+#[test]
+fn the_reading_order_follows_the_tree_and_an_untagged_file_is_refused() {
+    let dir = std::env::temp_dir().join(format!("pdfp-ro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("tagged.pdf");
+    std::fs::write(&file, tagged_document_drawn_out_of_order()).unwrap();
+
+    let (code, stdout, _) = run(&["export-reading-order", file.to_str().unwrap(), "--json"]);
+    assert_eq!(code, 0);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let texts: Vec<&str> = value["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["First", "Second"]);
+
+    let untagged = fixture("valid-3page.pdf");
+    let (code, stdout, stderr) = run(&["export-reading-order", untagged.to_str().unwrap()]);
+    assert_eq!(code, 2);
+    assert!(stdout.is_empty(), "{stdout:?}");
+    assert!(stderr.contains("not tagged"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

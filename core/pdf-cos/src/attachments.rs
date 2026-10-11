@@ -9,7 +9,7 @@
 //! bytes. It never opens, runs or interprets them.
 
 use crate::scan::{
-    fetch_object_bytes, find_indirect_ref, find_key, find_startxref, find_trailer, parse_uint,
+    fetch_object_bytes, find_indirect_ref, find_key, find_startxref, section_dictionary, parse_uint,
     parse_xref_chain, skip_ws,
 };
 use crate::xref::decode_stream_limited;
@@ -43,10 +43,10 @@ pub fn list_embedded_files(data: &[u8]) -> Vec<EmbeddedFile> {
     let Ok(xref) = parse_xref_chain(data, xref_offset, &mut leniency) else {
         return Vec::new();
     };
-    let Some(trailer) = find_trailer(data, xref_offset) else {
+    let Some(trailer) = section_dictionary(data, xref_offset) else {
         return Vec::new();
     };
-    let Some((root, _)) = find_indirect_ref(trailer, b"/Root") else {
+    let Some((root, _)) = find_indirect_ref(&trailer, b"/Root") else {
         return Vec::new();
     };
     let fetch = |num: u32| fetch_object_bytes(data, &xref, num);
@@ -136,7 +136,7 @@ fn filespec(spec: &[u8], key: &str, fetch: Fetch) -> Option<EmbeddedFile> {
 }
 
 /// The dictionary a key holds, whether written inline or as a reference.
-fn dict_value(parent: &[u8], key: &[u8], fetch: Fetch) -> Option<Vec<u8>> {
+pub(crate) fn dict_value(parent: &[u8], key: &[u8], fetch: Fetch) -> Option<Vec<u8>> {
     if let Some((num, _)) = find_indirect_ref(parent, key) {
         return fetch(num);
     }
@@ -204,7 +204,8 @@ pub(crate) fn array_after(node: &[u8], key: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn refs_in(array: &[u8]) -> Vec<u32> {
-    let text = String::from_utf8_lossy(array);
+    // `7 0 R/Next` and `7 0 R]` are references too: split on delimiters as well.
+    let text = String::from_utf8_lossy(array).replace(['/', '[', ']', '<', '>'], " ");
     let tokens: Vec<&str> = text.split_whitespace().collect();
     tokens
         .windows(3)

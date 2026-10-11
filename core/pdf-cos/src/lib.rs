@@ -3,6 +3,7 @@ pub mod attachments;
 pub mod comments;
 pub mod leniency;
 pub mod ocg;
+pub mod reading_order;
 pub mod revisions;
 pub mod scan;
 pub mod xref;

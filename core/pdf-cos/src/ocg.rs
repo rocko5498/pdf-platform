@@ -8,7 +8,7 @@
 //! already parses the catalog, so it is read here rather than left unanswered.
 
 use crate::scan::{
-    fetch_object_bytes, find_indirect_ref, find_key, find_startxref, find_trailer, parse_xref_chain,
+    fetch_object_bytes, find_indirect_ref, find_key, find_startxref, section_dictionary, parse_xref_chain,
 };
 
 /// One optional content group as the document declares it.
@@ -42,10 +42,10 @@ pub fn parse_optional_content_groups(data: &[u8]) -> Vec<OptionalContentGroup> {
     let Ok(xref) = parse_xref_chain(data, xref_offset, &mut leniency) else {
         return Vec::new();
     };
-    let Some(trailer) = find_trailer(data, xref_offset) else {
+    let Some(trailer) = section_dictionary(data, xref_offset) else {
         return Vec::new();
     };
-    let Some((root_num, _)) = find_indirect_ref(trailer, b"/Root") else {
+    let Some((root_num, _)) = find_indirect_ref(&trailer, b"/Root") else {
         return Vec::new();
     };
     let Some(catalog) = fetch_object_bytes(data, &xref, root_num) else {

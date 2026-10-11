@@ -8,7 +8,7 @@
 
 use crate::attachments::{array_after, read_string, refs_in, Fetch};
 use crate::scan::{
-    fetch_object_bytes, find_indirect_ref, find_key, find_startxref, find_trailer, parse_xref_chain,
+    fetch_object_bytes, find_indirect_ref, find_key, find_startxref, section_dictionary, parse_xref_chain,
     skip_ws,
 };
 
@@ -47,10 +47,10 @@ pub fn list_comments(data: &[u8]) -> Vec<Comment> {
     let Ok(xref) = parse_xref_chain(data, xref_offset, &mut leniency) else {
         return Vec::new();
     };
-    let Some(trailer) = find_trailer(data, xref_offset) else {
+    let Some(trailer) = section_dictionary(data, xref_offset) else {
         return Vec::new();
     };
-    let Some((root, _)) = find_indirect_ref(trailer, b"/Root") else {
+    let Some((root, _)) = find_indirect_ref(&trailer, b"/Root") else {
         return Vec::new();
     };
     let fetch = |num: u32| fetch_object_bytes(data, &xref, num);
