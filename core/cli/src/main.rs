@@ -123,6 +123,7 @@ fn main() {
         "move-pages",
         "duplicate-pages",
         "insert-blank",
+        "insert-pages",
         "stamp",
         "redact-by-term",
         "validate-signatures",
@@ -168,6 +169,10 @@ fn main() {
     }
     if cmd == "export-html" {
         cmd_export_html(&path, &rest);
+        return;
+    }
+    if cmd == "insert-pages" {
+        cmd_insert_pages(&path, &rest);
         return;
     }
     if cmd == "extract-attachments" {
@@ -1007,6 +1012,118 @@ fn cmd_extract_attachments(path: &Path, rest: &[String]) {
             eprintln!("error: {e}");
             process::exit(2);
         }
+    }
+}
+
+/// Which input a planned run of pages comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertSource {
+    Base,
+    Other,
+}
+
+/// The page runs that make up the result of inserting `other_range` (1-based,
+/// inclusive) of another document so that its first page becomes page `at` of
+/// a `base_count`-page document. `at` of `base_count + 1` appends.
+/// [FR-INSERT-1]
+fn plan_insertion(
+    base_count: u32,
+    at: u32,
+    other_range: (u32, u32),
+) -> Result<Vec<(InsertSource, u32, u32)>, String> {
+    if at == 0 || at > base_count + 1 {
+        return Err(format!(
+            "--at {at} is outside 1..={}: the document has {base_count} page(s)",
+            base_count + 1
+        ));
+    }
+    let mut plan = Vec::new();
+    if at > 1 {
+        plan.push((InsertSource::Base, 1, at - 1));
+    }
+    plan.push((InsertSource::Other, other_range.0, other_range.1));
+    if at <= base_count {
+        plan.push((InsertSource::Base, at, base_count));
+    }
+    Ok(plan)
+}
+
+/// Insert pages from another PDF. [FR-INSERT-1, FR-ORG-2, FR-CLI-1]
+///
+/// Usage: pdf-platform insert-pages <file> --from <other.pdf> [--range 2-4] --at N -o <out.pdf>
+///
+/// This goes through qpdf, so the result is a rewritten file, not an
+/// incremental update: signatures and earlier revisions are not carried over,
+/// and the output says so. (The page operations that edit in place are the
+/// other `*-pages` commands.) [PRIN-2, GR-8]
+fn cmd_insert_pages(path: &Path, rest: &[String]) {
+    use pdf_model::assembly_ops::{merge_pdfs_with_ranges, pdf_page_count, PageRange};
+
+    let fail = |code: i32, message: String| -> ! {
+        eprintln!("error: {message}");
+        process::exit(code);
+    };
+    let (_, out) = parse_dash_o(rest).unwrap_or_else(|e| fail(1, e));
+    let Some(from) = flag_value(rest, "--from") else {
+        fail(1, "insert-pages needs --from <other.pdf>".into());
+    };
+    let Some(at_text) = flag_value(rest, "--at") else {
+        fail(1, "insert-pages needs --at <page>".into());
+    };
+    let at = parse_position(at_text, "--at").unwrap_or_else(|e| fail(1, e)) + 1;
+    let from = PathBuf::from(from);
+    if !from.exists() {
+        fail(1, format!("not found: {}", from.display()));
+    }
+    if out.exists() {
+        fail(1, format!("{} already exists; choose a new -o", out.display()));
+    }
+    let base_count = pdf_page_count(path).unwrap_or_else(|e| fail(2, e.to_string()));
+    let other_count = pdf_page_count(&from).unwrap_or_else(|e| fail(2, e.to_string()));
+    let range = match flag_value(rest, "--range") {
+        None => (1, other_count),
+        Some(spec) => {
+            let (a, b) = spec.split_once('-').unwrap_or((spec, spec));
+            let number = |s: &str| {
+                s.trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("'{}' is not a page number", s.trim()))
+            };
+            let (first, last) = (
+                number(a).unwrap_or_else(|e| fail(1, e)),
+                number(b).unwrap_or_else(|e| fail(1, e)),
+            );
+            check_page_range(first, last).unwrap_or_else(|e| fail(1, e));
+            if last > other_count {
+                fail(
+                    1,
+                    format!("--range ends at {last}; {} has {other_count} page(s)", from.display()),
+                );
+            }
+            (first, last)
+        }
+    };
+    let plan = plan_insertion(base_count, at, range).unwrap_or_else(|e| fail(1, e));
+    let runs: Vec<PageRange> = plan
+        .iter()
+        .map(|&(source, first, last)| {
+            let file = if source == InsertSource::Base { path } else { from.as_path() };
+            PageRange::range(file, first, last)
+        })
+        .collect();
+    match merge_pdfs_with_ranges(&runs, &out) {
+        Ok(()) => {
+            println!(
+                "inserted {} page(s) of {} at page {at} -> {} ({} page(s)); \
+                 rewritten copy: signatures and earlier revisions are not carried over",
+                range.1 - range.0 + 1,
+                from.display(),
+                out.display(),
+                base_count + (range.1 - range.0 + 1)
+            );
+            process::exit(0);
+        }
+        Err(e) => fail(2, e.to_string()),
     }
 }
 
@@ -4589,5 +4706,29 @@ mod attachment_tests {
         assert_eq!(written, vec![("data.bin".to_string(), payload.len())]);
         assert_eq!(std::fs::read(dir.join("out").join("data.bin")).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod insert_pages_tests {
+    use super::*;
+    use InsertSource::{Base, Other};
+
+    #[test]
+    fn the_plan_puts_the_inserted_pages_exactly_where_asked() {
+        // 5-page document, insert pages 2-3 of another so they become pages 3-4.
+        assert_eq!(
+            plan_insertion(5, 3, (2, 3)).unwrap(),
+            [(Base, 1, 2), (Other, 2, 3), (Base, 3, 5)]
+        );
+        // At the front, and appended.
+        assert_eq!(plan_insertion(5, 1, (1, 1)).unwrap(), [(Other, 1, 1), (Base, 1, 5)]);
+        assert_eq!(plan_insertion(5, 6, (1, 2)).unwrap(), [(Base, 1, 5), (Other, 1, 2)]);
+    }
+
+    #[test]
+    fn a_position_outside_the_document_is_refused() {
+        assert!(plan_insertion(5, 7, (1, 1)).is_err());
+        assert!(plan_insertion(5, 0, (1, 1)).is_err());
     }
 }
