@@ -173,7 +173,7 @@ fn main() {
         return;
     }
     if cmd == "comments" {
-        cmd_comments(&path);
+        cmd_comments(&path, &rest);
         return;
     }
     if cmd == "insert-pages" {
@@ -1132,15 +1132,65 @@ fn cmd_insert_pages(path: &Path, rest: &[String]) {
     }
 }
 
+/// Which comments `comments` keeps. A field left `None` keeps everything.
+#[derive(Debug, Default)]
+struct CommentFilter {
+    /// Exact author, compared case-insensitively.
+    author: Option<String>,
+    /// Annotation subtype such as `Highlight`, compared case-insensitively.
+    kind: Option<String>,
+    page: Option<u32>,
+    /// `Some(true)` keeps replies only, `Some(false)` drops them.
+    replies: Option<bool>,
+}
+
+fn filter_comments(
+    comments: Vec<pdf_cos::comments::Comment>,
+    filter: &CommentFilter,
+) -> Vec<pdf_cos::comments::Comment> {
+    comments
+        .into_iter()
+        .filter(|c| {
+            filter.author.as_ref().is_none_or(|a| c.author.eq_ignore_ascii_case(a))
+                && filter.kind.as_ref().is_none_or(|k| c.subtype.eq_ignore_ascii_case(k))
+                && filter.page.is_none_or(|p| c.page == p)
+                && filter.replies.is_none_or(|r| c.is_reply == r)
+        })
+        .collect()
+}
+
 /// List the document's comments. [FR-REV-2, FR-REV-3, US-STU-7]
 ///
-/// Usage: pdf-platform comments <file> [--json]
-fn cmd_comments(path: &Path) {
+/// Usage: pdf-platform comments <file> [--author NAME] [--type Text|Highlight|...]
+///        [--page N] [--replies-only | --no-replies] [--json]
+fn cmd_comments(path: &Path, rest: &[String]) {
+    let filter = CommentFilter {
+        author: flag_value(rest, "--author").map(str::to_string),
+        kind: flag_value(rest, "--type").map(str::to_string),
+        page: flag_value(rest, "--page").map(|p| {
+            p.trim().parse::<u32>().unwrap_or_else(|_| {
+                eprintln!("error: --page must be a page number, got '{p}'");
+                process::exit(1);
+            })
+        }),
+        replies: match (
+            rest.iter().any(|a| a == "--replies-only"),
+            rest.iter().any(|a| a == "--no-replies"),
+        ) {
+            (true, true) => {
+                eprintln!("error: --replies-only and --no-replies contradict each other");
+                process::exit(1);
+            }
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        },
+    };
     let data = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("error: cannot read {}: {e}", path.display());
         process::exit(2);
     });
-    let comments: Vec<pdf_cos::comments::Comment> = pdf_cos::comments::list_comments(&data);
+    let comments = filter_comments(pdf_cos::comments::list_comments(&data), &filter);
     if json_mode() {
         let list: Vec<_> = comments
             .iter()
@@ -4777,5 +4827,40 @@ mod insert_pages_tests {
     fn a_position_outside_the_document_is_refused() {
         assert!(plan_insertion(5, 7, (1, 1)).is_err());
         assert!(plan_insertion(5, 0, (1, 1)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod comment_filter_tests {
+    use super::*;
+    use pdf_cos::comments::Comment;
+
+    fn c(page: u32, kind: &str, author: &str, reply: bool) -> Comment {
+        Comment {
+            page,
+            subtype: kind.into(),
+            author: author.into(),
+            contents: String::new(),
+            modified: String::new(),
+            is_reply: reply,
+        }
+    }
+
+    #[test]
+    fn each_filter_keeps_only_what_it_names_and_they_combine() {
+        let all = vec![
+            c(1, "Highlight", "Ana", false),
+            c(2, "Text", "Ben", false),
+            c(2, "Text", "ana", true),
+        ];
+        let by = |f: CommentFilter| filter_comments(all.clone(), &f).len();
+        assert_eq!(by(CommentFilter::default()), 3);
+        assert_eq!(by(CommentFilter { author: Some("ANA".into()), ..Default::default() }), 2);
+        assert_eq!(by(CommentFilter { kind: Some("text".into()), ..Default::default() }), 2);
+        assert_eq!(by(CommentFilter { page: Some(2), ..Default::default() }), 2);
+        assert_eq!(by(CommentFilter { replies: Some(true), ..Default::default() }), 1);
+        assert_eq!(by(CommentFilter { replies: Some(false), ..Default::default() }), 2);
+        let both = CommentFilter { author: Some("ana".into()), page: Some(2), ..Default::default() };
+        assert_eq!(by(both), 1);
     }
 }
