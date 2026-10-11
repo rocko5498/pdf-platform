@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use engine_api::extract::{Extract, ExtractError, PageTextModel};
 
@@ -25,14 +25,25 @@ struct CacheKey {
 /// bumps the revision and old entries become stale (evicted on next access).
 pub struct TextExtractionService {
     cache: HashMap<CacheKey, PageTextModel>,
+    /// Insertion order of the cached pages, oldest first, for eviction.
+    order: VecDeque<u32>,
     current_revision: u64,
 }
+
+/// The most page models held at once. Searching a 2,000-page document used to
+/// keep every page's model for the life of the session; this is the bound
+/// ADR-011 and GR-7 require. The oldest page is evicted first, and an evicted
+/// page is simply extracted again if it is needed.
+/// shortcut: a page-count bound, not a byte bound, since page models vary in
+/// size; upgrade to a weighted bound under the MemoryGovernor (SDS §8.5).
+pub const MAX_CACHED_PAGES: usize = 512;
 
 impl TextExtractionService {
     /// Create a new empty service.
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            order: VecDeque::new(),
             current_revision: 0,
         }
     }
@@ -42,6 +53,7 @@ impl TextExtractionService {
     pub fn invalidate(&mut self) {
         self.current_revision += 1;
         self.cache.clear();
+        self.order.clear();
     }
 
     /// Get the text model for a page, extracting if not cached.
@@ -57,7 +69,7 @@ impl TextExtractionService {
 
         if !self.cache.contains_key(&key) {
             let model = engine.extract_page(page_index)?;
-            self.cache.insert(key, model);
+            self.store(key, model);
         }
 
         Ok(self.cache.get(&key).unwrap())
@@ -112,6 +124,20 @@ impl TextExtractionService {
     /// Clear the cache (e.g., on document close).
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.order.clear();
+    }
+
+    /// Insert a model, evicting the oldest pages beyond [`MAX_CACHED_PAGES`].
+    fn store(&mut self, key: CacheKey, model: PageTextModel) {
+        if self.cache.insert(key, model).is_none() {
+            self.order.push_back(key.page_index);
+        }
+        while self.cache.len() > MAX_CACHED_PAGES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.cache.remove(&CacheKey { page_index: oldest, revision: self.current_revision });
+        }
     }
 
     /// Insert a pre-extracted page model into the cache. [ADR-019]
@@ -123,7 +149,7 @@ impl TextExtractionService {
             page_index: model.page_index,
             revision: self.current_revision,
         };
-        self.cache.insert(key, model);
+        self.store(key, model);
     }
 }
 
@@ -287,5 +313,33 @@ mod tests {
         let result = SearchResult::from_service(&service, "test", 1);
         assert_eq!(result.total_matches, 3);
         assert!(!result.has_unreliable);
+    }
+
+    #[test]
+    fn the_cache_is_bounded_and_evicts_the_oldest_page_first() {
+        let mut service = TextExtractionService::new();
+        let total = MAX_CACHED_PAGES as u32 + 40;
+        for page in 0..total {
+            service.insert_model(MockEngine::with_model(page, "text").models.remove(&page).unwrap());
+        }
+        assert_eq!(service.cached_page_count(), MAX_CACHED_PAGES);
+        // The 40 oldest are gone; the newest is still there.
+        assert!(service.get_cached(0).is_none());
+        assert!(service.get_cached(39).is_none());
+        assert!(service.get_cached(40).is_some());
+        assert!(service.get_cached(total - 1).is_some());
+    }
+
+    #[test]
+    fn an_evicted_page_is_extracted_again_on_demand() {
+        let mut service = TextExtractionService::new();
+        let engine = MockEngine::with_model(0, "again");
+        for page in 1..=MAX_CACHED_PAGES as u32 {
+            service.insert_model(MockEngine::with_model(page, "x").models.remove(&page).unwrap());
+        }
+        service.insert_model(engine.models[&0].clone());
+        assert_eq!(service.cached_page_count(), MAX_CACHED_PAGES);
+        assert!(service.get_cached(1).is_none(), "page 1 should have been evicted");
+        assert!(service.get_cached(0).is_some());
     }
 }
