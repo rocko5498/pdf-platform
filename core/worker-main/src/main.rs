@@ -1032,6 +1032,7 @@ fn scan_and_encode(
         has_acroform: ds.has_acroform,
         has_xfa: ds.has_xfa,
         has_js: ds.has_js,
+        is_tagged: ds.is_tagged,
         sig_count: ds.sig_count,
         leniency_count: leniency_events.len() as u32,
         leniency_events,

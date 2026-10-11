@@ -214,12 +214,13 @@ pub fn encode_worker_event(event: &WorkerEvent) -> Vec<u8> {
             let mut out = format!(
                 "EVT:SUMMARY:{correlation_id}\n\
                  root={}\npage_count={}\nhas_acroform={}\nhas_xfa={}\n\
-                 has_js={}\nsig_count={}\nleniency_count={}\n",
+                 has_js={}\nis_tagged={}\nsig_count={}\nleniency_count={}\n",
                 summary.root_obj_num,
                 summary.page_count,
                 u8::from(summary.has_acroform),
                 u8::from(summary.has_xfa),
                 u8::from(summary.has_js),
+                u8::from(summary.is_tagged),
                 summary.sig_count,
                 summary.leniency_count,
             );
@@ -511,6 +512,7 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
             let mut has_acroform = None;
             let mut has_xfa = None;
             let mut has_js = None;
+            let mut is_tagged = false;
             let mut sig_count = None;
             let mut leniency_count = None;
             let mut leniency_events = Vec::new();
@@ -548,6 +550,12 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
                                 .map_err(|_| EventDecodeError::BadField("has_js"))?
                                 != 0,
                         )
+                    }
+                    "is_tagged" => {
+                        is_tagged = v
+                            .parse::<u8>()
+                            .map_err(|_| EventDecodeError::BadField("is_tagged"))?
+                            != 0
                     }
                     "sig_count" => {
                         sig_count = Some(
@@ -595,6 +603,7 @@ pub fn decode_worker_event(body: &[u8]) -> Result<WorkerEvent, EventDecodeError>
                     has_acroform: has_acroform.ok_or(EventDecodeError::BadField("has_acroform"))?,
                     has_xfa: has_xfa.ok_or(EventDecodeError::BadField("has_xfa"))?,
                     has_js: has_js.ok_or(EventDecodeError::BadField("has_js"))?,
+                    is_tagged,
                     sig_count: sig_count.ok_or(EventDecodeError::BadField("sig_count"))?,
                     leniency_count: leniency_count
                         .ok_or(EventDecodeError::BadField("leniency_count"))?,
@@ -1047,6 +1056,7 @@ mod tests {
                 has_acroform: true,
                 has_xfa: false,
                 has_js: true,
+                is_tagged: true,
                 sig_count: 1,
                 leniency_count: 2,
                 leniency_events: vec!["repaired xref".into(), "missing font".into()],

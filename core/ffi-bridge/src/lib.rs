@@ -186,6 +186,7 @@ fn open_document_impl(path: &str, password: &str) -> Result<ffi::OpenResultFFI, 
             has_acroform: false,
             has_xfa: false,
             has_js: false,
+            is_tagged: false,
             sig_count: 0,
             leniency_count: 0,
             leniency_events: vec![],
@@ -324,6 +325,7 @@ fn diagnostics_impl() -> Result<String, String> {
         out.push_str(&format!("AcroForm: {}\n", s.has_acroform));
         out.push_str(&format!("JavaScript: {}\n", s.has_js));
         out.push_str(&format!("XFA: {}\n", s.has_xfa));
+        out.push_str(&format!("Tagged: {}\n", s.is_tagged));
         out.push_str(&format!("Signatures: {}\n", s.sig_count));
         out.push_str(&format!("Leniency: {}\n", s.leniency_count));
         for e in &s.leniency_events {
