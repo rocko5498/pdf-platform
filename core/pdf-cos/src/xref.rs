@@ -479,6 +479,47 @@ fn parse_signed_int(data: &[u8], pos: &mut usize) -> Option<i64> {
 }
 
 /// Find the stream content between "stream\n" and "endstream" in a stream object body.
+/// Decode a stream object's data, refusing to produce more than `max_bytes`.
+///
+/// `decompress_stream` is unbounded, which is fine for the document's own
+/// object and xref streams but not for an attachment, whose size the document
+/// chooses. Only FlateDecode and unfiltered streams are handled; a predictor
+/// or another filter is refused rather than returned still encoded. [GR-7, GR-8]
+///
+/// # Errors
+/// When the object has no stream, uses an unsupported filter or decode
+/// parameters, or decodes to more than `max_bytes`.
+pub fn decode_stream_limited(stream_obj_body: &[u8], max_bytes: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let dict = dictionary_part(stream_obj_body);
+    let content = find_stream_content(stream_obj_body).ok_or("object has no stream data")?;
+    let has = |needle: &[u8]| dict.windows(needle.len()).any(|w| w == needle);
+    if has(b"/DecodeParms") || has(b"/Predictor") {
+        return Err("stream uses decode parameters this reader does not apply".into());
+    }
+    if has(b"/FlateDecode") || has(b"/Fl ") {
+        let mut out = Vec::new();
+        let mut zlib = flate2::read::ZlibDecoder::new(content).take(max_bytes as u64 + 1);
+        zlib.read_to_end(&mut out)
+            .map_err(|e| format!("FlateDecode failed: {e}"))?;
+        if out.len() > max_bytes {
+            return Err(format!("decoded data exceeds the {max_bytes}-byte limit"));
+        }
+        Ok(out)
+    } else if has(b"/Filter") {
+        Err("stream uses a filter this reader does not apply".into())
+    } else {
+        let end = content
+            .strip_suffix(b"\r\n")
+            .or_else(|| content.strip_suffix(b"\n"))
+            .unwrap_or(content);
+        if end.len() > max_bytes {
+            return Err(format!("data exceeds the {max_bytes}-byte limit"));
+        }
+        Ok(end.to_vec())
+    }
+}
+
 fn find_stream_content(body: &[u8]) -> Option<&[u8]> {
     // Look for "stream" followed by \n or \r\n.
     let stream_marker = b"stream";

@@ -70,6 +70,7 @@ fn main() {
         "export-text",
         "export-images",
         "export-html",
+        "extract-attachments",
         "optimize-preflight",
         "merge",
         "split",
@@ -127,6 +128,10 @@ fn main() {
     }
     if cmd == "export-html" {
         cmd_export_html(&path, &rest);
+        return;
+    }
+    if cmd == "extract-attachments" {
+        cmd_extract_attachments(&path, &rest);
         return;
     }
     if cmd == "merge" {
@@ -231,6 +236,7 @@ fn usage() {
          \x20 pdf-platform export-text <file> [page]\n\
          \x20 pdf-platform export-images <file> -o <outdir> [--dpi N]\n\
          \x20 pdf-platform export-html <file> -o <out.html>\n\
+         \x20 pdf-platform extract-attachments <file> -o <dir>\n\
          \x20 pdf-platform optimize-preflight <file> [screen|print|archive]\n\
          \x20 pdf-platform merge <file1> <file2> [...] -o <out.pdf>\n\
          \x20 pdf-platform split <file> -o <outdir>\n\
@@ -838,6 +844,100 @@ fn cmd_export_html(path: &Path, rest: &[String]) {
         Ok(pages) => {
             println!("exported {pages} page(s) to {}", out.display());
             process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// The most one attachment may decode to. A document chooses its attachments'
+/// sizes, so the reader chooses the ceiling. [GR-7]
+const MAX_ATTACHMENT_BYTES: usize = 256 * 1024 * 1024;
+
+/// A name that is safe to create inside the output directory. An attachment's
+/// name is document-supplied: `..\..\startup\x.exe` must not leave the folder.
+/// [FR-EMB-4, NFR-SEC-1]
+fn safe_attachment_name(name: &str, taken: &[String]) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_control() || ":*?\"<>|".contains(c) { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').to_string();
+    let stem = if cleaned.is_empty() { "attachment".to_string() } else { cleaned };
+    let mut candidate = stem.clone();
+    let mut n = 2;
+    while taken.iter().any(|t| t.eq_ignore_ascii_case(&candidate)) {
+        candidate = match stem.rsplit_once('.') {
+            Some((a, b)) if !a.is_empty() => format!("{a}-{n}.{b}"),
+            _ => format!("{stem}-{n}"),
+        };
+        n += 1;
+    }
+    candidate
+}
+
+/// Write every embedded file of `data` into `out_dir`; returns (name, bytes).
+/// Never opens or runs anything it writes. [FR-EMB-1, FR-EMB-4]
+fn extract_attachments(data: &[u8], out_dir: &Path) -> Result<Vec<(String, usize)>, String> {
+    let files: Vec<pdf_cos::attachments::EmbeddedFile> =
+        pdf_cos::attachments::list_embedded_files(data);
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
+    let mut written: Vec<(String, usize)> = Vec::new();
+    let mut taken: Vec<String> = Vec::new();
+    for file in &files {
+        let bytes = pdf_cos::attachments::extract_embedded_file(data, file, MAX_ATTACHMENT_BYTES)
+            .map_err(|e| format!("{}: {e}", file.name))?;
+        let name = safe_attachment_name(&file.name, &taken);
+        let target = out_dir.join(&name);
+        // create_new: never replace a file that is already there.
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
+        std::io::Write::write_all(&mut handle, &bytes)
+            .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+        taken.push(name.clone());
+        written.push((name, bytes.len()));
+    }
+    Ok(written)
+}
+
+/// Extract embedded files. [FR-EMB-1, FR-EMB-3, FR-CLI-1]
+///
+/// Usage: pdf-platform extract-attachments <file> -o <dir>
+fn cmd_extract_attachments(path: &Path, rest: &[String]) {
+    let (extra, out) = match parse_dash_o(rest) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+    if !extra.is_empty() {
+        eprintln!("error: unexpected argument(s): {}", extra.join(" "));
+        process::exit(1);
+    }
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", path.display());
+            process::exit(2);
+        }
+    };
+    match extract_attachments(&data, &out) {
+        Ok(files) if files.is_empty() => {
+            println!("no embedded files");
+        }
+        Ok(files) => {
+            for (name, size) in &files {
+                println!("{name} ({size} bytes)");
+            }
+            println!("extracted {} file(s) to {}", files.len(), out.display());
         }
         Err(e) => {
             eprintln!("error: {e}");
@@ -4361,5 +4461,54 @@ mod batch_tests {
 
         std::env::remove_var("PDF_PLATFORM_INDEX_DIR");
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    #[test]
+    fn hostile_names_stay_inside_the_folder_and_collisions_are_kept_apart() {
+        assert_eq!(safe_attachment_name("..\\..\\startup\\evil.exe", &[]), "evil.exe");
+        assert_eq!(safe_attachment_name("../../etc/passwd", &[]), "passwd");
+        assert_eq!(safe_attachment_name("C:\\x\\a:b.txt", &[]), "a_b.txt");
+        assert_eq!(safe_attachment_name("", &[]), "attachment");
+        assert_eq!(safe_attachment_name("..", &[]), "attachment");
+        let taken = vec!["a.txt".to_string()];
+        assert_eq!(safe_attachment_name("A.TXT", &taken), "A-2.TXT");
+    }
+
+    /// A file embedded by qpdf, a producer that is not this codebase, comes out
+    /// byte for byte through the real command path. [T-12]
+    #[test]
+    fn a_file_embedded_by_qpdf_is_extracted_exactly() {
+        if std::process::Command::new("qpdf").arg("--version").output().is_err() {
+            eprintln!("skipped: qpdf not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pdfp-att-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("data.bin"), &payload).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/corpus-diff/fixtures/valid-1page.pdf");
+        let status = std::process::Command::new("qpdf")
+            .arg(&source)
+            .arg("--add-attachment")
+            .arg(dir.join("data.bin"))
+            .arg("--key=data.bin")
+            .arg("--")
+            .arg(dir.join("with.pdf"))
+            .status()
+            .unwrap();
+        assert!(status.code().is_some_and(|c| c == 0 || c == 3), "qpdf failed");
+
+        let data = std::fs::read(dir.join("with.pdf")).unwrap();
+        let written = extract_attachments(&data, &dir.join("out")).unwrap();
+        assert_eq!(written, vec![("data.bin".to_string(), payload.len())]);
+        assert_eq!(std::fs::read(dir.join("out").join("data.bin")).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
