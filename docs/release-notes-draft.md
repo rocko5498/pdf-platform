@@ -5,7 +5,7 @@
 Every claim below must be re-checked against the release commit's CI logs before use.
 Per-criterion evidence: [milestone-exit-tracker.md](milestone-exit-tracker.md).
 
-## Shipped since the 2026-10-10 baseline (merged PRs #87 to #104)
+## Shipped since the 2026-10-10 baseline (merged PRs #87 to #114)
 
 - **Opening real-world files** [FR-VIEW-2]: linearized files, PNG/TIFF-predictor cross-reference
   and object streams, compact incremental sections chained by `/Prev`, `startxref` beyond the
@@ -21,6 +21,11 @@ Per-criterion evidence: [milestone-exit-tracker.md](milestone-exit-tracker.md).
 - **Page thumbnails** [FR-THUMB-1]: lazy "Pages" dock.
 - **Menu bar** built from the declared taxonomy [ADR-032].
 - **Tagged flag** [FR-A11Y-1]: a tagged document now reports as structured.
+- **Saving cannot truncate a document** [FR-REC-2, MET-REL-2]: the coordinator's save stages, syncs and renames. (The shell's own save path is a draft awaiting review and is **not** in this list until merged.)
+- **Previous View / Next View** [FR-NAV-3]: Alt+Left / Alt+Right; registry profile 0.4.0.
+- **Attachments and comments** (CLI) [FR-EMB-1, FR-REV-3]: `extract-attachments`, `comments`.
+- **Insert pages from another PDF** (CLI, via qpdf, a rewritten copy) [FR-INSERT-1].
+- **Machine-readable output** [FR-CLI-3]: `--json` for four commands; documented exit codes.
 
 ## Non-claims (must stay in the final changelog) [ROAD-2, GR-8]
 
@@ -28,8 +33,9 @@ Per-criterion evidence: [milestone-exit-tracker.md](milestone-exit-tracker.md).
 - No hard p95 performance claim: no pinned reference hardware run (MET-PERF-*, MET-GOV-1).
 - Screen-reader behaviour is not verified; the a11y audit is static.
 - Reading order of tagged documents is **not** exposed or exported (FR-A11Y-1 exposure, FR-A11Y-3).
-- Page operations, export, revisions and sanitize are CLI only; no GUI.
-- Thumbnails cannot be dragged to reorder or rotate pages.
+- Page operations, export, revisions, sanitize, attachments, comments and insert are CLI only; no GUI. `--json` covers four commands only.
+- Thumbnails cannot be dragged to reorder or rotate pages; layers cannot be toggled.
+- Comments are listed, not filtered, threaded or status-tracked; `insert-pages` is not incremental and does not keep signatures.
 - Corpus is synthetic plus qpdf-generated shapes; no real-world corpus sweep.
 - Save of encrypted documents is refused, not supported.
 - Partial or version-2 scope, labelled as such: forms JavaScript, redaction (not implemented),
