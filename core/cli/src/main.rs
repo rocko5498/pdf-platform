@@ -22,7 +22,7 @@ fn json_mode() -> bool {
 }
 
 /// The commands whose output has a machine-readable form.
-const JSON_COMMANDS: [&str; 3] = ["summary", "revisions", "extract-attachments"];
+const JSON_COMMANDS: [&str; 4] = ["summary", "revisions", "extract-attachments", "comments"];
 
 /// The command a given argument list will run: the named command, or the
 /// summary when the first argument is a file. Mirrors `main`'s dispatch.
@@ -124,6 +124,7 @@ fn main() {
         "duplicate-pages",
         "insert-blank",
         "insert-pages",
+        "comments",
         "stamp",
         "redact-by-term",
         "validate-signatures",
@@ -169,6 +170,10 @@ fn main() {
     }
     if cmd == "export-html" {
         cmd_export_html(&path, &rest);
+        return;
+    }
+    if cmd == "comments" {
+        cmd_comments(&path);
         return;
     }
     if cmd == "insert-pages" {
@@ -1125,6 +1130,48 @@ fn cmd_insert_pages(path: &Path, rest: &[String]) {
         }
         Err(e) => fail(2, e.to_string()),
     }
+}
+
+/// List the document's comments. [FR-REV-2, FR-REV-3, US-STU-7]
+///
+/// Usage: pdf-platform comments <file> [--json]
+fn cmd_comments(path: &Path) {
+    let data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("error: cannot read {}: {e}", path.display());
+        process::exit(2);
+    });
+    let comments: Vec<pdf_cos::comments::Comment> = pdf_cos::comments::list_comments(&data);
+    if json_mode() {
+        let list: Vec<_> = comments
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "page": c.page,
+                    "type": c.subtype,
+                    "author": c.author,
+                    "text": c.contents,
+                    "modified": c.modified,
+                    "reply": c.is_reply,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "comments": list }));
+        process::exit(0);
+    }
+    if comments.is_empty() {
+        println!("no comments");
+        process::exit(0);
+    }
+    for c in &comments {
+        let who = if c.author.is_empty() { "(no author)" } else { c.author.as_str() };
+        let reply = if c.is_reply { " [reply]" } else { "" };
+        println!("p.{} {} by {who}{reply}", c.page, c.subtype);
+        if !c.contents.is_empty() {
+            println!("    {}", c.contents.replace('\n', "\n    "));
+        }
+    }
+    println!("{} comment(s)", comments.len());
+    process::exit(0);
 }
 
 fn cmd_merge(first: &Path, rest: &[String]) {

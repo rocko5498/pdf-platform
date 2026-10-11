@@ -19,7 +19,7 @@ use crate::xref::decode_stream_limited;
 const MAX_NODES: usize = 2000;
 const MAX_DEPTH: usize = 8;
 
-type Fetch<'a> = &'a dyn Fn(u32) -> Option<Vec<u8>>;
+pub(crate) type Fetch<'a> = &'a dyn Fn(u32) -> Option<Vec<u8>>;
 
 /// One embedded file as the document declares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +172,7 @@ fn balanced_dict(data: &[u8], i: &mut usize) -> Option<Vec<u8>> {
 }
 
 /// The `[ ... ]` body after a key.
-fn array_after(node: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn array_after(node: &[u8], key: &[u8]) -> Option<Vec<u8>> {
     let pos = find_key(node, key)? + key.len();
     let rest = &node[pos..];
     let mut i = 0;
@@ -203,7 +203,7 @@ fn array_after(node: &[u8], key: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn refs_in(array: &[u8]) -> Vec<u32> {
+pub(crate) fn refs_in(array: &[u8]) -> Vec<u32> {
     let text = String::from_utf8_lossy(array);
     let tokens: Vec<&str> = text.split_whitespace().collect();
     tokens
@@ -239,7 +239,7 @@ fn string_after(dict: &[u8], key: &[u8]) -> Option<String> {
 }
 
 /// A literal `( )` or hex `< >` PDF string, decoded to text (UTF-16BE aware).
-fn read_string(data: &[u8], i: &mut usize) -> Option<String> {
+pub(crate) fn read_string(data: &[u8], i: &mut usize) -> Option<String> {
     skip_ws(data, i);
     let bytes: Vec<u8> = match data.get(*i)? {
         b'(' => {
