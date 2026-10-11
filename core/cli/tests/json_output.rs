@@ -115,3 +115,29 @@ fn comments_are_listed_as_text_and_as_json_with_their_page() {
     assert!(prose.contains("Check the figure"), "{prose}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn comment_filters_narrow_the_listing_through_the_real_binary() {
+    let dir = std::env::temp_dir().join(format!("pdfp-cfilter-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("note.pdf");
+    std::fs::write(&file, document_with_a_note()).unwrap();
+    let count = |extra: &[&str]| -> usize {
+        let mut args = vec!["comments", file.to_str().unwrap(), "--json"];
+        args.extend_from_slice(extra);
+        let (code, stdout, _) = run(&args);
+        assert_eq!(code, 0);
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        value["comments"].as_array().unwrap().len()
+    };
+    assert_eq!(count(&[]), 1);
+    assert_eq!(count(&["--author", "ben"]), 1);
+    assert_eq!(count(&["--author", "Ana"]), 0);
+    assert_eq!(count(&["--page", "1"]), 0);
+    assert_eq!(count(&["--type", "Text", "--page", "2"]), 1);
+    let (code, _, stderr) = run(&["comments", file.to_str().unwrap(), "--page", "two"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("--page must be a page number"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

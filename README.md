@@ -102,7 +102,7 @@ cargo run -p cli --bin pdf-platform -- forms-calc-demo
 cargo run -p cli --bin pdf-platform -- confinement
 cargo run -p cli --bin pdf-platform -- in.pdf --json          # also: revisions, extract-attachments
 cargo run -p cli --bin pdf-platform -- extract-attachments in.pdf -o attachments/
-cargo run -p cli --bin pdf-platform -- comments in.pdf [--json]    # page, type, author, text of every comment
+cargo run -p cli --bin pdf-platform -- comments in.pdf [--author A] [--type Highlight] [--page N] [--no-replies] [--json]
 cargo test --workspace
 cargo run -p corpus-diff   # needs qpdf; exit 0 = gate pass
 cargo bench -p benchmarks --bench startup
