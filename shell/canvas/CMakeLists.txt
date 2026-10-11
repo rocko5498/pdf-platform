@@ -19,6 +19,8 @@ target_link_libraries(shell-print PUBLIC
 add_library(shell-canvas STATIC
     canvas.cc
     canvas.h
+    view_history.cc
+    view_history.h
 )
 target_include_directories(shell-canvas PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
